@@ -97,12 +97,12 @@ function ResumeDetails({
             {plural(resume.page_count, "page")} · {formatBytes(resume.size_bytes)} · Uploaded {formatDate(resume.uploaded_at)}
           </p>
         </div>
-        <div className="flex flex-wrap gap-2">
+        <div className="grid w-full grid-cols-3 gap-2 sm:flex sm:w-auto">
           <a
             href={fileUrl}
             target="_blank"
             rel="noreferrer"
-            className="inline-flex items-center gap-2 rounded-lg border border-zinc-200 bg-white px-3.5 py-2 text-sm font-medium text-zinc-700 shadow-sm transition-colors hover:bg-zinc-50 hover:text-zinc-900"
+            className="inline-flex items-center justify-center gap-2 rounded-lg border border-zinc-200 bg-white px-3.5 py-2 text-sm font-medium text-zinc-700 shadow-sm transition-colors hover:bg-zinc-50 hover:text-zinc-900"
           >
             <ExternalLink className="size-4" />
             Open
@@ -160,7 +160,23 @@ function ResumeDetails({
         </div>
 
         {tab === "preview" ? (
-          <iframe key={fileUrl} src={fileUrl} title="Resume preview" className="h-[75vh] w-full bg-zinc-100" />
+          <>
+            {/* Mobile browsers (iOS Safari especially) render embedded PDFs poorly, so link out instead. */}
+            <div className="flex flex-col items-center px-6 py-12 text-center md:hidden">
+              <FileText className="mb-3 size-8 text-zinc-400" />
+              <p className="text-sm text-zinc-500">PDF previews don't display well on small screens.</p>
+              <a
+                href={fileUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="mt-4 inline-flex items-center gap-2 rounded-lg bg-zinc-900 px-3.5 py-2 text-sm font-medium text-white shadow-sm hover:bg-zinc-800"
+              >
+                <ExternalLink className="size-4" />
+                Open PDF
+              </a>
+            </div>
+            <iframe key={fileUrl} src={fileUrl} title="Resume preview" className="hidden h-[75vh] w-full bg-zinc-100 md:block" />
+          </>
         ) : resume.extracted_text ? (
           <div className="p-6">
             <p className="mb-4 text-xs text-zinc-400">

@@ -23,8 +23,8 @@ export function Button({
   ...props
 }: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: Variant; icon?: LucideIcon; loading?: boolean }) {
   return (
-    <button className={`${buttonBase} ${variants[variant]} ${className}`} disabled={loading || props.disabled} {...props}>
-      {loading ? <Loader2 className="size-4 animate-spin" /> : Icon && <Icon className="size-4" />}
+    <button className={`${buttonBase} ${variants[variant]} ${className}`} {...props} disabled={loading || props.disabled}>
+      {loading ? <Loader2 className="size-4 shrink-0 animate-spin" /> : Icon && <Icon className="size-4 shrink-0" />}
       {children}
     </button>
   );
@@ -43,7 +43,7 @@ export function ButtonLink({
 }) {
   return (
     <Link to={to} className={`${buttonBase} ${variants[variant]}`}>
-      {Icon && <Icon className="size-4" />}
+      {Icon && <Icon className="size-4 shrink-0" />}
       {children}
     </Link>
   );
