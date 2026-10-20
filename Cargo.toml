@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["crates/tailor-core", "crates/tailor-server"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"

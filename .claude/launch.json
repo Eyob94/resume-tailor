@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "resume-tailor",
+      "runtimeExecutable": "cargo",
+      "runtimeArgs": ["run", "-p", "tailor-server"],
+      "port": 8787
+    }
+  ]
+}
