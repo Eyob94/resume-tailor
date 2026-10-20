@@ -170,8 +170,6 @@ export function JobsPage() {
 
       {searches && searches.length > 0 && (
         <section>
-          {jobs && <TailoringProgress jobs={jobs} />}
-
           <div className="mb-4 flex items-end gap-3 border-b border-zinc-200">
             <div className="flex min-w-0 flex-1 gap-1 overflow-x-auto" role="tablist">
               {FILTERS.map(([id, label]) => (
@@ -212,40 +210,6 @@ export function JobsPage() {
         </section>
       )}
     </>
-  );
-}
-
-function TailoringProgress({ jobs }: { jobs: JobListing[] }) {
-  const saved = jobs.filter((j) => j.status === "saved");
-  const tailored = saved.filter((j) => j.tailored_at).length;
-  const percent = saved.length ? Math.round((tailored / saved.length) * 100) : 0;
-
-  return (
-    <Card className="mb-6 px-5 py-4">
-      <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
-        <p className="text-sm font-medium">Tailored resumes</p>
-        <p className="text-sm text-zinc-500">
-          {saved.length ? `${tailored} of ${plural(saved.length, "saved job")} tailored` : "No saved jobs yet"}
-        </p>
-      </div>
-      <div
-        role="progressbar"
-        aria-label="Saved jobs with a tailored resume"
-        aria-valuemin={0}
-        aria-valuemax={saved.length}
-        aria-valuenow={tailored}
-        className="h-2 overflow-hidden rounded-full bg-zinc-100"
-      >
-        <div className="h-full rounded-full bg-emerald-500 transition-all" style={{ width: `${percent}%` }} />
-      </div>
-      <p className="mt-2 text-xs text-zinc-500">
-        {saved.length === 0
-          ? "Save the jobs you want to apply for; they'll be tracked here."
-          : tailored === 0
-            ? "Tailoring arrives once the AI backend is set up."
-            : `${percent}% done`}
-      </p>
-    </Card>
   );
 }
 
