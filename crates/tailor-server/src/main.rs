@@ -68,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/searches/{id}", put(update_search).delete(delete_search))
         .route("/jobs", get(list_jobs))
         .route("/jobs/{id}", patch(update_job))
+        .route("/jobs/status", post(update_jobs_status))
         .route("/scan", get(scan_status))
         .route("/scan/run", post(run_scan_now))
         .route("/settings", get(get_settings).put(update_settings))
@@ -229,6 +230,25 @@ async fn update_job(
     } else {
         Err(AppError::not_found_msg("Job not found."))
     }
+}
+
+#[derive(Deserialize)]
+struct BulkJobStatus {
+    ids: Vec<i64>,
+    status: JobStatus,
+}
+
+const MAX_BULK_IDS: usize = 2000;
+
+async fn update_jobs_status(
+    State(store): State<Arc<Store>>,
+    Json(body): Json<BulkJobStatus>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if body.ids.len() > MAX_BULK_IDS {
+        return Err(AppError::bad_request(format!("Update at most {MAX_BULK_IDS} jobs at once.")));
+    }
+    let updated = store.set_jobs_status(&body.ids, body.status)?;
+    Ok(Json(json!({ "updated": updated })))
 }
 
 async fn scan_status(State(scanner): State<Arc<Scanner>>) -> Result<Json<ScanStatus>, AppError> {

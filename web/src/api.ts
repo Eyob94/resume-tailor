@@ -94,6 +94,7 @@ export interface JobListing {
   work_mode: WorkMode | null;
   status: JobStatus;
   first_seen_at: string;
+  tailored_at: string | null;
   search_ids: number[];
   matched_keywords: string[];
 }
@@ -130,6 +131,8 @@ export const jobsApi = {
   deleteSearch: (id: number) => request<void>(`/searches/${id}`, { method: "DELETE" }),
   listJobs: (status?: JobStatus) => request<JobListing[]>(status ? `/jobs?status=${status}` : "/jobs"),
   setJobStatus: (id: number, status: JobStatus) => request<void>(`/jobs/${id}`, { method: "PATCH", ...json({ status }) }),
+  setJobsStatus: (ids: number[], status: JobStatus) =>
+    request<{ updated: number }>("/jobs/status", { method: "POST", ...json({ ids, status }) }),
   scanStatus: () => request<ScanStatus>("/scan"),
   runScan: () => request<void>("/scan/run", { method: "POST" }),
   getSettings: () => request<Settings>("/settings"),

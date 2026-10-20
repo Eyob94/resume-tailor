@@ -60,6 +60,8 @@ pub struct JobListing {
     pub work_mode: Option<WorkMode>,
     pub status: JobStatus,
     pub first_seen_at: String,
+    /// When a tailored resume was made for this job, if ever.
+    pub tailored_at: Option<String>,
     pub search_ids: Vec<i64>,
     pub matched_keywords: Vec<String>,
 }
@@ -270,7 +272,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT j.id, j.linkedin_id, j.title, j.company, j.company_url, j.location, j.posted_on, j.url,
                     j.description, j.seniority, j.employment_type, j.industries, j.work_mode, j.status,
-                    j.first_seen_at, m.search_id, m.matched_keywords
+                    j.first_seen_at, m.search_id, m.matched_keywords, j.tailored_at
              FROM jobs j JOIN search_matches m ON m.job_id = j.id
              WHERE ?1 IS NULL OR j.status = ?1
              ORDER BY COALESCE(j.posted_on, '') DESC, j.first_seen_at DESC, j.id DESC, m.search_id",
@@ -292,6 +294,7 @@ impl Store {
                 work_mode: row.get::<_, Option<String>>(12)?.as_deref().and_then(WorkMode::parse),
                 status: JobStatus::parse(&row.get::<_, String>(13)?),
                 first_seen_at: row.get(14)?,
+                tailored_at: row.get(17)?,
                 search_ids: vec![row.get(15)?],
                 matched_keywords: Vec::new(),
             };
@@ -331,6 +334,22 @@ impl Store {
             params![id, status.as_str(), now()],
         )?;
         Ok(changed > 0)
+    }
+
+    /// Sets the status of several jobs at once. Returns how many changed.
+    pub fn set_jobs_status(&self, ids: &[i64], status: JobStatus) -> Result<usize, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut changed = 0;
+        {
+            let mut stmt = tx.prepare("UPDATE jobs SET status = ?2, updated_at = ?3 WHERE id = ?1 AND status != ?2")?;
+            let ts = now();
+            for id in ids {
+                changed += stmt.execute(params![id, status.as_str(), ts])?;
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
     }
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>, StoreError> {
@@ -480,6 +499,9 @@ mod tests {
         assert_eq!(jobs[0].matched_keywords, vec!["Rust", "Kafka"]);
         assert_eq!(jobs[0].work_mode, Some(WorkMode::Hybrid));
 
+        assert_eq!(jobs[0].tailored_at, None);
+        assert_eq!(store.set_jobs_status(&[id, 999], JobStatus::Saved).unwrap(), 1);
+        assert_eq!(store.set_jobs_status(&[id], JobStatus::Saved).unwrap(), 0, "already saved");
         assert!(store.set_job_status(id, JobStatus::Dismissed).unwrap());
         assert!(store.list_jobs(Some(JobStatus::New)).unwrap().is_empty());
         assert_eq!(store.list_jobs(Some(JobStatus::Dismissed)).unwrap().len(), 1);

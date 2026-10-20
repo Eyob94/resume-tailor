@@ -3,7 +3,9 @@ import {
   AlertTriangle,
   Bookmark,
   BookmarkCheck,
+  BookmarkPlus,
   Braces,
+  CheckCircle2,
   ChevronDown,
   Clock,
   ExternalLink,
@@ -90,6 +92,18 @@ export function JobsPage() {
     }
   }
 
+  async function saveAll(ids: number[]) {
+    if (!confirm(`Save all ${plural(ids.length, "job")} in this list?`)) return;
+    const idSet = new Set(ids);
+    setJobs((all) => all?.map((j) => (idSet.has(j.id) ? { ...j, status: "saved" } : j)) ?? null);
+    try {
+      await jobsApi.setJobsStatus(ids, "saved");
+    } catch (e) {
+      setError(errorMessage(e));
+      await loadJobs();
+    }
+  }
+
   async function setStatus(job: JobListing, status: JobStatus) {
     setJobs((all) => all?.map((j) => (j.id === job.id ? { ...j, status } : j)) ?? null);
     try {
@@ -156,21 +170,30 @@ export function JobsPage() {
 
       {searches && searches.length > 0 && (
         <section>
-          <div className="mb-4 flex gap-1 overflow-x-auto border-b border-zinc-200" role="tablist">
-            {FILTERS.map(([id, label]) => (
-              <button
-                key={id}
-                role="tab"
-                aria-selected={filter === id}
-                onClick={() => setFilter(id)}
-                className={`-mb-px flex shrink-0 items-center gap-2 border-b-2 px-3 pb-2.5 text-sm font-medium transition-colors ${
-                  filter === id ? "border-zinc-900 text-zinc-900" : "border-transparent text-zinc-500 hover:text-zinc-900"
-                }`}
-              >
-                {label}
-                <span className="rounded-full bg-zinc-100 px-1.5 py-0.5 text-xs text-zinc-500">{counts[id]}</span>
-              </button>
-            ))}
+          {jobs && <TailoringProgress jobs={jobs} />}
+
+          <div className="mb-4 flex items-end gap-3 border-b border-zinc-200">
+            <div className="flex min-w-0 flex-1 gap-1 overflow-x-auto" role="tablist">
+              {FILTERS.map(([id, label]) => (
+                <button
+                  key={id}
+                  role="tab"
+                  aria-selected={filter === id}
+                  onClick={() => setFilter(id)}
+                  className={`-mb-px flex shrink-0 items-center gap-2 border-b-2 px-3 pb-2.5 text-sm font-medium transition-colors ${
+                    filter === id ? "border-zinc-900 text-zinc-900" : "border-transparent text-zinc-500 hover:text-zinc-900"
+                  }`}
+                >
+                  {label}
+                  <span className="rounded-full bg-zinc-100 px-1.5 py-0.5 text-xs text-zinc-500">{counts[id]}</span>
+                </button>
+              ))}
+            </div>
+            {filter === "new" && visible.length > 0 && (
+              <Button icon={BookmarkPlus} onClick={() => saveAll(visible.map((j) => j.id))} className="mb-2 shrink-0">
+                Save all <span className="hidden sm:inline">({visible.length})</span>
+              </Button>
+            )}
           </div>
 
           {jobs === null ? (
@@ -189,6 +212,40 @@ export function JobsPage() {
         </section>
       )}
     </>
+  );
+}
+
+function TailoringProgress({ jobs }: { jobs: JobListing[] }) {
+  const saved = jobs.filter((j) => j.status === "saved");
+  const tailored = saved.filter((j) => j.tailored_at).length;
+  const percent = saved.length ? Math.round((tailored / saved.length) * 100) : 0;
+
+  return (
+    <Card className="mb-6 px-5 py-4">
+      <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
+        <p className="text-sm font-medium">Tailored resumes</p>
+        <p className="text-sm text-zinc-500">
+          {saved.length ? `${tailored} of ${plural(saved.length, "saved job")} tailored` : "No saved jobs yet"}
+        </p>
+      </div>
+      <div
+        role="progressbar"
+        aria-label="Saved jobs with a tailored resume"
+        aria-valuemin={0}
+        aria-valuemax={saved.length}
+        aria-valuenow={tailored}
+        className="h-2 overflow-hidden rounded-full bg-zinc-100"
+      >
+        <div className="h-full rounded-full bg-emerald-500 transition-all" style={{ width: `${percent}%` }} />
+      </div>
+      <p className="mt-2 text-xs text-zinc-500">
+        {saved.length === 0
+          ? "Save the jobs you want to apply for; they'll be tracked here."
+          : tailored === 0
+            ? "Tailoring arrives once the AI backend is set up."
+            : `${percent}% done`}
+      </p>
+    </Card>
   );
 }
 
@@ -292,6 +349,12 @@ function JobRow({ job, onStatus }: { job: JobListing; onStatus: (s: JobStatus) =
           <a href={job.url} target="_blank" rel="noreferrer" className="font-medium hover:underline">
             {job.title}
           </a>
+          {job.tailored_at && (
+            <span className="ml-2 inline-flex items-center gap-1 rounded-md bg-emerald-50 px-1.5 py-0.5 align-middle text-xs font-medium text-emerald-700">
+              <CheckCircle2 className="size-3" />
+              Tailored
+            </span>
+          )}
           <p className="mt-0.5 text-sm text-zinc-600">
             {job.company_url ? (
               <a href={job.company_url} target="_blank" rel="noreferrer" className="hover:underline">
