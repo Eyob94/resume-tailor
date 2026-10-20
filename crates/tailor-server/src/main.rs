@@ -1,16 +1,22 @@
 use std::{env, fmt::Display, net::SocketAddr, path::PathBuf, sync::Arc};
 
+mod scanner;
+
 use axum::{
-    extract::{DefaultBodyLimit, Multipart, State},
+    extract::{DefaultBodyLimit, FromRef, Multipart, Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, patch, post, put},
     Json, Router,
 };
+use scanner::{Scanner, ScanStatus, MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES};
+use serde::Deserialize;
 use serde_json::json;
 use tailor_core::{
+    linkedin::LinkedInClient,
     pdf::{self, PdfError},
-    store::{MasterResume, Store, StoreError},
+    search::{JobSearch, SearchInput},
+    store::{JobListing, JobStatus, MasterResume, Store, StoreError},
 };
 use tower_http::{
     services::{ServeDir, ServeFile},
@@ -20,7 +26,23 @@ use tracing_subscriber::EnvFilter;
 
 const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 
-type AppState = Arc<Store>;
+#[derive(Clone)]
+struct AppState {
+    store: Arc<Store>,
+    scanner: Arc<Scanner>,
+}
+
+impl FromRef<AppState> for Arc<Store> {
+    fn from_ref(state: &AppState) -> Self {
+        state.store.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<Scanner> {
+    fn from_ref(state: &AppState) -> Self {
+        state.scanner.clone()
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -35,14 +57,23 @@ async fn main() -> anyhow::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8787);
 
     let store = Arc::new(Store::open(&data_dir)?);
+    let scanner = Arc::new(Scanner::new(store.clone(), LinkedInClient::new()?));
+    tokio::spawn(scanner.clone().run_forever());
 
     let api = Router::new()
         .route("/health", get(health))
         .route("/resume", get(get_resume).post(upload_resume).delete(delete_resume))
         .route("/resume/file", get(resume_file))
+        .route("/searches", get(list_searches).post(create_search))
+        .route("/searches/{id}", put(update_search).delete(delete_search))
+        .route("/jobs", get(list_jobs))
+        .route("/jobs/{id}", patch(update_job))
+        .route("/scan", get(scan_status))
+        .route("/scan/run", post(run_scan_now))
+        .route("/settings", get(get_settings).put(update_settings))
         // Leave headroom over the file limit for multipart framing.
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES + 64 * 1024))
-        .with_state(store);
+        .with_state(AppState { store, scanner });
 
     let mut app = Router::new().nest("/api", api);
     if web_dist.join("index.html").exists() {
@@ -64,12 +95,12 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({ "ok": true }))
 }
 
-async fn get_resume(State(store): State<AppState>) -> Result<Json<Option<MasterResume>>, AppError> {
+async fn get_resume(State(store): State<Arc<Store>>) -> Result<Json<Option<MasterResume>>, AppError> {
     Ok(Json(store.get_resume()?))
 }
 
 async fn upload_resume(
-    State(store): State<AppState>,
+    State(store): State<Arc<Store>>,
     mut multipart: Multipart,
 ) -> Result<Json<MasterResume>, AppError> {
     while let Some(field) = multipart.next_field().await.map_err(AppError::multipart)? {
@@ -107,7 +138,7 @@ async fn upload_resume(
     Err(AppError::bad_request("No file was uploaded."))
 }
 
-async fn delete_resume(State(store): State<AppState>) -> Result<StatusCode, AppError> {
+async fn delete_resume(State(store): State<Arc<Store>>) -> Result<StatusCode, AppError> {
     if store.delete_resume()? {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -115,7 +146,7 @@ async fn delete_resume(State(store): State<AppState>) -> Result<StatusCode, AppE
     }
 }
 
-async fn resume_file(State(store): State<AppState>) -> Result<Response, AppError> {
+async fn resume_file(State(store): State<Arc<Store>>) -> Result<Response, AppError> {
     let Some(resume) = store.get_resume()? else {
         return Err(AppError::not_found());
     };
@@ -136,6 +167,102 @@ async fn resume_file(State(store): State<AppState>) -> Result<Response, AppError
         (header::CACHE_CONTROL, "no-cache".to_string()),
     ];
     Ok((headers, bytes).into_response())
+}
+
+async fn list_searches(State(store): State<Arc<Store>>) -> Result<Json<Vec<JobSearch>>, AppError> {
+    Ok(Json(store.list_searches()?))
+}
+
+async fn create_search(
+    State(state): State<AppState>,
+    Json(input): Json<SearchInput>,
+) -> Result<(StatusCode, Json<JobSearch>), AppError> {
+    let criteria = input.validate().map_err(|e| AppError::bad_request(e.0))?;
+    let search = state.store.create_search(&criteria)?;
+    state.scanner.reschedule();
+    Ok((StatusCode::CREATED, Json(search)))
+}
+
+async fn update_search(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(input): Json<SearchInput>,
+) -> Result<Json<JobSearch>, AppError> {
+    let criteria = input.validate().map_err(|e| AppError::bad_request(e.0))?;
+    let search = state.store.update_search(id, &criteria)?.ok_or_else(|| AppError::not_found_msg("Search not found."))?;
+    state.scanner.reschedule();
+    Ok(Json(search))
+}
+
+async fn delete_search(State(state): State<AppState>, Path(id): Path<i64>) -> Result<StatusCode, AppError> {
+    if !state.store.delete_search(id)? {
+        return Err(AppError::not_found_msg("Search not found."));
+    }
+    state.scanner.reschedule();
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct JobsQuery {
+    status: Option<JobStatus>,
+}
+
+async fn list_jobs(
+    State(store): State<Arc<Store>>,
+    Query(query): Query<JobsQuery>,
+) -> Result<Json<Vec<JobListing>>, AppError> {
+    Ok(Json(store.list_jobs(query.status)?))
+}
+
+#[derive(Deserialize)]
+struct JobPatch {
+    status: JobStatus,
+}
+
+async fn update_job(
+    State(store): State<Arc<Store>>,
+    Path(id): Path<i64>,
+    Json(patch): Json<JobPatch>,
+) -> Result<StatusCode, AppError> {
+    if store.set_job_status(id, patch.status)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::not_found_msg("Job not found."))
+    }
+}
+
+async fn scan_status(State(scanner): State<Arc<Scanner>>) -> Result<Json<ScanStatus>, AppError> {
+    Ok(Json(scanner.status()?))
+}
+
+async fn run_scan_now(State(scanner): State<Arc<Scanner>>) -> Result<StatusCode, AppError> {
+    scanner
+        .request_run()
+        .map(|()| StatusCode::ACCEPTED)
+        .map_err(|message| AppError { status: StatusCode::TOO_MANY_REQUESTS, message })
+}
+
+#[derive(serde::Serialize, Deserialize)]
+struct Settings {
+    scan_interval_minutes: u32,
+}
+
+async fn get_settings(State(scanner): State<Arc<Scanner>>) -> Json<Settings> {
+    Json(Settings { scan_interval_minutes: scanner.interval_minutes() })
+}
+
+async fn update_settings(
+    State(scanner): State<Arc<Scanner>>,
+    Json(settings): Json<Settings>,
+) -> Result<Json<Settings>, AppError> {
+    let minutes = settings.scan_interval_minutes;
+    if !(MIN_INTERVAL_MINUTES..=MAX_INTERVAL_MINUTES).contains(&minutes) {
+        return Err(AppError::bad_request(format!(
+            "Scan interval must be between {MIN_INTERVAL_MINUTES} and {MAX_INTERVAL_MINUTES} minutes."
+        )));
+    }
+    scanner.set_interval_minutes(minutes)?;
+    Ok(Json(settings))
 }
 
 /// Keeps only the base name, trimmed and capped, defaulting to `resume.pdf`.
@@ -160,7 +287,11 @@ impl AppError {
     }
 
     fn not_found() -> Self {
-        Self { status: StatusCode::NOT_FOUND, message: "No master resume has been uploaded.".into() }
+        Self::not_found_msg("No master resume has been uploaded.")
+    }
+
+    fn not_found_msg(message: &str) -> Self {
+        Self { status: StatusCode::NOT_FOUND, message: message.into() }
     }
 
     fn too_large() -> Self {

@@ -1,6 +1,7 @@
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
+import { errorMessage, jobsApi } from "../api";
 import { ServerStatus } from "../components/Layout";
-import { Card, PageHeader } from "../components/ui";
+import { Alert, Card, PageHeader } from "../components/ui";
 import { useDevMode } from "../devMode";
 
 function Row({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
@@ -33,13 +34,49 @@ function Switch({ checked, onChange, label }: { checked: boolean; onChange: (on:
 
 export function SettingsPage() {
   const [devMode, setDevMode] = useDevMode();
+  const [scanInterval, setScanInterval] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    jobsApi.getSettings().then(
+      (s) => setScanInterval(s.scan_interval_minutes),
+      (e) => setError(errorMessage(e)),
+    );
+  }, []);
+
+  async function changeInterval(minutes: number) {
+    const previous = scanInterval;
+    setScanInterval(minutes);
+    try {
+      await jobsApi.updateSettings({ scan_interval_minutes: minutes });
+    } catch (e) {
+      setScanInterval(previous);
+      setError(errorMessage(e));
+    }
+  }
 
   return (
     <>
       <PageHeader title="Settings" />
+      {error && <Alert onDismiss={() => setError(null)}>{error}</Alert>}
       <Card className="divide-y divide-zinc-100">
         <Row label="Server">
           <ServerStatus />
+        </Row>
+        <Row label="Job scan interval" hint="How often saved searches are checked on LinkedIn.">
+          <select
+            aria-label="Job scan interval"
+            value={scanInterval ?? ""}
+            disabled={scanInterval === null}
+            onChange={(e) => changeInterval(Number(e.target.value))}
+            className="rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-sm text-zinc-900 shadow-sm"
+          >
+            {[10, 15, 20, 30, 45, 60].map((m) => (
+              <option key={m} value={m}>
+                Every {m === 60 ? "hour" : `${m} min`}
+              </option>
+            ))}
+          </select>
         </Row>
         <Row label="AI backend">Not configured yet</Row>
         <Row label="Data">

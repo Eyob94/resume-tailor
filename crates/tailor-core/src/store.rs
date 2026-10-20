@@ -10,12 +10,17 @@ use thiserror::Error;
 
 use crate::pdf::PdfInfo;
 
+mod jobs;
+pub use jobs::*;
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error(transparent)]
     Db(#[from] rusqlite::Error),
     #[error(transparent)]
     Io(#[from] io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -28,14 +33,64 @@ pub struct MasterResume {
 }
 
 /// Each entry runs once, in order; progress is tracked in `PRAGMA user_version`.
-const MIGRATIONS: &[&str] = &["CREATE TABLE master_resume (
+const MIGRATIONS: &[&str] = &[
+    "CREATE TABLE master_resume (
         id             INTEGER PRIMARY KEY CHECK (id = 1),
         file_name      TEXT    NOT NULL,
         size_bytes     INTEGER NOT NULL,
         page_count     INTEGER NOT NULL,
         extracted_text TEXT    NOT NULL,
         uploaded_at    TEXT    NOT NULL
-    );"];
+    );",
+    "CREATE TABLE job_searches (
+        id            INTEGER PRIMARY KEY,
+        name          TEXT NOT NULL,
+        titles        TEXT NOT NULL,  -- JSON array
+        keywords      TEXT NOT NULL,  -- JSON array
+        location      TEXT,
+        work_modes    TEXT NOT NULL,  -- JSON array
+        posted_within TEXT NOT NULL,
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL
+    );
+    CREATE TABLE jobs (
+        id              INTEGER PRIMARY KEY,
+        linkedin_id     TEXT NOT NULL UNIQUE,
+        title           TEXT NOT NULL,
+        company         TEXT NOT NULL,
+        company_url     TEXT,
+        location        TEXT NOT NULL,
+        posted_on       TEXT,
+        url             TEXT NOT NULL,
+        description     TEXT,
+        seniority       TEXT,
+        employment_type TEXT,
+        industries      TEXT,
+        work_mode       TEXT,
+        status          TEXT NOT NULL DEFAULT 'new',
+        first_seen_at   TEXT NOT NULL,
+        updated_at      TEXT NOT NULL
+    );
+    CREATE TABLE search_matches (
+        search_id        INTEGER NOT NULL REFERENCES job_searches(id) ON DELETE CASCADE,
+        job_id           INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        matched_keywords TEXT NOT NULL,  -- JSON array
+        matched_at       TEXT NOT NULL,
+        PRIMARY KEY (search_id, job_id)
+    );
+    CREATE TABLE settings (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+    CREATE TABLE scan_runs (
+        id          INTEGER PRIMARY KEY,
+        started_at  TEXT NOT NULL,
+        finished_at TEXT,
+        status      TEXT NOT NULL,  -- running | ok | partial | failed | interrupted
+        new_matches INTEGER NOT NULL DEFAULT 0,
+        message     TEXT
+    );",
+];
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -47,6 +102,7 @@ impl Store {
         let data_dir = data_dir.as_ref().to_path_buf();
         fs::create_dir_all(&data_dir)?;
         let conn = Connection::open(data_dir.join("db.sqlite"))?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&conn)?;
         Ok(Self { conn: Mutex::new(conn), data_dir })
     }

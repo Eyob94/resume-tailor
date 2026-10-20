@@ -3,8 +3,8 @@
   "configurations": [
     {
       "name": "resume-tailor",
-      "runtimeExecutable": "cargo",
-      "runtimeArgs": ["run", "-p", "tailor-server"],
+      "runtimeExecutable": "sh",
+      "runtimeArgs": ["-c", "SCAN_COOLDOWN_SECONDS=60 exec cargo run -p tailor-server"],
       "port": 8787
     }
   ]
