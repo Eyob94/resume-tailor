@@ -70,7 +70,7 @@ export function Layout() {
           <ServerStatus />
         </div>
       </aside>
-      <main className="flex-1 px-4 pt-6 pb-28 sm:px-8 md:py-8 lg:px-12">
+      <main className="min-w-0 flex-1 px-4 pt-6 pb-28 sm:px-8 md:py-8 lg:px-12">
         <div className="mx-auto max-w-5xl">
           <Outlet />
         </div>

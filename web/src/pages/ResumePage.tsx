@@ -2,8 +2,12 @@ import { useRef, useState } from "react";
 import { ExternalLink, FileText, Info, RefreshCw, Trash2 } from "lucide-react";
 import { MAX_UPLOAD_BYTES, api, errorMessage, useResume, type MasterResume } from "../api";
 import { Dropzone } from "../components/Dropzone";
+import { JsonView } from "../components/JsonView";
+import { useDevMode } from "../devMode";
 import { Alert, Button, Card, PageHeader, Skeleton } from "../components/ui";
 import { formatBytes, formatDate, plural } from "../format";
+
+type Tab = "preview" | "text" | "json";
 
 function validateFile(file: File): string | null {
   const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
@@ -79,9 +83,18 @@ function ResumeDetails({
   onReplace: (file: File) => void;
   onRemove: () => void;
 }) {
-  const [tab, setTab] = useState<"preview" | "text">("preview");
+  const [selectedTab, setTab] = useState<Tab>("preview");
+  const [devMode] = useDevMode();
   const replaceInput = useRef<HTMLInputElement>(null);
   const fileUrl = api.resumeFileUrl(resume.uploaded_at);
+
+  const tabs: [Tab, string][] = [
+    ["preview", "Preview"],
+    ["text", "Extracted text"],
+    ...(devMode ? [["json", "JSON"] as [Tab, string]] : []),
+  ];
+  // Turning dev mode off while on the JSON tab falls back to the preview.
+  const tab = selectedTab === "json" && !devMode ? "preview" : selectedTab;
 
   return (
     <div className="space-y-6">
@@ -139,12 +152,7 @@ function ResumeDetails({
 
       <Card className="overflow-hidden">
         <div role="tablist" className="flex gap-1 border-b border-zinc-200 px-3 pt-3">
-          {(
-            [
-              ["preview", "Preview"],
-              ["text", "Extracted text"],
-            ] as const
-          ).map(([id, label]) => (
+          {tabs.map(([id, label]) => (
             <button
               key={id}
               role="tab"
@@ -159,7 +167,9 @@ function ResumeDetails({
           ))}
         </div>
 
-        {tab === "preview" ? (
+        {tab === "json" ? (
+          <JsonView value={resume} fileName="resume.json" note="Raw GET /api/resume response" />
+        ) : tab === "preview" ? (
           <>
             {/* Mobile browsers (iOS Safari especially) render embedded PDFs poorly, so link out instead. */}
             <div className="flex flex-col items-center px-6 py-12 text-center md:hidden">
