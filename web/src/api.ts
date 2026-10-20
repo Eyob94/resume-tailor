@@ -36,7 +36,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw new ApiError(message, res.status);
   }
-  if (res.status === 204) return undefined as T;
+  if (res.status === 202 || res.status === 204) return undefined as T;
   return res.json() as Promise<T>;
 }
 
@@ -51,6 +51,89 @@ export const api = {
   deleteResume: () => request<void>("/resume", { method: "DELETE" }),
   /** `version` busts the browser cache after a replace. */
   resumeFileUrl: (version: string) => `/api/resume/file?v=${encodeURIComponent(version)}`,
+};
+
+export type WorkMode = "onsite" | "hybrid" | "remote";
+export type PostedWithin = "day" | "week" | "month";
+export type JobStatus = "new" | "saved" | "dismissed";
+
+export interface SearchInput {
+  name?: string;
+  titles: string[];
+  keywords: string[];
+  location?: string;
+  work_modes: WorkMode[];
+  posted_within: PostedWithin;
+}
+
+export interface JobSearch {
+  id: number;
+  name: string;
+  titles: string[];
+  keywords: string[];
+  location: string | null;
+  work_modes: WorkMode[];
+  posted_within: PostedWithin;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface JobListing {
+  id: number;
+  linkedin_id: string;
+  title: string;
+  company: string;
+  company_url: string | null;
+  location: string;
+  posted_on: string | null;
+  url: string;
+  description: string | null;
+  seniority: string | null;
+  employment_type: string | null;
+  industries: string | null;
+  work_mode: WorkMode | null;
+  status: JobStatus;
+  first_seen_at: string;
+  search_ids: number[];
+  matched_keywords: string[];
+}
+
+export interface ScanRun {
+  id: number;
+  started_at: string;
+  finished_at: string | null;
+  status: "running" | "ok" | "partial" | "failed" | "interrupted";
+  new_matches: number;
+  message: string | null;
+}
+
+export interface ScanStatus {
+  running: boolean;
+  interval_minutes: number;
+  next_run_at: string | null;
+  last_run: ScanRun | null;
+}
+
+export interface Settings {
+  scan_interval_minutes: number;
+}
+
+const json = (body: unknown): RequestInit => ({
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(body),
+});
+
+export const jobsApi = {
+  listSearches: () => request<JobSearch[]>("/searches"),
+  createSearch: (input: SearchInput) => request<JobSearch>("/searches", { method: "POST", ...json(input) }),
+  updateSearch: (id: number, input: SearchInput) => request<JobSearch>(`/searches/${id}`, { method: "PUT", ...json(input) }),
+  deleteSearch: (id: number) => request<void>(`/searches/${id}`, { method: "DELETE" }),
+  listJobs: (status?: JobStatus) => request<JobListing[]>(status ? `/jobs?status=${status}` : "/jobs"),
+  setJobStatus: (id: number, status: JobStatus) => request<void>(`/jobs/${id}`, { method: "PATCH", ...json({ status }) }),
+  scanStatus: () => request<ScanStatus>("/scan"),
+  runScan: () => request<void>("/scan/run", { method: "POST" }),
+  getSettings: () => request<Settings>("/settings"),
+  updateSettings: (settings: Settings) => request<Settings>("/settings", { method: "PUT", ...json(settings) }),
 };
 
 export function errorMessage(e: unknown): string {

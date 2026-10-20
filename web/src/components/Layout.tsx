@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
-import { Briefcase, FileText, Settings, Sparkles, type LucideIcon } from "lucide-react";
+import { Briefcase, FileText, Search, Settings, Sparkles, type LucideIcon } from "lucide-react";
 import { api } from "../api";
 
 const nav: { to: string; label: string; shortLabel: string; icon: LucideIcon; end?: boolean }[] = [
   { to: "/", label: "Applications", shortLabel: "Applications", icon: Briefcase, end: true },
+  { to: "/jobs", label: "Jobs", shortLabel: "Jobs", icon: Search },
   { to: "/new", label: "New application", shortLabel: "New", icon: Sparkles },
   { to: "/resume", label: "Master resume", shortLabel: "Resume", icon: FileText },
   { to: "/settings", label: "Settings", shortLabel: "Settings", icon: Settings },
@@ -26,7 +27,7 @@ export function Layout() {
       <header className="sticky top-0 z-10 border-b border-zinc-200 bg-white/90 px-4 py-3 backdrop-blur md:hidden">
         <Brand />
       </header>
-      <nav className="fixed inset-x-0 bottom-0 z-10 grid grid-cols-4 border-t border-zinc-200 bg-white/95 pb-[env(safe-area-inset-bottom)] backdrop-blur md:hidden">
+      <nav className="fixed inset-x-0 bottom-0 z-10 grid grid-cols-5 border-t border-zinc-200 bg-white/95 pb-[env(safe-area-inset-bottom)] backdrop-blur md:hidden">
         {nav.map(({ to, shortLabel, icon: Icon, end }) => (
           <NavLink
             key={to}
