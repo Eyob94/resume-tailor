@@ -30,13 +30,15 @@ impl JobSource for LinkedInClient {
 
 #[derive(Debug, Clone)]
 pub struct ScanLimits {
-    /// Result requests per title. The first returns ~60 jobs; each extra
-    /// "load more" page ~10, and signed-out visitors only get a few of those.
-    pub max_pages_per_query: usize,
+    /// "Load more" pages (10 jobs each) per scan, shared by all titles; each
+    /// title's first request is the full page (~60 jobs). Signed-out visitors
+    /// get about three per window, and a refused one ends paging for the scan.
+    pub max_load_more_per_run: usize,
     /// Job descriptions fetched per scan; the rest wait for the next scan.
     /// LinkedIn starts refusing back-to-back job pages after a handful.
     pub max_details_per_run: usize,
-    /// Random pause before every request, between these bounds.
+    /// Random pause before every request, between these bounds. Bursts are
+    /// what trip LinkedIn's limits.
     pub min_delay: Duration,
     pub max_delay: Duration,
 }
@@ -44,10 +46,10 @@ pub struct ScanLimits {
 impl Default for ScanLimits {
     fn default() -> Self {
         Self {
-            max_pages_per_query: 1,
+            max_load_more_per_run: 2,
             max_details_per_run: 10,
-            min_delay: Duration::from_secs(3),
-            max_delay: Duration::from_secs(8),
+            min_delay: Duration::from_secs(5),
+            max_delay: Duration::from_secs(12),
         }
     }
 }
@@ -61,6 +63,9 @@ pub struct ScanReport {
     pub pending_details: usize,
     /// LinkedIn refused a job page, so description fetching stopped early.
     pub details_paused: bool,
+    /// LinkedIn refused a results page, so remaining titles were skipped.
+    /// Jobs already collected were still processed.
+    pub search_blocked: bool,
     pub error: Option<String>,
 }
 
@@ -70,6 +75,12 @@ enum ScanError {
     Source(#[from] LinkedInError),
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+/// Requests left in this scan.
+struct Budget {
+    load_more: usize,
+    details: usize,
 }
 
 pub async fn run_scan<S: JobSource>(store: &Store, source: &S, limits: &ScanLimits) -> ScanReport {
@@ -82,14 +93,13 @@ pub async fn run_scan<S: JobSource>(store: &Store, source: &S, limits: &ScanLimi
         }
     };
 
-    let mut detail_budget = limits.max_details_per_run;
+    let mut budget = Budget { load_more: limits.max_load_more_per_run, details: limits.max_details_per_run };
     for search in &searches {
-        if let Err(e) = scan_search(store, source, limits, search, &mut detail_budget, &mut report).await {
-            let blocked = matches!(e, ScanError::Source(LinkedInError::Blocked(_)));
+        if report.search_blocked {
+            break; // Keep hammering a rate limit and it gets longer.
+        }
+        if let Err(e) = scan_search(store, source, limits, search, &mut budget, &mut report).await {
             report.error = Some(e.to_string());
-            if blocked {
-                break; // Keep hammering a rate limit and it gets longer.
-            }
         }
     }
     report
@@ -100,7 +110,7 @@ async fn scan_search<S: JobSource>(
     source: &S,
     limits: &ScanLimits,
     search: &JobSearch,
-    detail_budget: &mut usize,
+    budget: &mut Budget,
     report: &mut ScanReport,
 ) -> Result<(), ScanError> {
     let criteria = &search.criteria;
@@ -110,9 +120,13 @@ async fn scan_search<S: JobSource>(
 
     let mut seen = HashSet::new();
     let mut candidates: Vec<JobCard> = Vec::new();
-    for keywords in &queries {
+    'queries: for keywords in &queries {
         let mut start = 0;
-        for page in 0..limits.max_pages_per_query {
+        loop {
+            let first_page = start == 0;
+            if !first_page && budget.load_more == 0 {
+                break;
+            }
             pause(limits).await;
             report.requests += 1;
             let query = SearchQuery {
@@ -122,13 +136,26 @@ async fn scan_search<S: JobSource>(
                 work_modes: &criteria.work_modes,
                 start,
             };
-            let cards = match source.search(&query).await {
+            let result = source.search(&query).await;
+            if !first_page {
+                budget.load_more -= 1;
+            }
+            let cards = match result {
                 Ok(cards) => cards,
-                // Paging past the last result returns an error status, and
-                // signed-out paging is capped with a 429. Either way this
-                // query is done; keep what we have and move on.
-                Err(LinkedInError::Status(_) | LinkedInError::Blocked(_)) if page > 0 => break,
-                Err(e) => return Err(e.into()),
+                // Signed-out paging cap: no more "load more" this scan.
+                Err(LinkedInError::Blocked(_)) if !first_page => {
+                    budget.load_more = 0;
+                    break;
+                }
+                // Paging past the last result.
+                Err(LinkedInError::Status(_)) if !first_page => break,
+                // A results page failed: stop searching, but still process
+                // the jobs already collected below.
+                Err(e) => {
+                    report.search_blocked |= matches!(e, LinkedInError::Blocked(_));
+                    report.error = Some(e.to_string());
+                    break 'queries;
+                }
             };
             if cards.is_empty() {
                 break;
@@ -147,10 +174,10 @@ async fn scan_search<S: JobSource>(
         let mut description = store.known_job(&card.linkedin_id)?.and_then(|job| job.description);
         let mut detail = None;
         if description.is_none() {
-            if *detail_budget == 0 {
+            if budget.details == 0 {
                 report.pending_details += 1;
             } else {
-                *detail_budget -= 1;
+                budget.details -= 1;
                 pause(limits).await;
                 report.requests += 1;
                 match source.job_detail(&card.linkedin_id).await {
@@ -161,7 +188,7 @@ async fn scan_search<S: JobSource>(
                     // Expected now and then: stop fetching descriptions for
                     // this scan, keep searching. The next scan picks up here.
                     Err(LinkedInError::Blocked(_)) => {
-                        *detail_budget = 0;
+                        budget.details = 0;
                         report.details_paused = true;
                         report.pending_details += 1;
                     }
@@ -173,15 +200,19 @@ async fn scan_search<S: JobSource>(
         let work_mode = infer_work_mode(&card.title, &card.location, description.as_deref());
         let job_id = store.upsert_job(&card, detail.as_ref(), work_mode)?;
 
-        // Keyword and work-mode checks need the description; jobs still
-        // without one are re-checked on the next scan.
-        let Some(description) = description else { continue };
-        if work_mode.is_some_and(|mode| !criteria.work_modes.contains(&mode)) {
+        // List jobs as soon as the title matches; the description only
+        // matters for keywords and work mode. Re-checked every scan, so a
+        // description that arrives later can still rule a job out.
+        let text = format!("{}\n{}", card.title, description.as_deref().unwrap_or_default());
+        let hits = keyword_hits(&text, &criteria.keywords);
+        let keywords_ok = criteria.keywords.is_empty() || !hits.is_empty();
+        let wrong_mode = work_mode.is_some_and(|mode| !criteria.work_modes.contains(&mode));
+        if wrong_mode || (!keywords_ok && description.is_some()) {
+            store.remove_match(search.id, job_id)?;
             continue;
         }
-        let hits = keyword_hits(&format!("{}\n{description}", card.title), &criteria.keywords);
-        if !criteria.keywords.is_empty() && hits.is_empty() {
-            continue;
+        if !keywords_ok {
+            continue; // Keywords may still be in the description; check once it's fetched.
         }
         if store.add_match(search.id, job_id, &hits)? {
             report.new_matches += 1;
@@ -219,6 +250,8 @@ mod tests {
         details: HashMap<String, String>,
         block_details: bool,
         block_after_first_page: bool,
+        /// Queries whose results page is refused outright.
+        blocked_queries: Vec<String>,
         detail_calls: Mutex<usize>,
     }
 
@@ -226,7 +259,8 @@ mod tests {
         fn search(&self, query: &SearchQuery<'_>) -> impl Future<Output = Result<Vec<JobCard>, LinkedInError>> + Send {
             let pages = self.pages.get(query.keywords).cloned().unwrap_or_default();
             // 2 cards per page in these fixtures.
-            let result = if self.block_after_first_page && query.start > 0 {
+            let blocked = self.blocked_queries.iter().any(|q| q == query.keywords);
+            let result = if blocked || (self.block_after_first_page && query.start > 0) {
                 Err(LinkedInError::Blocked(429))
             } else {
                 Ok(pages.get(query.start / 2).cloned().unwrap_or_default())
@@ -263,19 +297,19 @@ mod tests {
     }
 
     fn fast() -> ScanLimits {
-        ScanLimits { max_pages_per_query: 3, max_details_per_run: 10, min_delay: Duration::ZERO, max_delay: Duration::ZERO }
+        ScanLimits { max_load_more_per_run: 2, max_details_per_run: 10, min_delay: Duration::ZERO, max_delay: Duration::ZERO }
     }
 
     fn setup(modes: Vec<WorkMode>) -> (Store, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "tailor-scan-test-{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap()
-        ));
+        setup_with(vec!["Backend Engineer".into()], modes)
+    }
+
+    fn setup_with(titles: Vec<String>, modes: Vec<WorkMode>) -> (Store, std::path::PathBuf) {
+        let dir = crate::store::test_dir("tailor-scan-test");
         let store = Store::open(&dir).unwrap();
         let criteria = SearchInput {
             name: None,
-            titles: vec!["Backend Engineer".into()],
+            titles,
             keywords: vec!["Rust".into()],
             location: Some("Dubai".into()),
             work_modes: modes,
@@ -345,6 +379,73 @@ mod tests {
         let report = run_scan(&store, &src, &fast()).await;
         assert_eq!(report.error, None);
         assert_eq!(report.new_matches, 1); // job 1 from page one
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocked_results_page_keeps_collected_jobs() {
+        let titles = vec!["Backend Engineer".into(), "Platform Engineer".into()];
+        let (store, dir) = setup_with(titles, vec![WorkMode::Hybrid, WorkMode::Onsite]);
+        let src = FakeSource { blocked_queries: vec!["Platform Engineer".into()], ..source() };
+        let report = run_scan(&store, &src, &fast()).await;
+        assert!(report.search_blocked);
+        assert!(report.error.unwrap().contains("rate-limiting"));
+        // The first title's jobs were still evaluated.
+        assert_eq!(report.new_matches, 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_more_budget_is_shared_across_titles() {
+        let titles = vec!["Backend Engineer".into(), "Engineer".into()];
+        let (store, dir) = setup_with(titles, vec![WorkMode::Hybrid]);
+        let mut src = source();
+        let pages = src.pages["Backend Engineer"].clone();
+        src.pages.insert("Engineer".into(), pages);
+        let limits = ScanLimits { max_load_more_per_run: 1, ..fast() };
+        let report = run_scan(&store, &src, &limits).await;
+        // Title 1: full page + 1 load more. Title 2: full page only.
+        let searches = report.requests - *src.detail_calls.lock().unwrap();
+        assert_eq!(searches, 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn without_keywords_jobs_list_before_descriptions() {
+        let (store, dir) = setup_with(vec!["Backend Engineer".into()], vec![WorkMode::Hybrid, WorkMode::Onsite]);
+        store
+            .update_search(store.list_searches().unwrap()[0].id, &{
+                let mut c = store.list_searches().unwrap()[0].criteria.clone();
+                c.keywords.clear();
+                c
+            })
+            .unwrap();
+        let src = source();
+        let limits = ScanLimits { max_details_per_run: 0, ..fast() };
+        let report = run_scan(&store, &src, &limits).await;
+        // 1, 4 listed straight away; 3 is "(Remote)" in the title, so excluded.
+        assert_eq!(report.new_matches, 2);
+        assert_eq!(*src.detail_calls.lock().unwrap(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn later_description_can_remove_a_match() {
+        let (store, dir) = setup_with(vec!["Backend Engineer".into()], vec![WorkMode::Remote]);
+        let search = store.list_searches().unwrap()[0].clone();
+        let mut criteria = search.criteria.clone();
+        criteria.keywords.clear();
+        store.update_search(search.id, &criteria).unwrap();
+
+        let mut src = source();
+        src.details.insert("4".into(), "Fully on-site in Dubai.".into());
+        // First scan: no descriptions, so 1, 3, 4 are listed on title alone.
+        run_scan(&store, &src, &ScanLimits { max_details_per_run: 0, ..fast() }).await;
+        assert_eq!(store.list_jobs(None).unwrap().len(), 3);
+        // Second scan fetches descriptions: 1 is hybrid, 4 on-site; only 3 stays.
+        run_scan(&store, &src, &fast()).await;
+        let ids: Vec<String> = store.list_jobs(None).unwrap().into_iter().map(|j| j.linkedin_id).collect();
+        assert_eq!(ids, vec!["3"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -254,6 +254,16 @@ impl Store {
         Ok(inserted == 1)
     }
 
+    /// Removes a job from a search's results. Returns `true` if it was there.
+    pub fn remove_match(&self, search_id: i64, job_id: i64) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let removed = conn.execute(
+            "DELETE FROM search_matches WHERE search_id = ?1 AND job_id = ?2",
+            params![search_id, job_id],
+        )?;
+        Ok(removed > 0)
+    }
+
     /// Jobs matched by at least one search, newest postings first.
     pub fn list_jobs(&self, status: Option<JobStatus>) -> Result<Vec<JobListing>, StoreError> {
         let conn = self.conn.lock().unwrap();
@@ -399,11 +409,7 @@ mod tests {
     use crate::search::SearchInput;
 
     fn temp_store() -> (Store, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "tailor-jobs-test-{}-{}",
-            std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap()
-        ));
+        let dir = crate::store::test_dir("tailor-jobs-test");
         (Store::open(&dir).unwrap(), dir)
     }
 
