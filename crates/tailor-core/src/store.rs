@@ -90,6 +90,8 @@ const MIGRATIONS: &[&str] = &[
         new_matches INTEGER NOT NULL DEFAULT 0,
         message     TEXT
     );",
+    // Set once a tailored resume exists for the job.
+    "ALTER TABLE jobs ADD COLUMN tailored_at TEXT;",
 ];
 
 pub struct Store {
