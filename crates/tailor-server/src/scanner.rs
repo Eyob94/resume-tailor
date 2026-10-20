@@ -181,7 +181,7 @@ impl Scanner {
         };
         let mut notes: Vec<String> = Vec::new();
         if let Some(error) = &report.error {
-            notes.push(error.clone());
+            notes.push(if error.ends_with('.') { error.clone() } else { format!("{error}.") });
         }
         if report.details_paused {
             notes.push(format!(

@@ -13,8 +13,9 @@ use crate::search::{PostedWithin, WorkMode};
 
 /// Full results page: ~60 jobs in one request. Used for the first page.
 const SEARCH_PAGE_URL: &str = "https://www.linkedin.com/jobs/search";
-/// "Load more" fragment: ~10 jobs per request, and signed-out visitors only
-/// get a few of these before a 429. Used for later pages only.
+/// "Load more" fragment: 10 jobs per request starting at `start` (a plain
+/// offset, so 60 continues after the full page). Signed-out visitors get
+/// about three of these per window before a 429. Used for later pages only.
 const SEE_MORE_URL: &str = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search";
 /// Public job page (what a shared link opens). The `jobs-guest/api` detail
 /// fragment shares the tight "load more" quota; this page doesn't.
@@ -105,27 +106,39 @@ impl LinkedInClient {
                 .collect();
             params.push(("f_WT", codes.join(",")));
         }
-        // Like the browser: the full page first, "load more" after that.
+        // Like the browser: the full page first, "load more" after that,
+        // with the results page as the referrer.
         let html = if query.start == 0 {
-            self.get("search", SEARCH_PAGE_URL, &params).await?
+            self.get("search", SEARCH_PAGE_URL, &params, None).await?
         } else {
+            let referer = reqwest::Url::parse_with_params(SEARCH_PAGE_URL, &params).ok();
             params.push(("start", query.start.to_string()));
-            self.get("search-more", SEE_MORE_URL, &params).await?
+            self.get("search-more", SEE_MORE_URL, &params, referer.as_ref().map(reqwest::Url::as_str)).await?
         };
         Ok(parse_search_results(&html))
     }
 
     /// `Ok(None)` when the posting no longer exists or has no description.
     pub async fn job_detail(&self, linkedin_id: &str) -> Result<Option<JobDetail>, LinkedInError> {
-        match self.get("detail", &format!("{DETAIL_URL}/{linkedin_id}"), &[]).await {
+        match self.get("detail", &format!("{DETAIL_URL}/{linkedin_id}"), &[], None).await {
             Ok(html) => Ok(parse_job_detail(&html)),
             Err(LinkedInError::Status(404 | 410)) => Ok(None),
             Err(e) => Err(e),
         }
     }
 
-    async fn get(&self, kind: &str, url: &str, params: &[(&str, String)]) -> Result<String, LinkedInError> {
-        let res = self.http.get(url).query(params).send().await?;
+    async fn get(
+        &self,
+        kind: &str,
+        url: &str,
+        params: &[(&str, String)],
+        referer: Option<&str>,
+    ) -> Result<String, LinkedInError> {
+        let mut request = self.http.get(url).query(params);
+        if let Some(referer) = referer {
+            request = request.header(reqwest::header::REFERER, referer);
+        }
+        let res = request.send().await?;
         let status = res.status().as_u16();
         let start = params.iter().find(|(k, _)| *k == "start").map(|(_, v)| v.as_str()).unwrap_or("-");
         tracing::info!(kind, status, start, "linkedin request");

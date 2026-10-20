@@ -186,6 +186,16 @@ impl Store {
     }
 }
 
+/// A fresh, unique temp directory for a test database. A counter makes it
+/// unique even when parallel tests start within the same clock tick.
+#[cfg(test)]
+pub(crate) fn test_dir(prefix: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()))
+}
+
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let applied = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? as usize;
     for (index, sql) in MIGRATIONS.iter().enumerate().skip(applied) {
@@ -200,11 +210,7 @@ mod tests {
     use super::*;
 
     fn temp_store() -> (Store, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "tailor-store-test-{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap()
-        ));
+        let dir = test_dir("tailor-store-test");
         (Store::open(&dir).unwrap(), dir)
     }
 
