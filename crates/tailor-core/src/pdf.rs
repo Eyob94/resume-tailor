@@ -11,13 +11,10 @@ pub enum PdfError {
 #[derive(Debug, Clone)]
 pub struct PdfInfo {
     pub page_count: usize,
-    /// Plain text pulled from the PDF. Empty for scanned / image-only files.
     pub text: String,
 }
 
-/// Validates that `bytes` is a readable PDF and extracts its page count and text.
 pub fn inspect(bytes: &[u8]) -> Result<PdfInfo, PdfError> {
-    // The spec allows the header anywhere in the first 1024 bytes.
     let header_window = &bytes[..bytes.len().min(1024)];
     if !header_window.windows(5).any(|w| w == b"%PDF-") {
         return Err(PdfError::NotPdf);
@@ -26,8 +23,6 @@ pub fn inspect(bytes: &[u8]) -> Result<PdfInfo, PdfError> {
     let doc = lopdf::Document::load_mem(bytes).map_err(|e| PdfError::Unreadable(e.to_string()))?;
     let page_count = doc.get_pages().len();
 
-    // pdf-extract can panic on unusual fonts/encodings; a failed extraction
-    // shouldn't block the upload, it just leaves the text empty.
     let text = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(bytes))
         .ok()
         .and_then(Result::ok)
@@ -37,7 +32,6 @@ pub fn inspect(bytes: &[u8]) -> Result<PdfInfo, PdfError> {
     Ok(PdfInfo { page_count, text })
 }
 
-/// Trims trailing whitespace and collapses runs of blank lines.
 fn normalize(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut previous_blank = false;

@@ -1,4 +1,3 @@
-//! Runs the AI over the uploaded resume in the background.
 
 use std::sync::Arc;
 
@@ -55,7 +54,6 @@ impl ResumeReader {
         AiStatus { ollama: Ollama::status(&self.ollama_url).await, resume_reader_model: self.model() }
     }
 
-    /// Starts reading the current resume in the background.
     pub fn start(self: &Arc<Self>) -> Result<(), StartError> {
         let resume = self.store.get_resume()?.ok_or(StartError::NoResume)?;
         if let Some(latest) = self.store.latest_profile(&resume.uploaded_at)? {

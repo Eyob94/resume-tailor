@@ -32,7 +32,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       const body = await res.json();
       if (typeof body?.error === "string") message = body.error;
     } catch {
-      // Non-JSON error body; keep the fallback message.
     }
     throw new ApiError(message, res.status);
   }
@@ -49,7 +48,6 @@ export const api = {
     return request<MasterResume>("/resume", { method: "POST", body: form });
   },
   deleteResume: () => request<void>("/resume", { method: "DELETE" }),
-  /** `version` busts the browser cache after a replace. */
   resumeFileUrl: (version: string) => `/api/resume/file?v=${encodeURIComponent(version)}`,
 };
 

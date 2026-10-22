@@ -1,7 +1,3 @@
-//! Language-model backends that return JSON matching a schema.
-//!
-//! Only Ollama (local, free) for now; Claude Code / Codex CLIs can implement
-//! the same trait later.
 
 use std::{future::Future, time::Duration};
 
@@ -25,9 +21,7 @@ pub enum AiError {
     BadOutput(String),
 }
 
-/// A model that answers with JSON shaped by a JSON schema.
 pub trait JsonModel {
-    /// Short name shown to the user, e.g. "ollama · qwen2.5:7b".
     fn label(&self) -> String;
 
     fn generate_json(
@@ -54,14 +48,12 @@ pub struct OllamaStatus {
 impl Ollama {
     pub fn new(base_url: &str, model: &str) -> Self {
         let http = reqwest::Client::builder()
-            // A 7B model on a laptop can take a few minutes for a long resume.
             .timeout(Duration::from_secs(600))
             .build()
             .expect("static client config is valid");
         Self { http, base_url: base_url.trim_end_matches('/').to_string(), model: model.to_string() }
     }
 
-    /// Whether Ollama answers, and which models are installed.
     pub async fn status(base_url: &str) -> OllamaStatus {
         let url = base_url.trim_end_matches('/').to_string();
         let models = async {
@@ -105,7 +97,6 @@ impl JsonModel for Ollama {
             "format": schema,
             "options": {
                 "temperature": 0,
-                // Ollama's default 2048-token window cuts off a full resume.
                 "num_ctx": 16384,
             },
             "messages": [

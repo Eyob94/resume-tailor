@@ -1,4 +1,3 @@
-//! The structured resume ("profile") the AI fills in from the uploaded PDF.
 
 use std::collections::HashSet;
 
@@ -11,9 +10,7 @@ use crate::ai::{AiError, JsonModel};
 #[serde(default)]
 pub struct ResumeProfile {
     pub contact: Contact,
-    /// The resume's own summary, as written.
     pub summary: Option<String>,
-    /// One-line description of the candidate, written by the AI from resume facts.
     pub headline: Option<String>,
     pub experience: Vec<Experience>,
     pub projects: Vec<Project>,
@@ -37,12 +34,10 @@ pub struct Contact {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Experience {
-    /// Stable ID assigned by the app, e.g. "e1". Never set by the AI.
     pub id: String,
     pub company: String,
     pub title: String,
     pub location: Option<String>,
-    /// Dates as written on the resume, e.g. "Mar 2021", "Present".
     pub start: Option<String>,
     pub end: Option<String>,
     pub bullets: Vec<Bullet>,
@@ -51,7 +46,6 @@ pub struct Experience {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Bullet {
-    /// Stable ID, e.g. "e1.b2". Tailoring may only reword or drop these.
     pub id: String,
     pub text: String,
 }
@@ -81,14 +75,11 @@ pub struct Education {
 pub struct Skill {
     pub name: String,
     pub years: Option<f32>,
-    /// Companies or projects where the skill was used.
     pub used_at: Vec<String>,
 }
 
-/// Something in the profile the user should double-check.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Warning {
-    /// Bullet or item ID the warning is about.
     pub item_id: String,
     pub message: String,
 }
@@ -110,7 +101,6 @@ fn strings() -> Value {
     json!({ "type": "array", "items": { "type": "string" } })
 }
 
-/// JSON schema the model must follow. IDs are left out: the app assigns them.
 pub fn schema() -> Value {
     json!({
         "type": "object",
@@ -192,7 +182,6 @@ pub fn schema() -> Value {
     })
 }
 
-/// The model's raw answer: same shape, but bullets are plain strings.
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct RawResume {
@@ -288,7 +277,6 @@ fn clean_bullets(list: &mut Vec<Bullet>) {
 }
 
 impl ResumeProfile {
-    /// Trims whitespace, drops empty entries and nonsense values.
     pub fn tidy(&mut self) {
         let c = &mut self.contact;
         c.name = clean(&c.name);
@@ -334,8 +322,6 @@ impl ResumeProfile {
         clean_list(&mut self.awards);
     }
 
-    /// Gives every job, project, school and bullet a stable ID. Existing IDs
-    /// are kept, so edits never renumber what the user already saw.
     pub fn assign_ids(&mut self) {
         fn next_free(used: &HashSet<String>, prefix: &str) -> String {
             (1..).map(|n| format!("{prefix}{n}")).find(|id| !used.contains(id)).unwrap()
@@ -371,12 +357,10 @@ impl ResumeProfile {
         }
     }
 
-    /// Flags bullets that don't appear word for word in the resume text, a
-    /// sign the model reworded or invented them.
     pub fn check_against(&self, resume_text: &str) -> Vec<Warning> {
         let source = normalize(resume_text);
         if source.is_empty() {
-            return Vec::new(); // Scanned PDF: nothing to compare against.
+            return Vec::new();
         }
         self.experience
             .iter()
@@ -388,18 +372,14 @@ impl ResumeProfile {
     }
 }
 
-/// Lowercase letters and digits only, so line breaks, hyphenation and
-/// punctuation from PDF extraction don't cause false alarms.
 fn normalize(s: &str) -> String {
     s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
 
-/// Reads the resume text into a profile with IDs and warnings.
 pub async fn read_resume<M: JsonModel>(model: &M, resume_text: &str) -> Result<(ResumeProfile, Vec<Warning>), AiError> {
     let user = format!("Resume text:\n<<<\n{resume_text}\n>>>");
     let schema = schema();
     let mut last_error = None;
-    // One retry: small local models occasionally slip on long outputs.
     for _ in 0..2 {
         let value = match model.generate_json(SYSTEM_PROMPT, &user, &schema).await {
             Ok(value) => value,
@@ -485,11 +465,9 @@ mod tests {
         let ids: Vec<&str> = job.bullets.iter().map(|b| b.id.as_str()).collect();
         assert_eq!(ids, vec!["e1.b1", "e1.b2", "e1.b3"]);
         assert_eq!(job.bullets[0].text, "Led migration of billing services to Rust, cutting p99 latency by 40%");
-        // Duplicate "rust" dropped; impossible years cleared.
         assert_eq!(profile.skills.len(), 2);
         assert_eq!(profile.skills[1].years, None);
 
-        // Only the invented bullet is flagged.
         assert_eq!(warnings, vec![Warning { item_id: "e1.b3".into(), message: "Not found word for word in your resume.".into() }]);
     }
 

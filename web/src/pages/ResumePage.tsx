@@ -10,7 +10,6 @@ import { formatBytes, formatDate, plural } from "../format";
 
 type Tab = "profile" | "preview" | "text" | "json";
 
-/** The AI's reading of the resume; polls while it's still reading. */
 function useProfile(resumeVersion: string) {
   const [record, setRecord] = useState<ProfileRecord | null | undefined>(undefined);
   const load = useCallback(async () => setRecord(await profileApi.get()), []);
@@ -127,7 +126,6 @@ function ResumeDetails({
     ["text", "Extracted text"],
     ...(devMode ? [["json", "JSON"] as [Tab, string]] : []),
   ];
-  // Turning dev mode off while on the JSON tab falls back to the preview.
   const tab = selectedTab === "json" && !devMode ? "preview" : selectedTab;
 
   return (
@@ -169,7 +167,6 @@ function ResumeDetails({
               const file = e.target.files?.[0];
               e.target.value = "";
               if (!file) return;
-              // Invalid files go straight through so the error shows without a pointless confirm.
               if (validateFile(file) || confirm(`Replace "${resume.file_name}" with "${file.name}"?`)) onReplace(file);
             }}
           />
@@ -217,7 +214,6 @@ function ResumeDetails({
           )
         ) : tab === "preview" ? (
           <>
-            {/* Mobile browsers (iOS Safari especially) render embedded PDFs poorly, so link out instead. */}
             <div className="flex flex-col items-center px-6 py-12 text-center md:hidden">
               <FileText className="mb-3 size-8 text-zinc-400" />
               <p className="text-sm text-zinc-500">PDF previews don't display well on small screens.</p>

@@ -23,7 +23,6 @@ function Brand() {
 export function Layout() {
   return (
     <div className="flex min-h-screen flex-col md:flex-row">
-      {/* Phones: slim top bar + bottom tab bar. */}
       <header className="sticky top-0 z-10 border-b border-zinc-200 bg-white/90 px-4 py-3 backdrop-blur md:hidden">
         <Brand />
       </header>
@@ -45,7 +44,6 @@ export function Layout() {
         ))}
       </nav>
 
-      {/* Tablet and up: sidebar. */}
       <aside className="sticky top-0 hidden h-screen w-60 shrink-0 flex-col border-r border-zinc-200 bg-white md:flex">
         <div className="px-5 py-5">
           <Brand />

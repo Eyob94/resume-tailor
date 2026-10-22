@@ -34,7 +34,6 @@ pub struct MasterResume {
     pub uploaded_at: String,
 }
 
-/// Each entry runs once, in order; progress is tracked in `PRAGMA user_version`.
 const MIGRATIONS: &[&str] = &[
     "CREATE TABLE master_resume (
         id             INTEGER PRIMARY KEY CHECK (id = 1),
@@ -47,10 +46,10 @@ const MIGRATIONS: &[&str] = &[
     "CREATE TABLE job_searches (
         id            INTEGER PRIMARY KEY,
         name          TEXT NOT NULL,
-        titles        TEXT NOT NULL,  -- JSON array
-        keywords      TEXT NOT NULL,  -- JSON array
+        titles        TEXT NOT NULL,
+        keywords      TEXT NOT NULL,
         location      TEXT,
-        work_modes    TEXT NOT NULL,  -- JSON array
+        work_modes    TEXT NOT NULL,
         posted_within TEXT NOT NULL,
         created_at    TEXT NOT NULL,
         updated_at    TEXT NOT NULL
@@ -76,7 +75,7 @@ const MIGRATIONS: &[&str] = &[
     CREATE TABLE search_matches (
         search_id        INTEGER NOT NULL REFERENCES job_searches(id) ON DELETE CASCADE,
         job_id           INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-        matched_keywords TEXT NOT NULL,  -- JSON array
+        matched_keywords TEXT NOT NULL,
         matched_at       TEXT NOT NULL,
         PRIMARY KEY (search_id, job_id)
     );
@@ -88,18 +87,17 @@ const MIGRATIONS: &[&str] = &[
         id          INTEGER PRIMARY KEY,
         started_at  TEXT NOT NULL,
         finished_at TEXT,
-        status      TEXT NOT NULL,  -- running | ok | partial | failed | interrupted
+        status      TEXT NOT NULL,
         new_matches INTEGER NOT NULL DEFAULT 0,
         message     TEXT
     );",
-    // Set once a tailored resume exists for the job.
     "ALTER TABLE jobs ADD COLUMN tailored_at TEXT;",
     "CREATE TABLE resume_profiles (
         id                 INTEGER PRIMARY KEY,
-        resume_uploaded_at TEXT NOT NULL,  -- which upload this reading belongs to
-        status             TEXT NOT NULL,  -- reading | ready | failed | confirmed
+        resume_uploaded_at TEXT NOT NULL,
+        status             TEXT NOT NULL,
         model              TEXT NOT NULL,
-        data               TEXT,           -- JSON ResumeProfile
+        data               TEXT,
         warnings           TEXT NOT NULL DEFAULT '[]',
         error              TEXT,
         created_at         TEXT NOT NULL,
@@ -148,7 +146,6 @@ impl Store {
         Ok(resume)
     }
 
-    /// Stores `bytes` as the master resume, replacing any existing one.
     pub fn save_resume(
         &self,
         file_name: &str,
@@ -157,7 +154,6 @@ impl Store {
     ) -> Result<MasterResume, StoreError> {
         let conn = self.conn.lock().unwrap();
 
-        // Write to a temp file first so a crash never leaves a half-written PDF.
         let tmp = self.data_dir.join("resume.pdf.tmp");
         fs::write(&tmp, bytes)?;
         fs::rename(&tmp, self.resume_pdf_path())?;
@@ -189,7 +185,6 @@ impl Store {
         Ok(resume)
     }
 
-    /// Removes the master resume. Returns `false` if there was none.
     pub fn delete_resume(&self) -> Result<bool, StoreError> {
         let conn = self.conn.lock().unwrap();
         let deleted = conn.execute("DELETE FROM master_resume WHERE id = 1", [])?;
@@ -202,8 +197,6 @@ impl Store {
     }
 }
 
-/// A fresh, unique temp directory for a test database. A counter makes it
-/// unique even when parallel tests start within the same clock tick.
 #[cfg(test)]
 pub(crate) fn test_dir(prefix: &str) -> PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};

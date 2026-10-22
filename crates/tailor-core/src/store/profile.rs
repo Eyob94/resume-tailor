@@ -1,4 +1,3 @@
-//! What the AI understood from each uploaded resume, and its review state.
 
 use chrono::Utc;
 use rusqlite::{params, OptionalExtension, Row};
@@ -11,15 +10,11 @@ fn now() -> String {
     Utc::now().to_rfc3339()
 }
 
-/// One reading of an uploaded resume.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProfileRecord {
     pub id: i64,
-    /// `uploaded_at` of the resume this reading belongs to.
     pub resume_uploaded_at: String,
-    /// reading | ready | failed | confirmed
     pub status: String,
-    /// Which AI read it, e.g. "ollama · qwen2.5:7b".
     pub model: String,
     pub profile: Option<ResumeProfile>,
     pub warnings: Vec<Warning>,
@@ -59,7 +54,6 @@ fn finish(parts: (ProfileRecord, Option<String>, String)) -> Result<ProfileRecor
 }
 
 impl Store {
-    /// Records that the AI started reading the resume uploaded at `resume_uploaded_at`.
     pub fn start_profile(&self, resume_uploaded_at: &str, model: &str) -> Result<i64, StoreError> {
         let conn = self.conn.lock().unwrap();
         let ts = now();
@@ -90,7 +84,6 @@ impl Store {
         Ok(())
     }
 
-    /// The latest reading of the resume uploaded at `resume_uploaded_at`.
     pub fn latest_profile(&self, resume_uploaded_at: &str) -> Result<Option<ProfileRecord>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let parts = conn
@@ -113,8 +106,6 @@ impl Store {
         parts.map(finish).transpose()
     }
 
-    /// Saves the user's corrections. A confirmed profile goes back to
-    /// `ready`: edits need confirming again.
     pub fn save_profile_edits(
         &self,
         id: i64,
@@ -141,7 +132,6 @@ impl Store {
         Ok(changed > 0)
     }
 
-    /// Readings left `reading` by a previous process can never finish.
     pub fn mark_interrupted_profiles(&self) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -166,7 +156,6 @@ mod tests {
         let id = store.start_profile("t1", "fake").unwrap();
         assert_eq!(store.latest_profile("t1").unwrap().unwrap().status, "reading");
         assert!(store.latest_profile("t2").unwrap().is_none());
-        // Can't confirm or edit while reading.
         assert!(!store.confirm_profile(id).unwrap());
 
         let profile = ResumeProfile { contact: Contact { name: "Jordan".into(), ..Default::default() }, ..Default::default() };
@@ -179,7 +168,6 @@ mod tests {
         assert!(store.confirm_profile(id).unwrap());
         assert!(store.get_profile(id).unwrap().unwrap().confirmed_at.is_some());
 
-        // Editing a confirmed profile needs confirming again.
         assert!(store.save_profile_edits(id, &profile, &[]).unwrap());
         let record = store.get_profile(id).unwrap().unwrap();
         assert_eq!((record.status.as_str(), record.confirmed_at), ("ready", None));
