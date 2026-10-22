@@ -179,6 +179,7 @@ export interface ProfileRecord {
 export interface AiStatus {
   ollama: { url: string; reachable: boolean; models: string[] };
   resume_reader_model: string;
+  ollama_url: string;
 }
 
 export const profileApi = {
@@ -187,7 +188,8 @@ export const profileApi = {
   save: (profile: ResumeProfile) => request<ProfileRecord>("/resume/profile", { method: "PUT", ...json(profile) }),
   confirm: () => request<ProfileRecord>("/resume/profile/confirm", { method: "POST" }),
   aiStatus: () => request<AiStatus>("/ai"),
-  setReaderModel: (model: string) => request<AiStatus>("/ai", { method: "PUT", ...json({ resume_reader_model: model }) }),
+  updateAiSettings: (settings: { resume_reader_model?: string; ollama_url?: string }) =>
+    request<AiStatus>("/ai", { method: "PUT", ...json(settings) }),
 };
 
 export function errorMessage(e: unknown): string {
