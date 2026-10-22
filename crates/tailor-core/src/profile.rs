@@ -1,87 +1,13 @@
 use std::collections::HashSet;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{ai::JsonModel, errors::AiError};
 
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ResumeProfile {
-    pub contact: Contact,
-    pub summary: Option<String>,
-    pub headline: Option<String>,
-    pub experience: Vec<Experience>,
-    pub projects: Vec<Project>,
-    pub education: Vec<Education>,
-    pub skills: Vec<Skill>,
-    pub certifications: Vec<String>,
-    pub languages: Vec<String>,
-    pub awards: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Contact {
-    pub name: String,
-    pub email: Option<String>,
-    pub phone: Option<String>,
-    pub location: Option<String>,
-    pub links: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Experience {
-    pub id: String,
-    pub company: String,
-    pub title: String,
-    pub location: Option<String>,
-    pub start: Option<String>,
-    pub end: Option<String>,
-    pub bullets: Vec<Bullet>,
-}
-
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Bullet {
-    pub id: String,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Project {
-    pub id: String,
-    pub name: String,
-    pub description: Option<String>,
-    pub bullets: Vec<Bullet>,
-}
-
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Education {
-    pub id: String,
-    pub school: String,
-    pub degree: Option<String>,
-    pub field: Option<String>,
-    pub start: Option<String>,
-    pub end: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Skill {
-    pub name: String,
-    pub years: Option<f32>,
-    pub used_at: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Warning {
-    pub item_id: String,
-    pub message: String,
-}
+pub use crate::types::{
+    Bullet, Contact, Education, Experience, Project, ResumeProfile, Skill, Warning,
+};
 
 const SYSTEM_PROMPT: &str = "You extract structured data from a resume. \
 Fill the JSON structure using only information found in the resume text. \
@@ -216,7 +142,12 @@ struct RawProject {
 }
 
 fn bullets(raw: Vec<String>) -> Vec<Bullet> {
-    raw.into_iter().map(|text| Bullet { id: String::new(), text }).collect()
+    raw.into_iter()
+        .map(|text| Bullet {
+            id: String::new(),
+            text,
+        })
+        .collect()
 }
 
 impl From<RawResume> for ResumeProfile {
@@ -241,7 +172,12 @@ impl From<RawResume> for ResumeProfile {
             projects: raw
                 .projects
                 .into_iter()
-                .map(|p| Project { id: String::new(), name: p.name, description: p.description, bullets: bullets(p.bullets) })
+                .map(|p| Project {
+                    id: String::new(),
+                    name: p.name,
+                    description: p.description,
+                    bullets: bullets(p.bullets),
+                })
                 .collect(),
             education: raw.education,
             skills: raw.skills,
@@ -323,11 +259,17 @@ impl ResumeProfile {
 
     pub fn assign_ids(&mut self) {
         fn next_free(used: &HashSet<String>, prefix: &str) -> String {
-            (1..).map(|n| format!("{prefix}{n}")).find(|id| !used.contains(id)).unwrap()
+            (1..)
+                .map(|n| format!("{prefix}{n}"))
+                .find(|id| !used.contains(id))
+                .unwrap()
         }
         fn fill_bullets(owner: &str, bullets: &mut [Bullet]) {
             let mut used: HashSet<String> = bullets.iter().map(|b| b.id.clone()).collect();
-            for b in bullets.iter_mut().filter(|b| b.id.is_empty() || !b.id.starts_with(&format!("{owner}.b"))) {
+            for b in bullets
+                .iter_mut()
+                .filter(|b| b.id.is_empty() || !b.id.starts_with(&format!("{owner}.b")))
+            {
                 b.id = next_free(&used, &format!("{owner}.b"));
                 used.insert(b.id.clone());
             }
@@ -366,16 +308,25 @@ impl ResumeProfile {
             .flat_map(|e| &e.bullets)
             .chain(self.projects.iter().flat_map(|p| &p.bullets))
             .filter(|b| !source.contains(&normalize(&b.text)))
-            .map(|b| Warning { item_id: b.id.clone(), message: "Not found word for word in your resume.".into() })
+            .map(|b| Warning {
+                item_id: b.id.clone(),
+                message: "Not found word for word in your resume.".into(),
+            })
             .collect()
     }
 }
 
 fn normalize(s: &str) -> String {
-    s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
-pub async fn read_resume<M: JsonModel>(model: &M, resume_text: &str) -> Result<(ResumeProfile, Vec<Warning>), AiError> {
+pub async fn read_resume<M: JsonModel>(
+    model: &M,
+    resume_text: &str,
+) -> Result<(ResumeProfile, Vec<Warning>), AiError> {
     let user = format!("Resume text:\n<<<\n{resume_text}\n>>>");
     let schema = schema();
     let mut last_error = None;
@@ -455,7 +406,9 @@ mod tests {
 
     #[tokio::test]
     async fn reads_tidies_assigns_ids_and_flags_invented_bullets() {
-        let model = FakeModel { answers: Mutex::new(vec![Ok(answer())]) };
+        let model = FakeModel {
+            answers: Mutex::new(vec![Ok(answer())]),
+        };
         let (profile, warnings) = read_resume(&model, RESUME_TEXT).await.unwrap();
 
         assert_eq!(profile.contact.name, "Jordan Rivera");
@@ -463,28 +416,53 @@ mod tests {
         assert_eq!(job.id, "e1");
         let ids: Vec<&str> = job.bullets.iter().map(|b| b.id.as_str()).collect();
         assert_eq!(ids, vec!["e1.b1", "e1.b2", "e1.b3"]);
-        assert_eq!(job.bullets[0].text, "Led migration of billing services to Rust, cutting p99 latency by 40%");
+        assert_eq!(
+            job.bullets[0].text,
+            "Led migration of billing services to Rust, cutting p99 latency by 40%"
+        );
         assert_eq!(profile.skills.len(), 2);
         assert_eq!(profile.skills[1].years, None);
 
-        assert_eq!(warnings, vec![Warning { item_id: "e1.b3".into(), message: "Not found word for word in your resume.".into() }]);
+        assert_eq!(
+            warnings,
+            vec![Warning {
+                item_id: "e1.b3".into(),
+                message: "Not found word for word in your resume.".into()
+            }]
+        );
     }
 
     #[tokio::test]
     async fn retries_once_on_bad_output() {
-        let model = FakeModel { answers: Mutex::new(vec![Err(AiError::BadOutput("cut off".into())), Ok(answer())]) };
+        let model = FakeModel {
+            answers: Mutex::new(vec![
+                Err(AiError::BadOutput("cut off".into())),
+                Ok(answer()),
+            ]),
+        };
         assert!(read_resume(&model, RESUME_TEXT).await.is_ok());
 
         let model = FakeModel {
-            answers: Mutex::new(vec![Err(AiError::BadOutput("a".into())), Err(AiError::BadOutput("b".into()))]),
+            answers: Mutex::new(vec![
+                Err(AiError::BadOutput("a".into())),
+                Err(AiError::BadOutput("b".into())),
+            ]),
         };
-        assert!(matches!(read_resume(&model, RESUME_TEXT).await, Err(AiError::BadOutput(_))));
+        assert!(matches!(
+            read_resume(&model, RESUME_TEXT).await,
+            Err(AiError::BadOutput(_))
+        ));
     }
 
     #[tokio::test]
     async fn connection_errors_are_not_retried() {
-        let model = FakeModel { answers: Mutex::new(vec![Err(AiError::Unreachable("x".into()))]) };
-        assert!(matches!(read_resume(&model, RESUME_TEXT).await, Err(AiError::Unreachable(_))));
+        let model = FakeModel {
+            answers: Mutex::new(vec![Err(AiError::Unreachable("x".into()))]),
+        };
+        assert!(matches!(
+            read_resume(&model, RESUME_TEXT).await,
+            Err(AiError::Unreachable(_))
+        ));
     }
 
     #[test]
@@ -493,17 +471,36 @@ mod tests {
             experience: vec![Experience {
                 id: "e1".into(),
                 bullets: vec![
-                    Bullet { id: "e1.b1".into(), text: "a".into() },
-                    Bullet { id: String::new(), text: "new".into() },
-                    Bullet { id: "e1.b3".into(), text: "c".into() },
+                    Bullet {
+                        id: "e1.b1".into(),
+                        text: "a".into(),
+                    },
+                    Bullet {
+                        id: String::new(),
+                        text: "new".into(),
+                    },
+                    Bullet {
+                        id: "e1.b3".into(),
+                        text: "c".into(),
+                    },
                 ],
                 ..Default::default()
             }],
             ..Default::default()
         };
-        profile.experience.push(Experience { bullets: vec![Bullet { id: String::new(), text: "x".into() }], ..Default::default() });
+        profile.experience.push(Experience {
+            bullets: vec![Bullet {
+                id: String::new(),
+                text: "x".into(),
+            }],
+            ..Default::default()
+        });
         profile.assign_ids();
-        let first: Vec<&str> = profile.experience[0].bullets.iter().map(|b| b.id.as_str()).collect();
+        let first: Vec<&str> = profile.experience[0]
+            .bullets
+            .iter()
+            .map(|b| b.id.as_str())
+            .collect();
         assert_eq!(first, vec!["e1.b1", "e1.b2", "e1.b3"]);
         assert_eq!(profile.experience[1].id, "e2");
         assert_eq!(profile.experience[1].bullets[0].id, "e2.b1");
@@ -513,7 +510,10 @@ mod tests {
     fn verbatim_check_ignores_pdf_line_breaks() {
         let profile = ResumeProfile {
             experience: vec![Experience {
-                bullets: vec![Bullet { id: "e1.b1".into(), text: "Mentored 4 engineers".into() }],
+                bullets: vec![Bullet {
+                    id: "e1.b1".into(),
+                    text: "Mentored 4 engineers".into(),
+                }],
                 ..Default::default()
             }],
             ..Default::default()

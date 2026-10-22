@@ -1,9 +1,9 @@
 use std::{future::Future, time::Duration};
 
-use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::errors::AiError;
+use crate::types::OllamaStatus;
 
 pub const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
 
@@ -24,20 +24,17 @@ pub struct Ollama {
     model: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct OllamaStatus {
-    pub url: String,
-    pub reachable: bool,
-    pub models: Vec<String>,
-}
-
 impl Ollama {
     pub fn new(base_url: &str, model: &str) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(600))
             .build()
             .expect("static client config is valid");
-        Self { http, base_url: base_url.trim_end_matches('/').to_string(), model: model.to_string() }
+        Self {
+            http,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            model: model.to_string(),
+        }
     }
 
     pub async fn status(base_url: &str) -> OllamaStatus {
@@ -59,7 +56,11 @@ impl Ollama {
             Some(names)
         }
         .await;
-        OllamaStatus { url, reachable: models.is_some(), models: models.unwrap_or_default() }
+        OllamaStatus {
+            url,
+            reachable: models.is_some(),
+            models: models.unwrap_or_default(),
+        }
     }
 
     fn map_send_error(&self, e: reqwest::Error) -> AiError {
@@ -76,7 +77,12 @@ impl JsonModel for Ollama {
         format!("ollama · {}", self.model)
     }
 
-    async fn generate_json(&self, system: &str, user: &str, schema: &Value) -> Result<Value, AiError> {
+    async fn generate_json(
+        &self,
+        system: &str,
+        user: &str,
+        schema: &Value,
+    ) -> Result<Value, AiError> {
         let body = json!({
             "model": self.model,
             "stream": false,
@@ -107,7 +113,8 @@ impl JsonModel for Ollama {
             return Err(AiError::Status(status, text.chars().take(300).collect()));
         }
 
-        let reply: Value = serde_json::from_str(&text).map_err(|e| AiError::BadOutput(e.to_string()))?;
+        let reply: Value =
+            serde_json::from_str(&text).map_err(|e| AiError::BadOutput(e.to_string()))?;
         let content = reply["message"]["content"]
             .as_str()
             .ok_or_else(|| AiError::BadOutput("no message content".into()))?;

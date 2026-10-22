@@ -1,12 +1,7 @@
 use std::sync::Arc;
 
 use serde::Serialize;
-use tailor_core::{
-    ai::{Ollama, OllamaStatus},
-    profile::read_resume,
-    errors::StoreError,
-    store::Store,
-};
+use tailor_core::{ai::Ollama, db::Db, errors::DbError, profile::read_resume, types::OllamaStatus};
 
 use crate::errors::StartError;
 
@@ -20,12 +15,12 @@ pub struct AiStatus {
 }
 
 pub struct ResumeReader {
-    store: Arc<Store>,
+    store: Arc<Db>,
     ollama_url: String,
 }
 
 impl ResumeReader {
-    pub fn new(store: Arc<Store>, ollama_url: String) -> Self {
+    pub fn new(store: Arc<Db>, ollama_url: String) -> Self {
         if let Err(e) = store.mark_interrupted_profiles() {
             tracing::error!("couldn't tidy interrupted resume readings: {e}");
         }
@@ -33,15 +28,22 @@ impl ResumeReader {
     }
 
     pub fn model(&self) -> String {
-        self.store.get_setting(MODEL_KEY).ok().flatten().unwrap_or_else(|| DEFAULT_MODEL.into())
+        self.store
+            .get_setting(MODEL_KEY)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| DEFAULT_MODEL.into())
     }
 
-    pub fn set_model(&self, model: &str) -> Result<(), StoreError> {
+    pub fn set_model(&self, model: &str) -> Result<(), DbError> {
         self.store.set_setting(MODEL_KEY, model)
     }
 
     pub async fn status(&self) -> AiStatus {
-        AiStatus { ollama: Ollama::status(&self.ollama_url).await, resume_reader_model: self.model() }
+        AiStatus {
+            ollama: Ollama::status(&self.ollama_url).await,
+            resume_reader_model: self.model(),
+        }
     }
 
     pub fn start(self: &Arc<Self>) -> Result<(), StartError> {
@@ -69,7 +71,10 @@ impl ResumeReader {
             if let Err(e) = outcome {
                 tracing::error!("couldn't save resume reading: {e}");
             }
-            tracing::info!(seconds = started.elapsed().as_secs(), "resume reading finished");
+            tracing::info!(
+                seconds = started.elapsed().as_secs(),
+                "resume reading finished"
+            );
         });
         Ok(())
     }

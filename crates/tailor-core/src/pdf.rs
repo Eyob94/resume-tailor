@@ -1,10 +1,5 @@
 use crate::errors::PdfError;
-
-#[derive(Debug, Clone)]
-pub struct PdfInfo {
-    pub page_count: usize,
-    pub text: String,
-}
+use crate::types::PdfInfo;
 
 pub fn inspect(bytes: &[u8]) -> Result<PdfInfo, PdfError> {
     let header_window = &bytes[..bytes.len().min(1024)];

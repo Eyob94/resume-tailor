@@ -13,17 +13,19 @@ use axum::{
 };
 use errors::{AppError, StartError};
 use reader::{AiStatus, ResumeReader};
-use scanner::{Scanner, ScanStatus, MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES};
+use scanner::{Scanner, MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES};
 use serde::Deserialize;
 use serde_json::json;
 use tailor_core::{
-    linkedin::LinkedInClient,
     ai::DEFAULT_OLLAMA_URL,
+    db::Db,
     errors::PdfError,
+    linkedin::LinkedInClient,
     pdf,
-    profile::ResumeProfile,
-    search::{JobSearch, SearchInput},
-    store::{JobListing, JobStatus, MasterResume, ProfileRecord, Store},
+    types::{
+        JobListing, JobSearch, JobStatus, MasterResume, ProfileRecord, ResumeProfile, ScanStatus,
+        SearchInput,
+    },
 };
 use tower_http::{
     services::{ServeDir, ServeFile},
@@ -35,7 +37,7 @@ pub(crate) const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
-    store: Arc<Store>,
+    store: Arc<Db>,
     scanner: Arc<Scanner>,
     reader: Arc<ResumeReader>,
 }
@@ -46,7 +48,7 @@ impl FromRef<AppState> for Arc<ResumeReader> {
     }
 }
 
-impl FromRef<AppState> for Arc<Store> {
+impl FromRef<AppState> for Arc<Db> {
     fn from_ref(state: &AppState) -> Self {
         state.store.clone()
     }
@@ -68,9 +70,12 @@ async fn main() -> anyhow::Result<()> {
 
     let data_dir = env::var("DATA_DIR").unwrap_or_else(|_| "data".into());
     let web_dist = PathBuf::from(env::var("WEB_DIST").unwrap_or_else(|_| "web/dist".into()));
-    let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8787);
+    let port: u16 = env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8787);
 
-    let store = Arc::new(Store::open(&data_dir)?);
+    let store = Arc::new(Db::open(&data_dir)?);
     let scanner = Arc::new(Scanner::new(store.clone(), LinkedInClient::new()?));
     tokio::spawn(scanner.clone().run_forever());
     let ollama_url = env::var("OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.into());
@@ -78,7 +83,10 @@ async fn main() -> anyhow::Result<()> {
 
     let api = Router::new()
         .route("/health", get(health))
-        .route("/resume", get(get_resume).post(upload_resume).delete(delete_resume))
+        .route(
+            "/resume",
+            get(get_resume).post(upload_resume).delete(delete_resume),
+        )
         .route("/resume/file", get(resume_file))
         .route("/resume/profile", get(get_profile).put(update_profile))
         .route("/resume/profile/read", post(read_profile))
@@ -93,7 +101,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/scan/run", post(run_scan_now))
         .route("/settings", get(get_settings).put(update_settings))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES + 64 * 1024))
-        .with_state(AppState { store, scanner, reader });
+        .with_state(AppState {
+            store,
+            scanner,
+            reader,
+        });
 
     let mut app = Router::new().nest("/api", api);
     if web_dist.join("index.html").exists() {
@@ -113,7 +125,7 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({ "ok": true }))
 }
 
-async fn get_resume(State(store): State<Arc<Store>>) -> Result<Json<Option<MasterResume>>, AppError> {
+async fn get_resume(State(store): State<Arc<Db>>) -> Result<Json<Option<MasterResume>>, AppError> {
     Ok(Json(store.get_resume()?))
 }
 
@@ -145,13 +157,16 @@ async fn upload_resume(
             PdfError::NotPdf => AppError::bad_request("That file isn't a PDF."),
             PdfError::Unreadable(detail) => {
                 tracing::warn!("unreadable PDF: {detail}");
-                AppError::bad_request("Couldn't read that PDF. It may be corrupted or password-protected.")
+                AppError::bad_request(
+                    "Couldn't read that PDF. It may be corrupted or password-protected.",
+                )
             }
         })?;
 
-        let saved = tokio::task::spawn_blocking(move || store.save_resume(&file_name, &bytes, &info))
-            .await
-            .map_err(AppError::internal)??;
+        let saved =
+            tokio::task::spawn_blocking(move || store.save_resume(&file_name, &bytes, &info))
+                .await
+                .map_err(AppError::internal)??;
         if let Err(StartError::Store(e)) = state.reader.start() {
             tracing::error!("couldn't start reading the resume: {e}");
         }
@@ -160,7 +175,7 @@ async fn upload_resume(
     Err(AppError::bad_request("No file was uploaded."))
 }
 
-async fn delete_resume(State(store): State<Arc<Store>>) -> Result<StatusCode, AppError> {
+async fn delete_resume(State(store): State<Arc<Db>>) -> Result<StatusCode, AppError> {
     if store.delete_resume()? {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -168,7 +183,7 @@ async fn delete_resume(State(store): State<Arc<Store>>) -> Result<StatusCode, Ap
     }
 }
 
-async fn resume_file(State(store): State<Arc<Store>>) -> Result<Response, AppError> {
+async fn resume_file(State(store): State<Arc<Db>>) -> Result<Response, AppError> {
     let Some(resume) = store.get_resume()? else {
         return Err(AppError::not_found());
     };
@@ -180,17 +195,28 @@ async fn resume_file(State(store): State<Arc<Store>>) -> Result<Response, AppErr
     let header_name: String = resume
         .file_name
         .chars()
-        .map(|c| if c.is_ascii_graphic() && c != '"' || c == ' ' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_graphic() && c != '"' || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let headers = [
         (header::CONTENT_TYPE, "application/pdf".to_string()),
-        (header::CONTENT_DISPOSITION, format!("inline; filename=\"{header_name}\"")),
+        (
+            header::CONTENT_DISPOSITION,
+            format!("inline; filename=\"{header_name}\""),
+        ),
         (header::CACHE_CONTROL, "no-cache".to_string()),
     ];
     Ok((headers, bytes).into_response())
 }
 
-async fn get_profile(State(store): State<Arc<Store>>) -> Result<Json<Option<ProfileRecord>>, AppError> {
+async fn get_profile(
+    State(store): State<Arc<Db>>,
+) -> Result<Json<Option<ProfileRecord>>, AppError> {
     let Some(resume) = store.get_resume()? else {
         return Ok(Json(None));
     };
@@ -201,14 +227,15 @@ async fn read_profile(State(reader): State<Arc<ResumeReader>>) -> Result<StatusC
     match reader.start() {
         Ok(()) => Ok(StatusCode::ACCEPTED),
         Err(StartError::NoResume) => Err(AppError::not_found()),
-        Err(StartError::AlreadyReading) => {
-            Err(AppError { status: StatusCode::CONFLICT, message: "Your resume is already being read.".into() })
-        }
+        Err(StartError::AlreadyReading) => Err(AppError {
+            status: StatusCode::CONFLICT,
+            message: "Your resume is already being read.".into(),
+        }),
         Err(StartError::Store(e)) => Err(e.into()),
     }
 }
 
-fn current_profile(store: &Store) -> Result<(MasterResume, ProfileRecord), AppError> {
+fn current_profile(store: &Db) -> Result<(MasterResume, ProfileRecord), AppError> {
     let resume = store.get_resume()?.ok_or_else(AppError::not_found)?;
     let record = store
         .latest_profile(&resume.uploaded_at)?
@@ -217,7 +244,7 @@ fn current_profile(store: &Store) -> Result<(MasterResume, ProfileRecord), AppEr
 }
 
 async fn update_profile(
-    State(store): State<Arc<Store>>,
+    State(store): State<Arc<Db>>,
     Json(mut profile): Json<ResumeProfile>,
 ) -> Result<Json<ProfileRecord>, AppError> {
     let (resume, record) = current_profile(&store)?;
@@ -233,11 +260,13 @@ async fn update_profile(
             message: "This reading can't be edited right now. Reload the page.".into(),
         });
     }
-    let saved = store.get_profile(record.id)?.ok_or_else(|| AppError::internal("profile vanished"))?;
+    let saved = store
+        .get_profile(record.id)?
+        .ok_or_else(|| AppError::internal("profile vanished"))?;
     Ok(Json(saved))
 }
 
-async fn confirm_profile(State(store): State<Arc<Store>>) -> Result<Json<ProfileRecord>, AppError> {
+async fn confirm_profile(State(store): State<Arc<Db>>) -> Result<Json<ProfileRecord>, AppError> {
     let (_, record) = current_profile(&store)?;
     if !store.confirm_profile(record.id)? {
         return Err(AppError {
@@ -245,7 +274,9 @@ async fn confirm_profile(State(store): State<Arc<Store>>) -> Result<Json<Profile
             message: "Only a finished reading can be confirmed. Reload the page.".into(),
         });
     }
-    let saved = store.get_profile(record.id)?.ok_or_else(|| AppError::internal("profile vanished"))?;
+    let saved = store
+        .get_profile(record.id)?
+        .ok_or_else(|| AppError::internal("profile vanished"))?;
     Ok(Json(saved))
 }
 
@@ -270,7 +301,7 @@ async fn update_ai_settings(
     Ok(Json(reader.status().await))
 }
 
-async fn list_searches(State(store): State<Arc<Store>>) -> Result<Json<Vec<JobSearch>>, AppError> {
+async fn list_searches(State(store): State<Arc<Db>>) -> Result<Json<Vec<JobSearch>>, AppError> {
     Ok(Json(store.list_searches()?))
 }
 
@@ -290,12 +321,18 @@ async fn update_search(
     Json(input): Json<SearchInput>,
 ) -> Result<Json<JobSearch>, AppError> {
     let criteria = input.validate().map_err(|e| AppError::bad_request(e.0))?;
-    let search = state.store.update_search(id, &criteria)?.ok_or_else(|| AppError::not_found_msg("Search not found."))?;
+    let search = state
+        .store
+        .update_search(id, &criteria)?
+        .ok_or_else(|| AppError::not_found_msg("Search not found."))?;
     state.scanner.reschedule();
     Ok(Json(search))
 }
 
-async fn delete_search(State(state): State<AppState>, Path(id): Path<i64>) -> Result<StatusCode, AppError> {
+async fn delete_search(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, AppError> {
     if !state.store.delete_search(id)? {
         return Err(AppError::not_found_msg("Search not found."));
     }
@@ -309,7 +346,7 @@ struct JobsQuery {
 }
 
 async fn list_jobs(
-    State(store): State<Arc<Store>>,
+    State(store): State<Arc<Db>>,
     Query(query): Query<JobsQuery>,
 ) -> Result<Json<Vec<JobListing>>, AppError> {
     Ok(Json(store.list_jobs(query.status)?))
@@ -321,7 +358,7 @@ struct JobPatch {
 }
 
 async fn update_job(
-    State(store): State<Arc<Store>>,
+    State(store): State<Arc<Db>>,
     Path(id): Path<i64>,
     Json(patch): Json<JobPatch>,
 ) -> Result<StatusCode, AppError> {
@@ -341,11 +378,13 @@ struct BulkJobStatus {
 const MAX_BULK_IDS: usize = 2000;
 
 async fn update_jobs_status(
-    State(store): State<Arc<Store>>,
+    State(store): State<Arc<Db>>,
     Json(body): Json<BulkJobStatus>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     if body.ids.len() > MAX_BULK_IDS {
-        return Err(AppError::bad_request(format!("Update at most {MAX_BULK_IDS} jobs at once.")));
+        return Err(AppError::bad_request(format!(
+            "Update at most {MAX_BULK_IDS} jobs at once."
+        )));
     }
     let updated = store.set_jobs_status(&body.ids, body.status)?;
     Ok(Json(json!({ "updated": updated })))
@@ -359,7 +398,10 @@ async fn run_scan_now(State(scanner): State<Arc<Scanner>>) -> Result<StatusCode,
     scanner
         .request_run()
         .map(|()| StatusCode::ACCEPTED)
-        .map_err(|message| AppError { status: StatusCode::TOO_MANY_REQUESTS, message })
+        .map_err(|message| AppError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message,
+        })
 }
 
 #[derive(serde::Serialize, Deserialize)]
@@ -368,7 +410,9 @@ struct Settings {
 }
 
 async fn get_settings(State(scanner): State<Arc<Scanner>>) -> Json<Settings> {
-    Json(Settings { scan_interval_minutes: scanner.interval_minutes() })
+    Json(Settings {
+        scan_interval_minutes: scanner.interval_minutes(),
+    })
 }
 
 async fn update_settings(
@@ -401,7 +445,10 @@ mod tests {
 
     #[test]
     fn sanitizes_file_names() {
-        assert_eq!(sanitize_file_name("../../etc/My Resume.pdf"), "My Resume.pdf");
+        assert_eq!(
+            sanitize_file_name("../../etc/My Resume.pdf"),
+            "My Resume.pdf"
+        );
         assert_eq!(sanitize_file_name("C:\\Users\\me\\cv.pdf"), "cv.pdf");
         assert_eq!(sanitize_file_name("   "), "resume.pdf");
     }

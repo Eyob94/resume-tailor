@@ -33,7 +33,7 @@ pub enum LinkedInError {
 }
 
 #[derive(Debug, Error)]
-pub enum StoreError {
+pub enum DbError {
     #[error(transparent)]
     Db(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -51,5 +51,5 @@ pub(crate) enum ScanError {
     #[error(transparent)]
     Source(#[from] LinkedInError),
     #[error(transparent)]
-    Store(#[from] StoreError),
+    Db(#[from] DbError),
 }

@@ -1,36 +1,16 @@
 use std::time::Duration;
 
 use scraper::{ElementRef, Html, Selector};
-use serde::Serialize;
 
 use crate::errors::LinkedInError;
 
-use crate::search::{PostedWithin, WorkMode};
+use crate::types::{JobCard, JobDetail, PostedWithin, WorkMode};
 
 const SEARCH_PAGE_URL: &str = "https://www.linkedin.com/jobs/search";
 const SEE_MORE_URL: &str = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search";
 const DETAIL_URL: &str = "https://www.linkedin.com/jobs/view";
 const USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct JobCard {
-    pub linkedin_id: String,
-    pub title: String,
-    pub company: String,
-    pub company_url: Option<String>,
-    pub location: String,
-    pub posted_on: Option<String>,
-    pub url: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct JobDetail {
-    pub description: String,
-    pub seniority: Option<String>,
-    pub employment_type: Option<String>,
-    pub industries: Option<String>,
-}
 
 pub struct SearchQuery<'a> {
     pub keywords: &'a str,
@@ -47,8 +27,14 @@ pub struct LinkedInClient {
 impl LinkedInClient {
     pub fn new() -> Result<Self, reqwest::Error> {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,*/*;q=0.8".parse().unwrap());
-        headers.insert(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9".parse().unwrap());
+        headers.insert(
+            reqwest::header::ACCEPT,
+            "text/html,application/xhtml+xml,*/*;q=0.8".parse().unwrap(),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT_LANGUAGE,
+            "en-US,en;q=0.9".parse().unwrap(),
+        );
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .default_headers(headers)
@@ -84,13 +70,22 @@ impl LinkedInClient {
         } else {
             let referer = reqwest::Url::parse_with_params(SEARCH_PAGE_URL, &params).ok();
             params.push(("start", query.start.to_string()));
-            self.get("search-more", SEE_MORE_URL, &params, referer.as_ref().map(reqwest::Url::as_str)).await?
+            self.get(
+                "search-more",
+                SEE_MORE_URL,
+                &params,
+                referer.as_ref().map(reqwest::Url::as_str),
+            )
+            .await?
         };
         Ok(parse_search_results(&html))
     }
 
     pub async fn job_detail(&self, linkedin_id: &str) -> Result<Option<JobDetail>, LinkedInError> {
-        match self.get("detail", &format!("{DETAIL_URL}/{linkedin_id}"), &[], None).await {
+        match self
+            .get("detail", &format!("{DETAIL_URL}/{linkedin_id}"), &[], None)
+            .await
+        {
             Ok(html) => Ok(parse_job_detail(&html)),
             Err(LinkedInError::Status(404 | 410)) => Ok(None),
             Err(e) => Err(e),
@@ -110,7 +105,11 @@ impl LinkedInClient {
         }
         let res = request.send().await?;
         let status = res.status().as_u16();
-        let start = params.iter().find(|(k, _)| *k == "start").map(|(_, v)| v.as_str()).unwrap_or("-");
+        let start = params
+            .iter()
+            .find(|(k, _)| *k == "start")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("-");
         tracing::info!(kind, status, start, "linkedin request");
         match status {
             200..=299 => Ok(res.text().await?),
@@ -125,7 +124,12 @@ fn selector(css: &str) -> Selector {
 }
 
 fn clean_text(el: ElementRef) -> String {
-    el.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ")
+    el.text()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn without_query(url: &str) -> String {
@@ -154,33 +158,61 @@ fn parse_card(card: ElementRef) -> Option<JobCard> {
     }
 
     let first = |css: &str| card.select(&selector(css)).next();
-    let title = first(".base-search-card__title").map(clean_text).filter(|t| !t.is_empty())?;
-    let company = first(".base-search-card__subtitle").map(clean_text).unwrap_or_default();
-    let company_url = first(".base-search-card__subtitle a[href]").and_then(|a| a.value().attr("href")).map(without_query);
-    let location = first(".job-search-card__location").map(clean_text).unwrap_or_default();
-    let posted_on = first("time[datetime]").and_then(|t| t.value().attr("datetime")).map(str::to_string);
+    let title = first(".base-search-card__title")
+        .map(clean_text)
+        .filter(|t| !t.is_empty())?;
+    let company = first(".base-search-card__subtitle")
+        .map(clean_text)
+        .unwrap_or_default();
+    let company_url = first(".base-search-card__subtitle a[href]")
+        .and_then(|a| a.value().attr("href"))
+        .map(without_query);
+    let location = first(".job-search-card__location")
+        .map(clean_text)
+        .unwrap_or_default();
+    let posted_on = first("time[datetime]")
+        .and_then(|t| t.value().attr("datetime"))
+        .map(str::to_string);
     let url = first("a.base-card__full-link[href]")
         .and_then(|a| a.value().attr("href"))
         .or_else(|| card.value().attr("href"))
         .map(without_query)
         .unwrap_or_else(|| format!("https://www.linkedin.com/jobs/view/{linkedin_id}"));
 
-    Some(JobCard { linkedin_id, title, company, company_url, location, posted_on, url })
+    Some(JobCard {
+        linkedin_id,
+        title,
+        company,
+        company_url,
+        location,
+        posted_on,
+        url,
+    })
 }
 
 pub fn parse_job_detail(html: &str) -> Option<JobDetail> {
     let doc = Html::parse_document(html);
-    let markup = doc.select(&selector(".show-more-less-html__markup")).next()?;
+    let markup = doc
+        .select(&selector(".show-more-less-html__markup"))
+        .next()?;
     let description = block_text(markup);
     if description.is_empty() {
         return None;
     }
 
-    let mut detail = JobDetail { description, seniority: None, employment_type: None, industries: None };
+    let mut detail = JobDetail {
+        description,
+        seniority: None,
+        employment_type: None,
+        industries: None,
+    };
     let header_sel = selector(".description__job-criteria-subheader");
     let value_sel = selector(".description__job-criteria-text");
     for item in doc.select(&selector(".description__job-criteria-item")) {
-        let (Some(header), Some(value)) = (item.select(&header_sel).next(), item.select(&value_sel).next()) else {
+        let (Some(header), Some(value)) = (
+            item.select(&header_sel).next(),
+            item.select(&value_sel).next(),
+        ) else {
             continue;
         };
         let value = Some(clean_text(value)).filter(|v| !v.is_empty());
@@ -216,7 +248,8 @@ fn block_text(root: ElementRef) -> String {
                         out.push_str("\n- ");
                         walk(child_el, out);
                     }
-                    "p" | "div" | "ul" | "ol" | "section" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                    "p" | "div" | "ul" | "ol" | "section" | "h1" | "h2" | "h3" | "h4" | "h5"
+                    | "h6" => {
                         out.push('\n');
                         walk(child_el, out);
                         out.push('\n');

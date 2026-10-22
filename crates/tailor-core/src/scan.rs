@@ -3,24 +3,36 @@ use std::{collections::HashSet, future::Future, time::Duration};
 use rand::Rng;
 
 use crate::{
+    db::Db,
     errors::{LinkedInError, ScanError},
-    linkedin::{JobCard, JobDetail, LinkedInClient, SearchQuery},
+    linkedin::{LinkedInClient, SearchQuery},
     matching::{infer_work_mode, keyword_hits, title_matches},
-    search::JobSearch,
-    store::Store,
+    types::{JobCard, JobDetail, JobSearch},
 };
 
 pub trait JobSource {
-    fn search(&self, query: &SearchQuery<'_>) -> impl Future<Output = Result<Vec<JobCard>, LinkedInError>> + Send;
-    fn job_detail(&self, linkedin_id: &str) -> impl Future<Output = Result<Option<JobDetail>, LinkedInError>> + Send;
+    fn search(
+        &self,
+        query: &SearchQuery<'_>,
+    ) -> impl Future<Output = Result<Vec<JobCard>, LinkedInError>> + Send;
+    fn job_detail(
+        &self,
+        linkedin_id: &str,
+    ) -> impl Future<Output = Result<Option<JobDetail>, LinkedInError>> + Send;
 }
 
 impl JobSource for LinkedInClient {
-    fn search(&self, query: &SearchQuery<'_>) -> impl Future<Output = Result<Vec<JobCard>, LinkedInError>> + Send {
+    fn search(
+        &self,
+        query: &SearchQuery<'_>,
+    ) -> impl Future<Output = Result<Vec<JobCard>, LinkedInError>> + Send {
         LinkedInClient::search(self, query)
     }
 
-    fn job_detail(&self, linkedin_id: &str) -> impl Future<Output = Result<Option<JobDetail>, LinkedInError>> + Send {
+    fn job_detail(
+        &self,
+        linkedin_id: &str,
+    ) -> impl Future<Output = Result<Option<JobDetail>, LinkedInError>> + Send {
         LinkedInClient::job_detail(self, linkedin_id)
     }
 }
@@ -59,7 +71,7 @@ struct Budget {
     details: usize,
 }
 
-pub async fn run_scan<S: JobSource>(store: &Store, source: &S, limits: &ScanLimits) -> ScanReport {
+pub async fn run_scan<S: JobSource>(store: &Db, source: &S, limits: &ScanLimits) -> ScanReport {
     let mut report = ScanReport::default();
     let searches = match store.list_searches() {
         Ok(searches) => searches,
@@ -69,7 +81,10 @@ pub async fn run_scan<S: JobSource>(store: &Store, source: &S, limits: &ScanLimi
         }
     };
 
-    let mut budget = Budget { load_more: limits.max_load_more_per_run, details: limits.max_details_per_run };
+    let mut budget = Budget {
+        load_more: limits.max_load_more_per_run,
+        details: limits.max_details_per_run,
+    };
     for search in &searches {
         if report.search_blocked {
             break;
@@ -82,7 +97,7 @@ pub async fn run_scan<S: JobSource>(store: &Store, source: &S, limits: &ScanLimi
 }
 
 async fn scan_search<S: JobSource>(
-    store: &Store,
+    store: &Db,
     source: &S,
     limits: &ScanLimits,
     search: &JobSearch,
@@ -90,7 +105,11 @@ async fn scan_search<S: JobSource>(
     report: &mut ScanReport,
 ) -> Result<(), ScanError> {
     let criteria = &search.criteria;
-    let queries = if criteria.titles.is_empty() { vec![criteria.keywords.join(" ")] } else { criteria.titles.clone() };
+    let queries = if criteria.titles.is_empty() {
+        vec![criteria.keywords.join(" ")]
+    } else {
+        criteria.titles.clone()
+    };
 
     let mut seen = HashSet::new();
     let mut candidates: Vec<JobCard> = Vec::new();
@@ -132,7 +151,8 @@ async fn scan_search<S: JobSource>(
             }
             start += cards.len();
             for card in cards {
-                let wanted = criteria.titles.is_empty() || title_matches(&card.title, &criteria.titles);
+                let wanted =
+                    criteria.titles.is_empty() || title_matches(&card.title, &criteria.titles);
                 if wanted && seen.insert(card.linkedin_id.clone()) {
                     candidates.push(card);
                 }
@@ -141,7 +161,10 @@ async fn scan_search<S: JobSource>(
     }
 
     for card in candidates {
-        let mut description = store.known_job(&card.linkedin_id)?.and_then(|job| job.description);
+        let mut description = store.known_job(&card.linkedin_id)?.and_then(|job| {
+            let _id = job.id;
+            job.description
+        });
         let mut detail = None;
         if description.is_none() {
             if budget.details == 0 {
@@ -168,7 +191,11 @@ async fn scan_search<S: JobSource>(
         let work_mode = infer_work_mode(&card.title, &card.location, description.as_deref());
         let job_id = store.upsert_job(&card, detail.as_ref(), work_mode)?;
 
-        let text = format!("{}\n{}", card.title, description.as_deref().unwrap_or_default());
+        let text = format!(
+            "{}\n{}",
+            card.title,
+            description.as_deref().unwrap_or_default()
+        );
         let hits = keyword_hits(&text, &criteria.keywords);
         let keywords_ok = criteria.keywords.is_empty() || !hits.is_empty();
         let wrong_mode = work_mode.is_some_and(|mode| !criteria.work_modes.contains(&mode));
@@ -197,7 +224,8 @@ fn jitter(limits: &ScanLimits) -> Duration {
     if limits.max_delay <= limits.min_delay {
         return limits.min_delay;
     }
-    let ms = rand::thread_rng().gen_range(limits.min_delay.as_millis() as u64..=limits.max_delay.as_millis() as u64);
+    let ms = rand::thread_rng()
+        .gen_range(limits.min_delay.as_millis() as u64..=limits.max_delay.as_millis() as u64);
     Duration::from_millis(ms)
 }
 
@@ -206,7 +234,7 @@ mod tests {
     use std::{collections::HashMap, sync::Mutex};
 
     use super::*;
-    use crate::search::{PostedWithin, SearchInput, WorkMode};
+    use crate::types::{PostedWithin, SearchInput, WorkMode};
 
     #[derive(Default)]
     struct FakeSource {
@@ -219,7 +247,10 @@ mod tests {
     }
 
     impl JobSource for FakeSource {
-        fn search(&self, query: &SearchQuery<'_>) -> impl Future<Output = Result<Vec<JobCard>, LinkedInError>> + Send {
+        fn search(
+            &self,
+            query: &SearchQuery<'_>,
+        ) -> impl Future<Output = Result<Vec<JobCard>, LinkedInError>> + Send {
             let pages = self.pages.get(query.keywords).cloned().unwrap_or_default();
             let blocked = self.blocked_queries.iter().any(|q| q == query.keywords);
             let result = if blocked || (self.block_after_first_page && query.start > 0) {
@@ -230,7 +261,10 @@ mod tests {
             async move { result }
         }
 
-        fn job_detail(&self, id: &str) -> impl Future<Output = Result<Option<JobDetail>, LinkedInError>> + Send {
+        fn job_detail(
+            &self,
+            id: &str,
+        ) -> impl Future<Output = Result<Option<JobDetail>, LinkedInError>> + Send {
             *self.detail_calls.lock().unwrap() += 1;
             let result = if self.block_details {
                 Err(LinkedInError::Blocked(999))
@@ -259,16 +293,21 @@ mod tests {
     }
 
     fn fast() -> ScanLimits {
-        ScanLimits { max_load_more_per_run: 2, max_details_per_run: 10, min_delay: Duration::ZERO, max_delay: Duration::ZERO }
+        ScanLimits {
+            max_load_more_per_run: 2,
+            max_details_per_run: 10,
+            min_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+        }
     }
 
-    fn setup(modes: Vec<WorkMode>) -> (Store, std::path::PathBuf) {
+    fn setup(modes: Vec<WorkMode>) -> (Db, std::path::PathBuf) {
         setup_with(vec!["Backend Engineer".into()], modes)
     }
 
-    fn setup_with(titles: Vec<String>, modes: Vec<WorkMode>) -> (Store, std::path::PathBuf) {
-        let dir = crate::store::test_dir("tailor-scan-test");
-        let store = Store::open(&dir).unwrap();
+    fn setup_with(titles: Vec<String>, modes: Vec<WorkMode>) -> (Db, std::path::PathBuf) {
+        let dir = crate::db::test_dir("tailor-scan-test");
+        let store = Db::open(&dir).unwrap();
         let criteria = SearchInput {
             name: None,
             titles,
@@ -288,11 +327,19 @@ mod tests {
         source.pages.insert(
             "Backend Engineer".into(),
             vec![
-                vec![card("1", "Senior Backend Engineer"), card("2", "iOS Developer")],
-                vec![card("3", "Backend Engineer (Remote)"), card("4", "Backend Engineer, Payments")],
+                vec![
+                    card("1", "Senior Backend Engineer"),
+                    card("2", "iOS Developer"),
+                ],
+                vec![
+                    card("3", "Backend Engineer (Remote)"),
+                    card("4", "Backend Engineer, Payments"),
+                ],
             ],
         );
-        source.details.insert("1".into(), "Hybrid role. We use Rust.".into());
+        source
+            .details
+            .insert("1".into(), "Hybrid role. We use Rust.".into());
         source.details.insert("3".into(), "Rust everywhere.".into());
         source.details.insert("4".into(), "Java shop.".into());
         source
@@ -307,7 +354,12 @@ mod tests {
         assert_eq!(report.error, None);
         assert_eq!(*src.detail_calls.lock().unwrap(), 3);
         let jobs = store.list_jobs(None).unwrap();
-        assert_eq!(jobs.iter().map(|j| j.linkedin_id.as_str()).collect::<Vec<_>>(), vec!["1"]);
+        assert_eq!(
+            jobs.iter()
+                .map(|j| j.linkedin_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1"]
+        );
         assert_eq!(jobs[0].matched_keywords, vec!["Rust"]);
         assert_eq!(jobs[0].work_mode, Some(WorkMode::Hybrid));
         assert_eq!(report.new_matches, 1);
@@ -322,7 +374,10 @@ mod tests {
     async fn detail_budget_defers_to_next_scan() {
         let (store, dir) = setup(vec![WorkMode::Remote, WorkMode::Hybrid]);
         let src = source();
-        let limits = ScanLimits { max_details_per_run: 1, ..fast() };
+        let limits = ScanLimits {
+            max_details_per_run: 1,
+            ..fast()
+        };
 
         let first = run_scan(&store, &src, &limits).await;
         assert_eq!((first.new_matches, first.pending_details), (1, 2));
@@ -334,7 +389,10 @@ mod tests {
     #[tokio::test]
     async fn paging_cap_keeps_first_page() {
         let (store, dir) = setup(vec![WorkMode::Hybrid, WorkMode::Onsite]);
-        let src = FakeSource { block_after_first_page: true, ..source() };
+        let src = FakeSource {
+            block_after_first_page: true,
+            ..source()
+        };
         let report = run_scan(&store, &src, &fast()).await;
         assert_eq!(report.error, None);
         assert_eq!(report.new_matches, 1);
@@ -345,7 +403,10 @@ mod tests {
     async fn blocked_results_page_keeps_collected_jobs() {
         let titles = vec!["Backend Engineer".into(), "Platform Engineer".into()];
         let (store, dir) = setup_with(titles, vec![WorkMode::Hybrid, WorkMode::Onsite]);
-        let src = FakeSource { blocked_queries: vec!["Platform Engineer".into()], ..source() };
+        let src = FakeSource {
+            blocked_queries: vec!["Platform Engineer".into()],
+            ..source()
+        };
         let report = run_scan(&store, &src, &fast()).await;
         assert!(report.search_blocked);
         assert!(report.error.unwrap().contains("rate-limiting"));
@@ -360,7 +421,10 @@ mod tests {
         let mut src = source();
         let pages = src.pages["Backend Engineer"].clone();
         src.pages.insert("Engineer".into(), pages);
-        let limits = ScanLimits { max_load_more_per_run: 1, ..fast() };
+        let limits = ScanLimits {
+            max_load_more_per_run: 1,
+            ..fast()
+        };
         let report = run_scan(&store, &src, &limits).await;
         let searches = report.requests - *src.detail_calls.lock().unwrap();
         assert_eq!(searches, 3);
@@ -369,7 +433,10 @@ mod tests {
 
     #[tokio::test]
     async fn without_keywords_jobs_list_before_descriptions() {
-        let (store, dir) = setup_with(vec!["Backend Engineer".into()], vec![WorkMode::Hybrid, WorkMode::Onsite]);
+        let (store, dir) = setup_with(
+            vec!["Backend Engineer".into()],
+            vec![WorkMode::Hybrid, WorkMode::Onsite],
+        );
         store
             .update_search(store.list_searches().unwrap()[0].id, &{
                 let mut c = store.list_searches().unwrap()[0].criteria.clone();
@@ -378,7 +445,10 @@ mod tests {
             })
             .unwrap();
         let src = source();
-        let limits = ScanLimits { max_details_per_run: 0, ..fast() };
+        let limits = ScanLimits {
+            max_details_per_run: 0,
+            ..fast()
+        };
         let report = run_scan(&store, &src, &limits).await;
         assert_eq!(report.new_matches, 2);
         assert_eq!(*src.detail_calls.lock().unwrap(), 0);
@@ -394,11 +464,25 @@ mod tests {
         store.update_search(search.id, &criteria).unwrap();
 
         let mut src = source();
-        src.details.insert("4".into(), "Fully on-site in Dubai.".into());
-        run_scan(&store, &src, &ScanLimits { max_details_per_run: 0, ..fast() }).await;
+        src.details
+            .insert("4".into(), "Fully on-site in Dubai.".into());
+        run_scan(
+            &store,
+            &src,
+            &ScanLimits {
+                max_details_per_run: 0,
+                ..fast()
+            },
+        )
+        .await;
         assert_eq!(store.list_jobs(None).unwrap().len(), 3);
         run_scan(&store, &src, &fast()).await;
-        let ids: Vec<String> = store.list_jobs(None).unwrap().into_iter().map(|j| j.linkedin_id).collect();
+        let ids: Vec<String> = store
+            .list_jobs(None)
+            .unwrap()
+            .into_iter()
+            .map(|j| j.linkedin_id)
+            .collect();
         assert_eq!(ids, vec!["3"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -406,7 +490,10 @@ mod tests {
     #[tokio::test]
     async fn blocked_job_pages_pause_softly() {
         let (store, dir) = setup(vec![WorkMode::Hybrid]);
-        let src = FakeSource { block_details: true, ..source() };
+        let src = FakeSource {
+            block_details: true,
+            ..source()
+        };
         let report = run_scan(&store, &src, &fast()).await;
         assert_eq!(report.error, None);
         assert!(report.details_paused);
@@ -421,10 +508,16 @@ mod tests {
 
         struct AlwaysBlocked;
         impl JobSource for AlwaysBlocked {
-            fn search(&self, _: &SearchQuery<'_>) -> impl Future<Output = Result<Vec<JobCard>, LinkedInError>> + Send {
+            fn search(
+                &self,
+                _: &SearchQuery<'_>,
+            ) -> impl Future<Output = Result<Vec<JobCard>, LinkedInError>> + Send {
                 async { Err(LinkedInError::Blocked(429)) }
             }
-            fn job_detail(&self, _: &str) -> impl Future<Output = Result<Option<JobDetail>, LinkedInError>> + Send {
+            fn job_detail(
+                &self,
+                _: &str,
+            ) -> impl Future<Output = Result<Option<JobDetail>, LinkedInError>> + Send {
                 async { Ok(None) }
             }
         }

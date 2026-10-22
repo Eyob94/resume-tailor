@@ -1,12 +1,12 @@
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use serde::Serialize;
 use tailor_core::{
+    db::Db,
+    errors::DbError,
     linkedin::LinkedInClient,
     scan::{run_scan, ScanLimits},
-    errors::StoreError,
-    store::{ScanRun, Store},
+    types::ScanStatus,
 };
 use tokio::sync::Notify;
 
@@ -16,14 +16,6 @@ pub const DEFAULT_INTERVAL_MINUTES: u32 = 60;
 const INTERVAL_KEY: &str = "scan_interval_minutes";
 const DEFAULT_COOLDOWN_SECONDS: i64 = MIN_INTERVAL_MINUTES as i64 * 60;
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ScanStatus {
-    pub running: bool,
-    pub interval_minutes: u32,
-    pub next_run_at: Option<String>,
-    pub last_run: Option<ScanRun>,
-}
-
 #[derive(Default)]
 struct State {
     running: bool,
@@ -32,7 +24,7 @@ struct State {
 }
 
 pub struct Scanner {
-    store: Arc<Store>,
+    store: Arc<Db>,
     client: LinkedInClient,
     limits: ScanLimits,
     cooldown: ChronoDuration,
@@ -41,7 +33,7 @@ pub struct Scanner {
 }
 
 impl Scanner {
-    pub fn new(store: Arc<Store>, client: LinkedInClient) -> Self {
+    pub fn new(store: Arc<Db>, client: LinkedInClient) -> Self {
         let cooldown_seconds = std::env::var("SCAN_COOLDOWN_SECONDS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -69,13 +61,13 @@ impl Scanner {
             .unwrap_or(DEFAULT_INTERVAL_MINUTES)
     }
 
-    pub fn set_interval_minutes(&self, minutes: u32) -> Result<(), StoreError> {
+    pub fn set_interval_minutes(&self, minutes: u32) -> Result<(), DbError> {
         self.store.set_setting(INTERVAL_KEY, &minutes.to_string())?;
         self.reschedule();
         Ok(())
     }
 
-    pub fn status(&self) -> Result<ScanStatus, StoreError> {
+    pub fn status(&self) -> Result<ScanStatus, DbError> {
         let state = self.state.lock().unwrap();
         Ok(ScanStatus {
             running: state.running,
@@ -99,7 +91,11 @@ impl Scanner {
             let ready_at = last + self.cooldown;
             if Utc::now() < ready_at {
                 let wait = (ready_at - Utc::now()).num_seconds() + 1;
-                let wait = if wait > 60 { format!("{} min", (wait + 59) / 60) } else { format!("{wait} s") };
+                let wait = if wait > 60 {
+                    format!("{} min", (wait + 59) / 60)
+                } else {
+                    format!("{wait} s")
+                };
                 return Err(format!("A scan ran recently. Try again in {wait}."));
             }
         }
@@ -111,11 +107,16 @@ impl Scanner {
 
     fn last_started_at(&self) -> Option<DateTime<Utc>> {
         let run = self.store.last_scan_run().ok().flatten()?;
-        DateTime::parse_from_rfc3339(&run.started_at).ok().map(|t| t.with_timezone(&Utc))
+        DateTime::parse_from_rfc3339(&run.started_at)
+            .ok()
+            .map(|t| t.with_timezone(&Utc))
     }
 
     fn has_searches(&self) -> bool {
-        self.store.list_searches().map(|s| !s.is_empty()).unwrap_or(false)
+        self.store
+            .list_searches()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
     }
 
     pub async fn run_forever(self: Arc<Self>) {
@@ -133,7 +134,10 @@ impl Scanner {
                 }
 
                 let interval = ChronoDuration::minutes(self.interval_minutes().into());
-                let next = self.last_started_at().map(|t| t + interval).unwrap_or_else(Utc::now);
+                let next = self
+                    .last_started_at()
+                    .map(|t| t + interval)
+                    .unwrap_or_else(Utc::now);
                 self.state.lock().unwrap().next_run_at = Some(next);
                 let wait = (next - Utc::now()).to_std().unwrap_or_default();
                 tokio::select! {
@@ -173,7 +177,11 @@ impl Scanner {
         };
         let mut notes: Vec<String> = Vec::new();
         if let Some(error) = &report.error {
-            notes.push(if error.ends_with('.') { error.clone() } else { format!("{error}.") });
+            notes.push(if error.ends_with('.') {
+                error.clone()
+            } else {
+                format!("{error}.")
+            });
         }
         if report.details_paused {
             notes.push(format!(
@@ -181,12 +189,23 @@ impl Scanner {
                 report.pending_details
             ));
         } else if report.pending_details > 0 {
-            notes.push(format!("{} jobs still need details; continuing next scan.", report.pending_details));
+            notes.push(format!(
+                "{} jobs still need details; continuing next scan.",
+                report.pending_details
+            ));
         }
         let message = (!notes.is_empty()).then(|| notes.join(" "));
-        tracing::info!(status, new_matches = report.new_matches, requests = report.requests, "scan finished");
+        tracing::info!(
+            status,
+            new_matches = report.new_matches,
+            requests = report.requests,
+            "scan finished"
+        );
 
-        if let Err(e) = self.store.finish_scan_run(run_id, status, report.new_matches, message.as_deref()) {
+        if let Err(e) =
+            self.store
+                .finish_scan_run(run_id, status, report.new_matches, message.as_deref())
+        {
             tracing::error!("couldn't record scan result: {e}");
         }
         self.state.lock().unwrap().running = false;
