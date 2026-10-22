@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { X } from "lucide-react";
 
-/** Text input that turns entries into removable chips on Enter or comma. */
 export function ChipInput({
   id,
   values,

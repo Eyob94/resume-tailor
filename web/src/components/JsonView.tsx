@@ -12,7 +12,6 @@ export function JsonView({ value, fileName, note }: { value: unknown; fileName: 
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
-      // Clipboard blocked (e.g. insecure context); Download still works.
     }
   }
 

@@ -1,7 +1,3 @@
-//! Client for LinkedIn's signed-out ("guest") job search pages.
-//!
-//! These are server-rendered HTML, so parsing depends on LinkedIn's markup and
-//! will need updating if it changes. No account or cookies are used.
 
 use std::time::Duration;
 
@@ -11,21 +7,14 @@ use thiserror::Error;
 
 use crate::search::{PostedWithin, WorkMode};
 
-/// Full results page: ~60 jobs in one request. Used for the first page.
 const SEARCH_PAGE_URL: &str = "https://www.linkedin.com/jobs/search";
-/// "Load more" fragment: 10 jobs per request starting at `start` (a plain
-/// offset, so 60 continues after the full page). Signed-out visitors get
-/// about three of these per window before a 429. Used for later pages only.
 const SEE_MORE_URL: &str = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search";
-/// Public job page (what a shared link opens). The `jobs-guest/api` detail
-/// fragment shares the tight "load more" quota; this page doesn't.
 const DETAIL_URL: &str = "https://www.linkedin.com/jobs/view";
 const USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
 
 #[derive(Debug, Error)]
 pub enum LinkedInError {
-    /// 429, or LinkedIn's custom 999 "request denied". Back off.
     #[error("LinkedIn is rate-limiting requests (HTTP {0}); will retry next scan")]
     Blocked(u16),
     #[error("LinkedIn returned HTTP {0}")]
@@ -41,7 +30,6 @@ pub struct JobCard {
     pub company: String,
     pub company_url: Option<String>,
     pub location: String,
-    /// `YYYY-MM-DD` as shown on the card.
     pub posted_on: Option<String>,
     pub url: String,
 }
@@ -68,8 +56,6 @@ pub struct LinkedInClient {
 
 impl LinkedInClient {
     pub fn new() -> Result<Self, reqwest::Error> {
-        // Behave like a browser tab: keep the cookies LinkedIn sets and send
-        // the usual headers. Bare cookie-less requests get rate-limited fast.
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,*/*;q=0.8".parse().unwrap());
         headers.insert(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9".parse().unwrap());
@@ -86,15 +72,12 @@ impl LinkedInClient {
         let mut params = vec![
             ("keywords", query.keywords.to_string()),
             ("f_TPR", query.posted_within.linkedin_param().to_string()),
-            // Newest first. Currently ignored by LinkedIn's search, but harmless.
             ("sortBy", "DD".to_string()),
         ];
         if let Some(location) = query.location {
             params.push(("location", location.to_string()));
         }
         if !query.work_modes.is_empty() {
-            // Sent for completeness; guest search currently ignores it, so
-            // work mode is also checked locally.
             let codes: Vec<&str> = query
                 .work_modes
                 .iter()
@@ -106,8 +89,6 @@ impl LinkedInClient {
                 .collect();
             params.push(("f_WT", codes.join(",")));
         }
-        // Like the browser: the full page first, "load more" after that,
-        // with the results page as the referrer.
         let html = if query.start == 0 {
             self.get("search", SEARCH_PAGE_URL, &params, None).await?
         } else {
@@ -118,7 +99,6 @@ impl LinkedInClient {
         Ok(parse_search_results(&html))
     }
 
-    /// `Ok(None)` when the posting no longer exists or has no description.
     pub async fn job_detail(&self, linkedin_id: &str) -> Result<Option<JobDetail>, LinkedInError> {
         match self.get("detail", &format!("{DETAIL_URL}/{linkedin_id}"), &[], None).await {
             Ok(html) => Ok(parse_job_detail(&html)),
@@ -162,7 +142,6 @@ fn without_query(url: &str) -> String {
     url.split(['?', '#']).next().unwrap_or(url).to_string()
 }
 
-/// Parses job cards from a search results page or "see more" fragment.
 pub fn parse_search_results(html: &str) -> Vec<JobCard> {
     let doc = Html::parse_document(html);
     let card_sel = selector(r#"[data-entity-urn^="urn:li:jobPosting:"]"#);
@@ -199,7 +178,6 @@ fn parse_card(card: ElementRef) -> Option<JobCard> {
     Some(JobCard { linkedin_id, title, company, company_url, location, posted_on, url })
 }
 
-/// Parses the guest job posting page: full description plus criteria.
 pub fn parse_job_detail(html: &str) -> Option<JobDetail> {
     let doc = Html::parse_document(html);
     let markup = doc.select(&selector(".show-more-less-html__markup")).next()?;
@@ -226,7 +204,6 @@ pub fn parse_job_detail(html: &str) -> Option<JobDetail> {
     Some(detail)
 }
 
-/// Converts description HTML to plain text, keeping paragraphs and bullets.
 fn block_text(root: ElementRef) -> String {
     fn walk(el: ElementRef, out: &mut String) {
         for child in el.children() {
@@ -284,7 +261,6 @@ fn block_text(root: ElementRef) -> String {
 mod tests {
     use super::*;
 
-    // Trimmed copies of the guest markup observed on 2026-10-20.
     const SEARCH_FIXTURE: &str = r#"
       <li><div class="base-card job-search-card" data-entity-urn="urn:li:jobPosting:4362132219">
         <a class="base-card__full-link" href="https://ae.linkedin.com/jobs/view/senior-software-engineer-backend-at-talabat-4362132219?position=1&amp;refId=x">

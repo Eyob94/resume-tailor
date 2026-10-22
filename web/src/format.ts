@@ -12,7 +12,6 @@ export function plural(count: number, word: string, pluralWord = `${word}s`): st
   return `${count} ${count === 1 ? word : pluralWord}`;
 }
 
-/** "just now", "5 min ago", "3 h ago", "2 days ago"; future times as "in 12 min". */
 export function relativeTime(iso: string, now = Date.now()): string {
   const diffMin = Math.round((new Date(iso).getTime() - now) / 60_000);
   const abs = Math.abs(diffMin);
@@ -21,7 +20,6 @@ export function relativeTime(iso: string, now = Date.now()): string {
   return diffMin > 0 ? `in ${label}` : `${label} ago`;
 }
 
-/** Days since a YYYY-MM-DD date, as "today", "yesterday", "3 days ago". */
 export function postedLabel(date: string): string {
   const days = Math.round((Date.now() - new Date(`${date}T00:00:00`).getTime()) / 86_400_000);
   if (days <= 0) return "today";

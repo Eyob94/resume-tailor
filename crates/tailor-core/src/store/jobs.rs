@@ -1,4 +1,3 @@
-//! Saved searches, scraped jobs, matches, settings and scan history.
 
 use std::collections::HashMap;
 
@@ -42,7 +41,6 @@ impl JobStatus {
     }
 }
 
-/// A job that matched at least one saved search.
 #[derive(Debug, Clone, Serialize)]
 pub struct JobListing {
     pub id: i64,
@@ -60,7 +58,6 @@ pub struct JobListing {
     pub work_mode: Option<WorkMode>,
     pub status: JobStatus,
     pub first_seen_at: String,
-    /// When a tailored resume was made for this job, if ever.
     pub tailored_at: Option<String>,
     pub search_ids: Vec<i64>,
     pub matched_keywords: Vec<String>,
@@ -76,7 +73,6 @@ pub struct ScanRun {
     pub id: i64,
     pub started_at: String,
     pub finished_at: Option<String>,
-    /// running | ok | partial | failed | interrupted
     pub status: String,
     pub new_matches: i64,
     pub message: Option<String>,
@@ -146,8 +142,6 @@ impl Store {
         Ok(self.get_search(id)?.expect("search was just inserted"))
     }
 
-    /// Updates a search and clears its matches so the next scan re-evaluates
-    /// jobs against the new criteria. Returns `None` if it doesn't exist.
     pub fn update_search(&self, id: i64, criteria: &SearchCriteria) -> Result<Option<JobSearch>, StoreError> {
         {
             let mut conn = self.conn.lock().unwrap();
@@ -191,8 +185,6 @@ impl Store {
         Ok(job)
     }
 
-    /// Inserts or refreshes a job. Detail fields are only overwritten when
-    /// `detail` is provided, so a card-only refresh keeps the description.
     pub fn upsert_job(
         &self,
         card: &JobCard,
@@ -238,7 +230,6 @@ impl Store {
         Ok(id)
     }
 
-    /// Records that a job matched a search. Returns `true` for a new match.
     pub fn add_match(&self, search_id: i64, job_id: i64, keywords: &[String]) -> Result<bool, StoreError> {
         let conn = self.conn.lock().unwrap();
         let keywords = serde_json::to_string(keywords)?;
@@ -256,7 +247,6 @@ impl Store {
         Ok(inserted == 1)
     }
 
-    /// Removes a job from a search's results. Returns `true` if it was there.
     pub fn remove_match(&self, search_id: i64, job_id: i64) -> Result<bool, StoreError> {
         let conn = self.conn.lock().unwrap();
         let removed = conn.execute(
@@ -266,7 +256,6 @@ impl Store {
         Ok(removed > 0)
     }
 
-    /// Jobs matched by at least one search, newest postings first.
     pub fn list_jobs(&self, status: Option<JobStatus>) -> Result<Vec<JobListing>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -301,7 +290,6 @@ impl Store {
             Ok((listing, row.get::<_, String>(16)?))
         })?;
 
-        // One row per (job, search) pair; fold them into one listing per job.
         let mut jobs: Vec<JobListing> = Vec::new();
         let mut index: HashMap<i64, usize> = HashMap::new();
         for row in rows {
@@ -336,7 +324,6 @@ impl Store {
         Ok(changed > 0)
     }
 
-    /// Sets the status of several jobs at once. Returns how many changed.
     pub fn set_jobs_status(&self, ids: &[i64], status: JobStatus) -> Result<usize, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -411,7 +398,6 @@ impl Store {
         Ok(run)
     }
 
-    /// Marks runs left `running` by a previous process as interrupted.
     pub fn mark_interrupted_scan_runs(&self) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -485,7 +471,6 @@ mod tests {
             industries: None,
         };
         let id = store.upsert_job(&card("1"), Some(&detail), Some(WorkMode::Hybrid)).unwrap();
-        // A later card-only refresh must not wipe the description.
         assert_eq!(store.upsert_job(&card("1"), None, Some(WorkMode::Hybrid)).unwrap(), id);
         assert_eq!(store.known_job("1").unwrap().unwrap().description.as_deref(), Some("Rust and Kafka"));
 
@@ -506,7 +491,6 @@ mod tests {
         assert!(store.list_jobs(Some(JobStatus::New)).unwrap().is_empty());
         assert_eq!(store.list_jobs(Some(JobStatus::Dismissed)).unwrap().len(), 1);
 
-        // Updating a search clears its matches; deleting cascades.
         store.update_search(a.id, &criteria("Backend Engineer")).unwrap();
         assert_eq!(store.list_jobs(None).unwrap()[0].search_ids, vec![b.id]);
         store.delete_search(b.id).unwrap();

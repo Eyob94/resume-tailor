@@ -85,7 +85,6 @@ function Bullets({
   );
 }
 
-/** Review and correct what the AI read from the resume. */
 export function ProfileEditor({
   record,
   onSave,

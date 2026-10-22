@@ -54,7 +54,6 @@ export function SettingsPage() {
     }
   }
 
-  // Keep the saved choice selectable even if that model was removed from Ollama.
   const models = ai ? Array.from(new Set([ai.resume_reader_model, ...ai.ollama.models])) : [];
 
   async function changeInterval(minutes: number) {

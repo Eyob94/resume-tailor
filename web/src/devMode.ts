@@ -11,7 +11,6 @@ function read(): boolean {
   }
 }
 
-/** Per-browser developer mode flag, kept in sync across components and tabs. */
 export function useDevMode(): [boolean, (on: boolean) => void] {
   const [enabled, setEnabled] = useState(read);
 
@@ -30,7 +29,6 @@ export function useDevMode(): [boolean, (on: boolean) => void] {
       if (on) localStorage.setItem(STORAGE_KEY, "1");
       else localStorage.removeItem(STORAGE_KEY);
     } catch {
-      // Storage unavailable (private mode etc.); the flag just won't persist.
     }
     setEnabled(on);
     window.dispatchEvent(new Event(CHANGE_EVENT));

@@ -89,19 +89,16 @@ async fn main() -> anyhow::Result<()> {
         .route("/scan", get(scan_status))
         .route("/scan/run", post(run_scan_now))
         .route("/settings", get(get_settings).put(update_settings))
-        // Leave headroom over the file limit for multipart framing.
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES + 64 * 1024))
         .with_state(AppState { store, scanner, reader });
 
     let mut app = Router::new().nest("/api", api);
     if web_dist.join("index.html").exists() {
-        // Serve the built frontend; unknown paths fall back to the SPA entry.
         let spa = ServeDir::new(&web_dist).fallback(ServeFile::new(web_dist.join("index.html")));
         app = app.fallback_service(spa);
     }
     let app = app.layer(TraceLayer::new_for_http());
 
-    // Loopback only: there's no auth, so never expose this on the network.
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("listening on http://{addr}");
@@ -152,7 +149,6 @@ async fn upload_resume(
         let saved = tokio::task::spawn_blocking(move || store.save_resume(&file_name, &bytes, &info))
             .await
             .map_err(AppError::internal)??;
-        // Read it with the AI in the background; the page polls for the result.
         if let Err(StartError::Store(e)) = state.reader.start() {
             tracing::error!("couldn't start reading the resume: {e}");
         }
@@ -178,7 +174,6 @@ async fn resume_file(State(store): State<Arc<Store>>) -> Result<Response, AppErr
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(AppError::not_found()),
         Err(e) => return Err(AppError::internal(e)),
     };
-    // Header values must be ASCII; the real name is still shown in the UI.
     let header_name: String = resume
         .file_name
         .chars()
@@ -192,7 +187,6 @@ async fn resume_file(State(store): State<Arc<Store>>) -> Result<Response, AppErr
     Ok((headers, bytes).into_response())
 }
 
-/// The AI's reading of the current resume, if any.
 async fn get_profile(State(store): State<Arc<Store>>) -> Result<Json<Option<ProfileRecord>>, AppError> {
     let Some(resume) = store.get_resume()? else {
         return Ok(Json(None));
@@ -211,7 +205,6 @@ async fn read_profile(State(reader): State<Arc<ResumeReader>>) -> Result<StatusC
     }
 }
 
-/// The reading the user can edit or confirm: the latest one for the current resume.
 fn current_profile(store: &Store) -> Result<(MasterResume, ProfileRecord), AppError> {
     let resume = store.get_resume()?.ok_or_else(AppError::not_found)?;
     let record = store
@@ -389,7 +382,6 @@ async fn update_settings(
     Ok(Json(settings))
 }
 
-/// Keeps only the base name, trimmed and capped, defaulting to `resume.pdf`.
 fn sanitize_file_name(raw: &str) -> String {
     let base = raw.rsplit(['/', '\\']).next().unwrap_or_default().trim();
     let name: String = base.chars().filter(|c| !c.is_control()).take(200).collect();

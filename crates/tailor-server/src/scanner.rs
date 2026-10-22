@@ -1,4 +1,3 @@
-//! Background job scanner: runs every saved search on a configurable interval.
 
 use std::sync::{Arc, Mutex};
 
@@ -15,8 +14,6 @@ pub const MIN_INTERVAL_MINUTES: u32 = 10;
 pub const MAX_INTERVAL_MINUTES: u32 = 60;
 pub const DEFAULT_INTERVAL_MINUTES: u32 = 60;
 const INTERVAL_KEY: &str = "scan_interval_minutes";
-/// Minimum gap between a scan and a manual "Run now". Override with
-/// `SCAN_COOLDOWN_SECONDS` for local testing only.
 const DEFAULT_COOLDOWN_SECONDS: i64 = MIN_INTERVAL_MINUTES as i64 * 60;
 
 #[derive(Debug, Clone, Serialize)]
@@ -72,7 +69,6 @@ impl Scanner {
             .unwrap_or(DEFAULT_INTERVAL_MINUTES)
     }
 
-    /// Caller validates the range.
     pub fn set_interval_minutes(&self, minutes: u32) -> Result<(), StoreError> {
         self.store.set_setting(INTERVAL_KEY, &minutes.to_string())?;
         self.reschedule();
@@ -89,13 +85,10 @@ impl Scanner {
         })
     }
 
-    /// Searches or settings changed; recompute the schedule.
     pub fn reschedule(&self) {
         self.wake.notify_one();
     }
 
-    /// Requests an immediate scan. Refused while one is running or within
-    /// the cooldown of the last one (10 minutes unless overridden).
     pub fn request_run(&self) -> Result<(), String> {
         let last_start = self.last_started_at();
         let mut state = self.state.lock().unwrap();
@@ -166,7 +159,6 @@ impl Scanner {
             Err(e) => {
                 tracing::error!("couldn't record scan start: {e}");
                 self.state.lock().unwrap().running = false;
-                // Avoid a hot loop if the database is broken.
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 return;
             }

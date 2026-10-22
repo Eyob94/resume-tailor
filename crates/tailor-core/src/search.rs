@@ -55,7 +55,6 @@ impl PostedWithin {
         }
     }
 
-    /// Value for LinkedIn's `f_TPR` (time posted range) filter.
     pub fn linkedin_param(self) -> &'static str {
         match self {
             Self::Day => "r86400",
@@ -65,7 +64,6 @@ impl PostedWithin {
     }
 }
 
-/// A saved search as submitted by the client, before validation.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SearchInput {
     #[serde(default)]
@@ -82,7 +80,6 @@ pub struct SearchInput {
     pub posted_within: PostedWithin,
 }
 
-/// Validated, normalized search criteria.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SearchCriteria {
     pub name: String,
@@ -148,7 +145,6 @@ fn collapse_spaces(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Trims, drops empties and case-insensitive duplicates, and enforces limits.
 fn clean_terms(raw: Vec<String>, label: &str) -> Result<Vec<String>, InvalidSearch> {
     let mut terms: Vec<String> = Vec::new();
     for term in raw {

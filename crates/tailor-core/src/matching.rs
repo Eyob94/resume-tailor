@@ -1,10 +1,6 @@
-//! Local matching on top of LinkedIn's loose keyword search.
 
 use crate::search::WorkMode;
 
-/// True if `term` occurs in `haystack` as a whole term: no letter or digit
-/// directly before or after it. Handles terms like "C++" and ".NET" that
-/// regex word boundaries get wrong. Case-insensitive.
 pub fn contains_term(haystack: &str, term: &str) -> bool {
     let haystack = haystack.to_lowercase();
     let term = term.trim().to_lowercase();
@@ -26,13 +22,10 @@ pub fn contains_term(haystack: &str, term: &str) -> bool {
     false
 }
 
-/// A job title matches a search title when it contains every word of it,
-/// in any order: "Backend Engineer" matches "Senior Backend Engineer (IoT)".
 pub fn title_matches(job_title: &str, titles: &[String]) -> bool {
     titles.iter().any(|title| title.split_whitespace().all(|word| contains_term(job_title, word)))
 }
 
-/// Keywords that appear in `text`, in the order they were given.
 pub fn keyword_hits(text: &str, keywords: &[String]) -> Vec<String> {
     keywords.iter().filter(|k| contains_term(text, k)).cloned().collect()
 }
@@ -43,7 +36,6 @@ const TITLE_SIGNALS: &[(WorkMode, &[&str])] = &[
     (WorkMode::Onsite, &["on-site", "onsite", "on site", "in-office", "office-based"]),
 ];
 
-// Descriptions mention "remote" in passing ("remote teams"), so require stronger phrasing there.
 const DESCRIPTION_SIGNALS: &[(WorkMode, &[&str])] = &[
     (
         WorkMode::Remote,
@@ -61,12 +53,9 @@ fn modes_in(text: &str, signals: &[(WorkMode, &[&str])]) -> Vec<WorkMode> {
         .collect()
 }
 
-/// Best-effort work mode. LinkedIn's guest pages don't expose it, so it's
-/// read from the text. `None` means the posting doesn't say clearly.
 pub fn infer_work_mode(title: &str, location: &str, description: Option<&str>) -> Option<WorkMode> {
     let pick = |modes: Vec<WorkMode>| match modes.as_slice() {
         [only] => Some(*only),
-        // Mixed signals ("hybrid, remote days available") usually mean hybrid.
         many if many.contains(&WorkMode::Hybrid) => Some(WorkMode::Hybrid),
         _ => None,
     };

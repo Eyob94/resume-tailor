@@ -51,7 +51,6 @@ export function JobsPage() {
     );
   }, [loadJobs]);
 
-  // Poll scan status; reload jobs whenever a scan finishes.
   const lastFinished = useRef<string | null | undefined>(undefined);
   useEffect(() => {
     const id = setInterval(async () => {
@@ -62,7 +61,6 @@ export function JobsPage() {
         if (lastFinished.current !== undefined && finished !== lastFinished.current) await loadJobs();
         lastFinished.current = finished;
       } catch {
-        // Server status is shown in the sidebar; keep polling.
       }
     }, 5_000);
     return () => clearInterval(id);
@@ -222,7 +220,6 @@ function ScanBar({ scan, onChange, onError }: { scan: ScanStatus; onChange: (s: 
     setRequesting(true);
     try {
       await jobsApi.runScan();
-      // The scanner picks the request up within a moment.
       setTimeout(async () => onChange(await jobsApi.scanStatus()), 700);
     } catch (e) {
       onError(errorMessage(e));

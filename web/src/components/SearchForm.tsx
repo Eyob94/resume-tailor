@@ -22,7 +22,6 @@ function Field({ label, htmlFor, hint, children }: { label: string; htmlFor?: st
 const inputClass =
   "w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm shadow-sm outline-none placeholder:text-zinc-400 focus:border-zinc-400 focus:ring-2 focus:ring-zinc-900/10";
 
-/** Mirrors the server's validation so most mistakes show before submitting. */
 function validate(input: SearchInput): string | null {
   if (!input.titles.length && !input.keywords.length) return "Add at least one job title or keyword.";
   if (!input.work_modes.length) return "Pick at least one work mode.";
