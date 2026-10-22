@@ -139,6 +139,59 @@ export const jobsApi = {
   updateSettings: (settings: Settings) => request<Settings>("/settings", { method: "PUT", ...json(settings) }),
 };
 
+export interface Bullet {
+  id: string;
+  text: string;
+}
+
+export interface ResumeProfile {
+  contact: { name: string; email: string | null; phone: string | null; location: string | null; links: string[] };
+  summary: string | null;
+  headline: string | null;
+  experience: {
+    id: string;
+    company: string;
+    title: string;
+    location: string | null;
+    start: string | null;
+    end: string | null;
+    bullets: Bullet[];
+  }[];
+  projects: { id: string; name: string; description: string | null; bullets: Bullet[] }[];
+  education: { id: string; school: string; degree: string | null; field: string | null; start: string | null; end: string | null }[];
+  skills: { name: string; years: number | null; used_at: string[] }[];
+  certifications: string[];
+  languages: string[];
+  awards: string[];
+}
+
+export interface ProfileRecord {
+  id: number;
+  resume_uploaded_at: string;
+  status: "reading" | "ready" | "failed" | "confirmed";
+  model: string;
+  profile: ResumeProfile | null;
+  warnings: { item_id: string; message: string }[];
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+  confirmed_at: string | null;
+}
+
+export interface AiStatus {
+  ollama: { url: string; reachable: boolean; models: string[] };
+  resume_reader_model: string;
+}
+
+export const profileApi = {
+  get: () => request<ProfileRecord | null>("/resume/profile"),
+  read: () => request<void>("/resume/profile/read", { method: "POST" }),
+  save: (profile: ResumeProfile) => request<ProfileRecord>("/resume/profile", { method: "PUT", ...json(profile) }),
+  confirm: () => request<ProfileRecord>("/resume/profile/confirm", { method: "POST" }),
+  aiStatus: () => request<AiStatus>("/ai"),
+  setReaderModel: (model: string) => request<AiStatus>("/ai", { method: "PUT", ...json({ resume_reader_model: model }) }),
+};
+
 export function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : "Something went wrong.";
 }

@@ -8,7 +8,7 @@ chrono = { version = "0.4", features = ["serde"] }
 lopdf = "0.34"
 pdf-extract = "0.9"
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "gzip", "json"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 scraper = "0.20"
 serde = { version = "1", features = ["derive"] }
@@ -18,4 +18,4 @@ tokio = { version = "1", features = ["time"] }
 tracing = "0.1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }

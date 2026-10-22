@@ -1,5 +1,6 @@
 use std::{env, fmt::Display, net::SocketAddr, path::PathBuf, sync::Arc};
 
+mod reader;
 mod scanner;
 
 use axum::{
@@ -9,14 +10,17 @@ use axum::{
     routing::{get, patch, post, put},
     Json, Router,
 };
+use reader::{AiStatus, ResumeReader, StartError};
 use scanner::{Scanner, ScanStatus, MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES};
 use serde::Deserialize;
 use serde_json::json;
 use tailor_core::{
     linkedin::LinkedInClient,
+    ai::DEFAULT_OLLAMA_URL,
     pdf::{self, PdfError},
+    profile::ResumeProfile,
     search::{JobSearch, SearchInput},
-    store::{JobListing, JobStatus, MasterResume, Store, StoreError},
+    store::{JobListing, JobStatus, MasterResume, ProfileRecord, Store, StoreError},
 };
 use tower_http::{
     services::{ServeDir, ServeFile},
@@ -30,6 +34,13 @@ const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 struct AppState {
     store: Arc<Store>,
     scanner: Arc<Scanner>,
+    reader: Arc<ResumeReader>,
+}
+
+impl FromRef<AppState> for Arc<ResumeReader> {
+    fn from_ref(state: &AppState) -> Self {
+        state.reader.clone()
+    }
 }
 
 impl FromRef<AppState> for Arc<Store> {
@@ -59,11 +70,17 @@ async fn main() -> anyhow::Result<()> {
     let store = Arc::new(Store::open(&data_dir)?);
     let scanner = Arc::new(Scanner::new(store.clone(), LinkedInClient::new()?));
     tokio::spawn(scanner.clone().run_forever());
+    let ollama_url = env::var("OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.into());
+    let reader = Arc::new(ResumeReader::new(store.clone(), ollama_url));
 
     let api = Router::new()
         .route("/health", get(health))
         .route("/resume", get(get_resume).post(upload_resume).delete(delete_resume))
         .route("/resume/file", get(resume_file))
+        .route("/resume/profile", get(get_profile).put(update_profile))
+        .route("/resume/profile/read", post(read_profile))
+        .route("/resume/profile/confirm", post(confirm_profile))
+        .route("/ai", get(ai_status).put(update_ai_settings))
         .route("/searches", get(list_searches).post(create_search))
         .route("/searches/{id}", put(update_search).delete(delete_search))
         .route("/jobs", get(list_jobs))
@@ -74,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/settings", get(get_settings).put(update_settings))
         // Leave headroom over the file limit for multipart framing.
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES + 64 * 1024))
-        .with_state(AppState { store, scanner });
+        .with_state(AppState { store, scanner, reader });
 
     let mut app = Router::new().nest("/api", api);
     if web_dist.join("index.html").exists() {
@@ -101,9 +118,10 @@ async fn get_resume(State(store): State<Arc<Store>>) -> Result<Json<Option<Maste
 }
 
 async fn upload_resume(
-    State(store): State<Arc<Store>>,
+    State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<MasterResume>, AppError> {
+    let store = state.store.clone();
     while let Some(field) = multipart.next_field().await.map_err(AppError::multipart)? {
         if field.name() != Some("file") {
             continue;
@@ -134,6 +152,10 @@ async fn upload_resume(
         let saved = tokio::task::spawn_blocking(move || store.save_resume(&file_name, &bytes, &info))
             .await
             .map_err(AppError::internal)??;
+        // Read it with the AI in the background; the page polls for the result.
+        if let Err(StartError::Store(e)) = state.reader.start() {
+            tracing::error!("couldn't start reading the resume: {e}");
+        }
         return Ok(Json(saved));
     }
     Err(AppError::bad_request("No file was uploaded."))
@@ -168,6 +190,88 @@ async fn resume_file(State(store): State<Arc<Store>>) -> Result<Response, AppErr
         (header::CACHE_CONTROL, "no-cache".to_string()),
     ];
     Ok((headers, bytes).into_response())
+}
+
+/// The AI's reading of the current resume, if any.
+async fn get_profile(State(store): State<Arc<Store>>) -> Result<Json<Option<ProfileRecord>>, AppError> {
+    let Some(resume) = store.get_resume()? else {
+        return Ok(Json(None));
+    };
+    Ok(Json(store.latest_profile(&resume.uploaded_at)?))
+}
+
+async fn read_profile(State(reader): State<Arc<ResumeReader>>) -> Result<StatusCode, AppError> {
+    match reader.start() {
+        Ok(()) => Ok(StatusCode::ACCEPTED),
+        Err(StartError::NoResume) => Err(AppError::not_found()),
+        Err(StartError::AlreadyReading) => {
+            Err(AppError { status: StatusCode::CONFLICT, message: "Your resume is already being read.".into() })
+        }
+        Err(StartError::Store(e)) => Err(e.into()),
+    }
+}
+
+/// The reading the user can edit or confirm: the latest one for the current resume.
+fn current_profile(store: &Store) -> Result<(MasterResume, ProfileRecord), AppError> {
+    let resume = store.get_resume()?.ok_or_else(AppError::not_found)?;
+    let record = store
+        .latest_profile(&resume.uploaded_at)?
+        .ok_or_else(|| AppError::not_found_msg("Your resume hasn't been read yet."))?;
+    Ok((resume, record))
+}
+
+async fn update_profile(
+    State(store): State<Arc<Store>>,
+    Json(mut profile): Json<ResumeProfile>,
+) -> Result<Json<ProfileRecord>, AppError> {
+    let (resume, record) = current_profile(&store)?;
+    profile.tidy();
+    profile.assign_ids();
+    if profile.contact.name.is_empty() {
+        return Err(AppError::bad_request("Add your name."));
+    }
+    let warnings = profile.check_against(&resume.extracted_text);
+    if !store.save_profile_edits(record.id, &profile, &warnings)? {
+        return Err(AppError {
+            status: StatusCode::CONFLICT,
+            message: "This reading can't be edited right now. Reload the page.".into(),
+        });
+    }
+    let saved = store.get_profile(record.id)?.ok_or_else(|| AppError::internal("profile vanished"))?;
+    Ok(Json(saved))
+}
+
+async fn confirm_profile(State(store): State<Arc<Store>>) -> Result<Json<ProfileRecord>, AppError> {
+    let (_, record) = current_profile(&store)?;
+    if !store.confirm_profile(record.id)? {
+        return Err(AppError {
+            status: StatusCode::CONFLICT,
+            message: "Only a finished reading can be confirmed. Reload the page.".into(),
+        });
+    }
+    let saved = store.get_profile(record.id)?.ok_or_else(|| AppError::internal("profile vanished"))?;
+    Ok(Json(saved))
+}
+
+async fn ai_status(State(reader): State<Arc<ResumeReader>>) -> Json<AiStatus> {
+    Json(reader.status().await)
+}
+
+#[derive(Deserialize)]
+struct AiSettings {
+    resume_reader_model: String,
+}
+
+async fn update_ai_settings(
+    State(reader): State<Arc<ResumeReader>>,
+    Json(settings): Json<AiSettings>,
+) -> Result<Json<AiStatus>, AppError> {
+    let model = settings.resume_reader_model.trim();
+    if model.is_empty() || model.len() > 200 {
+        return Err(AppError::bad_request("Pick a model."));
+    }
+    reader.set_model(model)?;
+    Ok(Json(reader.status().await))
 }
 
 async fn list_searches(State(store): State<Arc<Store>>) -> Result<Json<Vec<JobSearch>>, AppError> {
