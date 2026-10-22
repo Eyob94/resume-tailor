@@ -1,9 +1,8 @@
-pub mod ai;
+pub mod db;
 pub mod errors;
-pub mod linkedin;
-pub mod matching;
-pub mod pdf;
-pub mod profile;
-pub mod scan;
-pub mod search;
-pub mod store;
+pub mod match_stage;
+pub mod parse_stage;
+pub mod pipeline;
+pub mod resume_stage;
+pub mod scrape_stage;
+pub mod types;
