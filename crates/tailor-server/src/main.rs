@@ -1,7 +1,6 @@
 use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
 
 mod errors;
-mod scanner;
 
 use axum::{
     extract::{DefaultBodyLimit, FromRef, Multipart, Path, Query, State},
@@ -11,18 +10,22 @@ use axum::{
     Json, Router,
 };
 use errors::AppError;
-use scanner::{Scanner, MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES};
+
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
 use tailor_core::{
     db::Db,
     errors::{ProfileError, ResumeError},
-    linkedin::LinkedInClient,
+    match_stage::MatchStage,
     parse_stage::{
         ollama_status, ParseMessage, ParseStage, DEFAULT_MODEL, DEFAULT_OLLAMA_URL, MODEL_KEY,
     },
     resume_stage::{ResumeMessage, ResumeStage, MAX_UPLOAD_BYTES},
+    scrape_stage::{
+        interval_minutes, LinkedInClient, ScrapeMessage, ScrapeStage, DEFAULT_COOLDOWN_SECONDS,
+        MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES,
+    },
     types::{
         JobListing, JobSearch, JobStatus, MasterResume, OllamaStatus, ProfileRecord, ResumeProfile,
         ScanStatus, SearchInput,
@@ -38,7 +41,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Clone)]
 struct AppState {
     store: Arc<Db>,
-    scanner: Arc<Scanner>,
+    scrape: UnboundedSender<ScrapeMessage>,
     resume: UnboundedSender<ResumeMessage>,
     parse: UnboundedSender<ParseMessage>,
     ollama_url: String,
@@ -47,12 +50,6 @@ struct AppState {
 impl FromRef<AppState> for Arc<Db> {
     fn from_ref(state: &AppState) -> Self {
         state.store.clone()
-    }
-}
-
-impl FromRef<AppState> for Arc<Scanner> {
-    fn from_ref(state: &AppState) -> Self {
-        state.scanner.clone()
     }
 }
 
@@ -72,9 +69,24 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(8787);
 
     let store = Arc::new(Db::open(&data_dir)?);
-    let scanner = Arc::new(Scanner::new(store.clone(), LinkedInClient::new()?));
-    tokio::spawn(scanner.clone().run_forever());
     let ollama_url = env::var("OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.into());
+    let cooldown_seconds = env::var("SCAN_COOLDOWN_SECONDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_COOLDOWN_SECONDS);
+    if cooldown_seconds != DEFAULT_COOLDOWN_SECONDS {
+        tracing::warn!(cooldown_seconds, "manual scan cooldown overridden");
+    }
+    let (match_tx, match_rx) = tokio::sync::mpsc::unbounded_channel();
+    let match_stage = MatchStage::new(store.clone(), match_rx);
+    let (scrape_tx, scrape_rx) = tokio::sync::mpsc::unbounded_channel();
+    let scrape_stage = ScrapeStage::new(
+        store.clone(),
+        LinkedInClient::new()?,
+        cooldown_seconds,
+        scrape_rx,
+        match_tx,
+    );
     let (parse_tx, parse_rx) = tokio::sync::mpsc::unbounded_channel();
     let parse_stage = ParseStage::new(store.clone(), ollama_url.clone(), parse_rx);
     let (resume_tx, resume_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -102,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES + 64 * 1024))
         .with_state(AppState {
             store,
-            scanner,
+            scrape: scrape_tx,
             resume: resume_tx,
             parse: parse_tx,
             ollama_url,
@@ -121,6 +133,8 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app).await?;
     resume_stage.join().await;
     parse_stage.join().await;
+    scrape_stage.join().await;
+    match_stage.join().await;
     Ok(())
 }
 
@@ -309,7 +323,7 @@ async fn create_search(
 ) -> Result<(StatusCode, Json<JobSearch>), AppError> {
     let criteria = input.validate().map_err(|e| AppError::bad_request(e.0))?;
     let search = state.store.create_search(&criteria)?;
-    state.scanner.reschedule();
+    let _ = state.scrape.send(ScrapeMessage::Reschedule);
     Ok((StatusCode::CREATED, Json(search)))
 }
 
@@ -323,7 +337,7 @@ async fn update_search(
         .store
         .update_search(id, &criteria)?
         .ok_or_else(|| AppError::not_found_msg("Search not found."))?;
-    state.scanner.reschedule();
+    let _ = state.scrape.send(ScrapeMessage::Reschedule);
     Ok(Json(search))
 }
 
@@ -334,7 +348,7 @@ async fn delete_search(
     if !state.store.delete_search(id)? {
         return Err(AppError::not_found_msg("Search not found."));
     }
-    state.scanner.reschedule();
+    let _ = state.scrape.send(ScrapeMessage::Reschedule);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -388,13 +402,14 @@ async fn update_jobs_status(
     Ok(Json(json!({ "updated": updated })))
 }
 
-async fn scan_status(State(scanner): State<Arc<Scanner>>) -> Result<Json<ScanStatus>, AppError> {
-    Ok(Json(scanner.status()?))
+async fn scan_status(State(state): State<AppState>) -> Result<Json<ScanStatus>, AppError> {
+    let status = ask(&state.scrape, |reply| ScrapeMessage::Status { reply }).await??;
+    Ok(Json(status))
 }
 
-async fn run_scan_now(State(scanner): State<Arc<Scanner>>) -> Result<StatusCode, AppError> {
-    scanner
-        .request_run()
+async fn run_scan_now(State(state): State<AppState>) -> Result<StatusCode, AppError> {
+    ask(&state.scrape, |reply| ScrapeMessage::RunNow { reply })
+        .await?
         .map(|()| StatusCode::ACCEPTED)
         .map_err(|message| AppError {
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -407,14 +422,14 @@ struct Settings {
     scan_interval_minutes: u32,
 }
 
-async fn get_settings(State(scanner): State<Arc<Scanner>>) -> Json<Settings> {
+async fn get_settings(State(store): State<Arc<Db>>) -> Json<Settings> {
     Json(Settings {
-        scan_interval_minutes: scanner.interval_minutes(),
+        scan_interval_minutes: interval_minutes(&store),
     })
 }
 
 async fn update_settings(
-    State(scanner): State<Arc<Scanner>>,
+    State(state): State<AppState>,
     Json(settings): Json<Settings>,
 ) -> Result<Json<Settings>, AppError> {
     let minutes = settings.scan_interval_minutes;
@@ -423,6 +438,9 @@ async fn update_settings(
             "Scan interval must be between {MIN_INTERVAL_MINUTES} and {MAX_INTERVAL_MINUTES} minutes."
         )));
     }
-    scanner.set_interval_minutes(minutes)?;
+    state
+        .store
+        .set_setting("scan_interval_minutes", &minutes.to_string())?;
+    let _ = state.scrape.send(ScrapeMessage::Reschedule);
     Ok(Json(settings))
 }

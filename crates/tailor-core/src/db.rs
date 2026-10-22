@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs, io,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use chrono::Utc;
@@ -15,9 +15,10 @@ use crate::{
         ProfileRecord, ResumeProfile, ScanRun, SearchCriteria, Warning, WorkMode,
     },
 };
+#[derive(Clone)]
 pub struct Db {
-    conn: Mutex<Connection>,
-    data_dir: PathBuf,
+    conn: Arc<Mutex<Connection>>,
+    data_dir: Arc<PathBuf>,
 }
 
 pub(crate) struct KnownJob {
@@ -156,8 +157,8 @@ impl Db {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&conn)?;
         Ok(Self {
-            conn: Mutex::new(conn),
-            data_dir,
+            conn: Arc::new(Mutex::new(conn)),
+            data_dir: Arc::new(data_dir),
         })
     }
 
