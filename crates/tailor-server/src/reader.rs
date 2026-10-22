@@ -1,12 +1,14 @@
-
 use std::sync::Arc;
 
 use serde::Serialize;
 use tailor_core::{
     ai::{Ollama, OllamaStatus},
     profile::read_resume,
-    store::{Store, StoreError},
+    errors::StoreError,
+    store::Store,
 };
+
+use crate::errors::StartError;
 
 const MODEL_KEY: &str = "resume_reader_model";
 pub const DEFAULT_MODEL: &str = "qwen2.5:7b";
@@ -15,18 +17,6 @@ pub const DEFAULT_MODEL: &str = "qwen2.5:7b";
 pub struct AiStatus {
     pub ollama: OllamaStatus,
     pub resume_reader_model: String,
-}
-
-pub enum StartError {
-    NoResume,
-    AlreadyReading,
-    Store(StoreError),
-}
-
-impl From<StoreError> for StartError {
-    fn from(e: StoreError) -> Self {
-        Self::Store(e)
-    }
 }
 
 pub struct ResumeReader {

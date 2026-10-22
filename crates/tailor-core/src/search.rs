@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
+
+use crate::errors::InvalidSearch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -98,10 +99,6 @@ pub struct JobSearch {
     pub created_at: String,
     pub updated_at: String,
 }
-
-#[derive(Debug, Error)]
-#[error("{0}")]
-pub struct InvalidSearch(pub String);
 
 const MAX_TERMS: usize = 20;
 const MAX_TERM_CHARS: usize = 100;

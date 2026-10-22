@@ -1,4 +1,3 @@
-
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -6,7 +5,8 @@ use serde::Serialize;
 use tailor_core::{
     linkedin::LinkedInClient,
     scan::{run_scan, ScanLimits},
-    store::{ScanRun, Store, StoreError},
+    errors::StoreError,
+    store::{ScanRun, Store},
 };
 use tokio::sync::Notify;
 

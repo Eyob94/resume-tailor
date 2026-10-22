@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod errors;
 pub mod linkedin;
 pub mod matching;
 pub mod pdf;
