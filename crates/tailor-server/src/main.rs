@@ -17,14 +17,12 @@ use serde_json::json;
 use tailor_core::{
     db::Db,
     errors::{ProfileError, ResumeError},
-    match_stage::MatchStage,
-    parse_stage::{
-        ollama_status, ParseMessage, ParseStage, DEFAULT_MODEL, DEFAULT_OLLAMA_URL, MODEL_KEY,
-    },
-    resume_stage::{ResumeMessage, ResumeStage, MAX_UPLOAD_BYTES},
+    parse_stage::{ollama_status, ParseMessage, DEFAULT_MODEL, DEFAULT_OLLAMA_URL, MODEL_KEY},
+    pipeline::{Pipeline, PipelineConfig, PipelineSenders},
+    resume_stage::{ResumeMessage, MAX_UPLOAD_BYTES},
     scrape_stage::{
-        interval_minutes, LinkedInClient, ScrapeMessage, ScrapeStage, DEFAULT_COOLDOWN_SECONDS,
-        MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES,
+        interval_minutes, ScrapeMessage, DEFAULT_COOLDOWN_SECONDS, MAX_INTERVAL_MINUTES,
+        MIN_INTERVAL_MINUTES,
     },
     types::{
         JobListing, JobSearch, JobStatus, MasterResume, OllamaStatus, ProfileRecord, ResumeProfile,
@@ -41,9 +39,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Clone)]
 struct AppState {
     store: Arc<Db>,
-    scrape: UnboundedSender<ScrapeMessage>,
-    resume: UnboundedSender<ResumeMessage>,
-    parse: UnboundedSender<ParseMessage>,
+    senders: PipelineSenders,
     ollama_url: String,
 }
 
@@ -77,20 +73,13 @@ async fn main() -> anyhow::Result<()> {
     if cooldown_seconds != DEFAULT_COOLDOWN_SECONDS {
         tracing::warn!(cooldown_seconds, "manual scan cooldown overridden");
     }
-    let (match_tx, match_rx) = tokio::sync::mpsc::unbounded_channel();
-    let match_stage = MatchStage::new(store.clone(), match_rx);
-    let (scrape_tx, scrape_rx) = tokio::sync::mpsc::unbounded_channel();
-    let scrape_stage = ScrapeStage::new(
+    let (pipeline, senders) = Pipeline::new(
         store.clone(),
-        LinkedInClient::new()?,
-        cooldown_seconds,
-        scrape_rx,
-        match_tx,
-    );
-    let (parse_tx, parse_rx) = tokio::sync::mpsc::unbounded_channel();
-    let parse_stage = ParseStage::new(store.clone(), ollama_url.clone(), parse_rx);
-    let (resume_tx, resume_rx) = tokio::sync::mpsc::unbounded_channel();
-    let resume_stage = ResumeStage::new(store.clone(), resume_rx, parse_tx.clone());
+        PipelineConfig {
+            ollama_url: ollama_url.clone(),
+            scan_cooldown_seconds: cooldown_seconds,
+        },
+    )?;
 
     let api = Router::new()
         .route("/health", get(health))
@@ -114,9 +103,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES + 64 * 1024))
         .with_state(AppState {
             store,
-            scrape: scrape_tx,
-            resume: resume_tx,
-            parse: parse_tx,
+            senders: senders.clone(),
             ollama_url,
         });
 
@@ -131,10 +118,8 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("listening on http://{addr}");
     axum::serve(listener, app).await?;
-    resume_stage.join().await;
-    parse_stage.join().await;
-    scrape_stage.join().await;
-    match_stage.join().await;
+    drop(senders);
+    pipeline.join().await;
     Ok(())
 }
 
@@ -191,7 +176,7 @@ async fn upload_resume(
         }
         let file_name = field.file_name().unwrap_or_default().to_string();
         let bytes = field.bytes().await.map_err(AppError::multipart)?.to_vec();
-        let resume = ask(&state.resume, |reply| ResumeMessage::Upload {
+        let resume = ask(&state.senders.resume, |reply| ResumeMessage::Upload {
             file_name,
             bytes,
             reply,
@@ -204,9 +189,11 @@ async fn upload_resume(
 }
 
 async fn delete_resume(State(state): State<AppState>) -> Result<StatusCode, AppError> {
-    ask(&state.resume, |reply| ResumeMessage::Remove { reply })
-        .await?
-        .map_err(map_resume_error)?;
+    ask(&state.senders.resume, |reply| ResumeMessage::Remove {
+        reply,
+    })
+    .await?
+    .map_err(map_resume_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -251,9 +238,11 @@ async fn get_profile(
 }
 
 async fn read_profile(State(state): State<AppState>) -> Result<StatusCode, AppError> {
-    ask(&state.parse, |reply| ParseMessage::ReadAgain { reply })
-        .await?
-        .map_err(map_profile_error)?;
+    ask(&state.senders.parse, |reply| ParseMessage::ReadAgain {
+        reply,
+    })
+    .await?
+    .map_err(map_profile_error)?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -261,7 +250,7 @@ async fn update_profile(
     State(state): State<AppState>,
     Json(profile): Json<ResumeProfile>,
 ) -> Result<Json<ProfileRecord>, AppError> {
-    let saved = ask(&state.parse, |reply| ParseMessage::SaveEdits {
+    let saved = ask(&state.senders.parse, |reply| ParseMessage::SaveEdits {
         profile,
         reply,
     })
@@ -271,9 +260,11 @@ async fn update_profile(
 }
 
 async fn confirm_profile(State(state): State<AppState>) -> Result<Json<ProfileRecord>, AppError> {
-    let saved = ask(&state.parse, |reply| ParseMessage::Confirm { reply })
-        .await?
-        .map_err(map_profile_error)?;
+    let saved = ask(&state.senders.parse, |reply| ParseMessage::Confirm {
+        reply,
+    })
+    .await?
+    .map_err(map_profile_error)?;
     Ok(Json(saved))
 }
 
@@ -323,7 +314,7 @@ async fn create_search(
 ) -> Result<(StatusCode, Json<JobSearch>), AppError> {
     let criteria = input.validate().map_err(|e| AppError::bad_request(e.0))?;
     let search = state.store.create_search(&criteria)?;
-    let _ = state.scrape.send(ScrapeMessage::Reschedule);
+    let _ = state.senders.scrape.send(ScrapeMessage::Reschedule);
     Ok((StatusCode::CREATED, Json(search)))
 }
 
@@ -337,7 +328,7 @@ async fn update_search(
         .store
         .update_search(id, &criteria)?
         .ok_or_else(|| AppError::not_found_msg("Search not found."))?;
-    let _ = state.scrape.send(ScrapeMessage::Reschedule);
+    let _ = state.senders.scrape.send(ScrapeMessage::Reschedule);
     Ok(Json(search))
 }
 
@@ -348,7 +339,7 @@ async fn delete_search(
     if !state.store.delete_search(id)? {
         return Err(AppError::not_found_msg("Search not found."));
     }
-    let _ = state.scrape.send(ScrapeMessage::Reschedule);
+    let _ = state.senders.scrape.send(ScrapeMessage::Reschedule);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -403,18 +394,23 @@ async fn update_jobs_status(
 }
 
 async fn scan_status(State(state): State<AppState>) -> Result<Json<ScanStatus>, AppError> {
-    let status = ask(&state.scrape, |reply| ScrapeMessage::Status { reply }).await??;
+    let status = ask(&state.senders.scrape, |reply| ScrapeMessage::Status {
+        reply,
+    })
+    .await??;
     Ok(Json(status))
 }
 
 async fn run_scan_now(State(state): State<AppState>) -> Result<StatusCode, AppError> {
-    ask(&state.scrape, |reply| ScrapeMessage::RunNow { reply })
-        .await?
-        .map(|()| StatusCode::ACCEPTED)
-        .map_err(|message| AppError {
-            status: StatusCode::TOO_MANY_REQUESTS,
-            message,
-        })
+    ask(&state.senders.scrape, |reply| ScrapeMessage::RunNow {
+        reply,
+    })
+    .await?
+    .map(|()| StatusCode::ACCEPTED)
+    .map_err(|message| AppError {
+        status: StatusCode::TOO_MANY_REQUESTS,
+        message,
+    })
 }
 
 #[derive(serde::Serialize, Deserialize)]
@@ -441,6 +437,6 @@ async fn update_settings(
     state
         .store
         .set_setting("scan_interval_minutes", &minutes.to_string())?;
-    let _ = state.scrape.send(ScrapeMessage::Reschedule);
+    let _ = state.senders.scrape.send(ScrapeMessage::Reschedule);
     Ok(Json(settings))
 }
