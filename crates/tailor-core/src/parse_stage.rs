@@ -18,6 +18,7 @@ use crate::{
 
 pub const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
 pub const MODEL_KEY: &str = "resume_reader_model";
+pub const OLLAMA_URL_KEY: &str = "ollama_url";
 pub const DEFAULT_MODEL: &str = "qwen2.5:7b";
 
 pub enum ParseMessage {
@@ -51,7 +52,7 @@ impl ParseStage {
     }
 }
 
-async fn run(db: Arc<Db>, ollama_url: String, mut rx: UnboundedReceiver<ParseMessage>) {
+async fn run(db: Arc<Db>, default_ollama_url: String, mut rx: UnboundedReceiver<ParseMessage>) {
     let db_for_cleanup = db.clone();
     match tokio::task::spawn_blocking(move || db_for_cleanup.mark_interrupted_profiles()).await {
         Ok(Ok(())) => {}
@@ -61,7 +62,13 @@ async fn run(db: Arc<Db>, ollama_url: String, mut rx: UnboundedReceiver<ParseMes
     while let Some(message) = rx.recv().await {
         match message {
             ParseMessage::Parse { resume } => {
-                if let Err(e) = start_reading(db.clone(), ollama_url.clone(), resume).await {
+                if let Err(e) = start_reading(
+                    db.clone(),
+                    configured_ollama_url(&db, &default_ollama_url),
+                    resume,
+                )
+                .await
+                {
                     tracing::error!("couldn't start reading the resume: {e}");
                 }
             }
@@ -75,7 +82,14 @@ async fn run(db: Arc<Db>, ollama_url: String, mut rx: UnboundedReceiver<ParseMes
                     .and_then(|result| result.map_err(ProfileError::Db))
                     .and_then(|resume| resume.ok_or(ProfileError::NoResume));
                 let result = match result {
-                    Ok(resume) => start_reading(db.clone(), ollama_url.clone(), resume).await,
+                    Ok(resume) => {
+                        start_reading(
+                            db.clone(),
+                            configured_ollama_url(&db, &default_ollama_url),
+                            resume,
+                        )
+                        .await
+                    }
                     Err(e) => Err(e),
                 };
                 let _ = reply.send(result);
@@ -90,6 +104,13 @@ async fn run(db: Arc<Db>, ollama_url: String, mut rx: UnboundedReceiver<ParseMes
             }
         }
     }
+}
+
+fn configured_ollama_url(db: &Db, default_url: &str) -> String {
+    db.get_setting(OLLAMA_URL_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| default_url.to_string())
 }
 
 async fn start_reading(

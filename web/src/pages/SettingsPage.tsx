@@ -1,7 +1,7 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { errorMessage, jobsApi, profileApi, type AiStatus } from "../api";
 import { ServerStatus } from "../components/Layout";
-import { Alert, Card, PageHeader } from "../components/ui";
+import { Alert, Button, Card, PageHeader } from "../components/ui";
 import { useDevMode } from "../devMode";
 
 function Row({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
@@ -37,20 +37,43 @@ export function SettingsPage() {
   const [scanInterval, setScanInterval] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [ai, setAi] = useState<AiStatus | null>(null);
+  const [ollamaUrl, setOllamaUrl] = useState("");
 
   useEffect(() => {
     jobsApi.getSettings().then(
       (s) => setScanInterval(s.scan_interval_minutes),
       (e) => setError(errorMessage(e)),
     );
-    profileApi.aiStatus().then(setAi, (e) => setError(errorMessage(e)));
+    profileApi.aiStatus().then(
+      (status) => {
+        setAi(status);
+        setOllamaUrl(status.ollama_url);
+      },
+      (e) => setError(errorMessage(e)),
+    );
   }, []);
+
+  const [savingUrl, setSavingUrl] = useState(false);
 
   async function changeReaderModel(model: string) {
     try {
-      setAi(await profileApi.setReaderModel(model));
+      setAi(await profileApi.updateAiSettings({ resume_reader_model: model }));
     } catch (e) {
       setError(errorMessage(e));
+    }
+  }
+
+  async function saveOllamaUrl(e: FormEvent) {
+    e.preventDefault();
+    setSavingUrl(true);
+    try {
+      const status = await profileApi.updateAiSettings({ ollama_url: ollamaUrl });
+      setAi(status);
+      setOllamaUrl(status.ollama_url);
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setSavingUrl(false);
     }
   }
 
@@ -114,6 +137,22 @@ export function SettingsPage() {
               </select>
             </span>
           )}
+        </Row>
+        <Row label="Ollama URL" hint="Where the Ollama server runs. Change it if Ollama is on another machine.">
+          <form onSubmit={saveOllamaUrl} className="flex w-full items-center gap-2 sm:w-auto">
+            <input
+              id="ollama-url"
+              aria-label="Ollama URL"
+              type="url"
+              value={ollamaUrl}
+              onChange={(e) => setOllamaUrl(e.target.value)}
+              placeholder="http://127.0.0.1:11434"
+              className="min-w-0 flex-1 rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-sm text-zinc-900 shadow-sm sm:w-64 sm:flex-none"
+            />
+            <Button type="submit" variant="primary" loading={savingUrl} disabled={!ai || ollamaUrl.trim() === ai.ollama_url}>
+              Save
+            </Button>
+          </form>
         </Row>
         <Row label="Data">
           Stored locally in <code className="rounded bg-zinc-100 px-1.5 py-0.5 text-xs">./data</code>

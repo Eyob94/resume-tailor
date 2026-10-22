@@ -38,6 +38,7 @@ Open http://localhost:5173 (proxies `/api` to the Rust server).
 | `PORT` | `8787` | Server binds to 127.0.0.1 only (no auth) |
 | `DATA_DIR` | `data` | SQLite DB + uploaded PDF |
 | `WEB_DIST` | `web/dist` | Built frontend to serve |
+| `OLLAMA_URL` | `http://127.0.0.1:11434` | Initial Ollama server URL; can be changed later in Settings and is saved in SQLite |
 | `SCAN_COOLDOWN_SECONDS` | `600` | Minimum gap before a manual "Run now" scan. Lower only for local testing (the dev launch config uses 60) |
 
 ## Tests

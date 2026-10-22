@@ -17,7 +17,9 @@ use serde_json::json;
 use tailor_core::{
     db::Db,
     errors::{ProfileError, ResumeError},
-    parse_stage::{ollama_status, ParseMessage, DEFAULT_MODEL, DEFAULT_OLLAMA_URL, MODEL_KEY},
+    parse_stage::{
+        ollama_status, ParseMessage, DEFAULT_MODEL, DEFAULT_OLLAMA_URL, MODEL_KEY, OLLAMA_URL_KEY,
+    },
     pipeline::{Pipeline, PipelineConfig, PipelineSenders},
     resume_stage::{ResumeMessage, MAX_UPLOAD_BYTES},
     scrape_stage::{
@@ -272,6 +274,7 @@ async fn confirm_profile(State(state): State<AppState>) -> Result<Json<ProfileRe
 struct AiStatus {
     ollama: OllamaStatus,
     resume_reader_model: String,
+    ollama_url: String,
 }
 
 async fn ai_status(State(state): State<AppState>) -> Result<Json<AiStatus>, AppError> {
@@ -281,26 +284,47 @@ async fn ai_status(State(state): State<AppState>) -> Result<Json<AiStatus>, AppE
         .ok()
         .flatten()
         .unwrap_or_else(|| DEFAULT_MODEL.into());
+    let ollama_url = state
+        .store
+        .get_setting(OLLAMA_URL_KEY)?
+        .unwrap_or_else(|| state.ollama_url.clone());
     Ok(Json(AiStatus {
-        ollama: ollama_status(&state.ollama_url).await,
+        ollama: ollama_status(&ollama_url).await,
         resume_reader_model: model,
+        ollama_url,
     }))
 }
 
 #[derive(Deserialize)]
 struct AiSettings {
-    resume_reader_model: String,
+    resume_reader_model: Option<String>,
+    ollama_url: Option<String>,
 }
 
 async fn update_ai_settings(
     State(state): State<AppState>,
     Json(settings): Json<AiSettings>,
 ) -> Result<Json<AiStatus>, AppError> {
-    let model = settings.resume_reader_model.trim();
-    if model.is_empty() || model.len() > 200 {
-        return Err(AppError::bad_request("Pick a model."));
+    let url = settings.ollama_url.as_deref().map(|url| url.trim().trim_end_matches('/'));
+    if let Some(url) = url {
+        if url.len() > 2048 || !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err(AppError::bad_request(
+                "Enter a valid Ollama URL beginning with http:// or https://.",
+            ));
+        }
     }
-    state.store.set_setting(MODEL_KEY, model)?;
+    let model = settings.resume_reader_model.as_deref().map(str::trim);
+    if let Some(model) = model {
+        if model.is_empty() || model.len() > 200 {
+            return Err(AppError::bad_request("Pick a model."));
+        }
+    }
+    if let Some(url) = url {
+        state.store.set_setting(OLLAMA_URL_KEY, url)?;
+    }
+    if let Some(model) = model {
+        state.store.set_setting(MODEL_KEY, model)?;
+    }
     ai_status(State(state)).await
 }
 
