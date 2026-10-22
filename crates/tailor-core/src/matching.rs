@@ -1,4 +1,3 @@
-
 use crate::search::WorkMode;
 
 pub fn contains_term(haystack: &str, term: &str) -> bool {

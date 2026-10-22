@@ -6,24 +6,13 @@ use std::{
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
-use thiserror::Error;
 
-use crate::pdf::PdfInfo;
+use crate::{errors::StoreError, pdf::PdfInfo};
 
 mod jobs;
 mod profile;
 pub use jobs::*;
 pub use profile::*;
-
-#[derive(Debug, Error)]
-pub enum StoreError {
-    #[error(transparent)]
-    Db(#[from] rusqlite::Error),
-    #[error(transparent)]
-    Io(#[from] io::Error),
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MasterResume {

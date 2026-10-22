@@ -1,9 +1,9 @@
-
 use chrono::Utc;
 use rusqlite::{params, OptionalExtension, Row};
 use serde::Serialize;
 
-use super::{Store, StoreError};
+use super::Store;
+use crate::errors::StoreError;
 use crate::profile::{ResumeProfile, Warning};
 
 fn now() -> String {

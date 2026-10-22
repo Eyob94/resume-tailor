@@ -1,11 +1,11 @@
-
 use std::collections::HashMap;
 
 use chrono::Utc;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use super::{Store, StoreError};
+use super::Store;
+use crate::errors::StoreError;
 use crate::{
     linkedin::{JobCard, JobDetail},
     search::{JobSearch, PostedWithin, SearchCriteria, WorkMode},

@@ -1,5 +1,6 @@
-use std::{env, fmt::Display, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
 
+mod errors;
 mod reader;
 mod scanner;
 
@@ -10,17 +11,19 @@ use axum::{
     routing::{get, patch, post, put},
     Json, Router,
 };
-use reader::{AiStatus, ResumeReader, StartError};
+use errors::{AppError, StartError};
+use reader::{AiStatus, ResumeReader};
 use scanner::{Scanner, ScanStatus, MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES};
 use serde::Deserialize;
 use serde_json::json;
 use tailor_core::{
     linkedin::LinkedInClient,
     ai::DEFAULT_OLLAMA_URL,
-    pdf::{self, PdfError},
+    errors::PdfError,
+    pdf,
     profile::ResumeProfile,
     search::{JobSearch, SearchInput},
-    store::{JobListing, JobStatus, MasterResume, ProfileRecord, Store, StoreError},
+    store::{JobListing, JobStatus, MasterResume, ProfileRecord, Store},
 };
 use tower_http::{
     services::{ServeDir, ServeFile},
@@ -28,7 +31,7 @@ use tower_http::{
 };
 use tracing_subscriber::EnvFilter;
 
-const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
+pub(crate) const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
@@ -389,57 +392,6 @@ fn sanitize_file_name(raw: &str) -> String {
         "resume.pdf".into()
     } else {
         name
-    }
-}
-
-struct AppError {
-    status: StatusCode,
-    message: String,
-}
-
-impl AppError {
-    fn bad_request(message: impl Into<String>) -> Self {
-        Self { status: StatusCode::BAD_REQUEST, message: message.into() }
-    }
-
-    fn not_found() -> Self {
-        Self::not_found_msg("No master resume has been uploaded.")
-    }
-
-    fn not_found_msg(message: &str) -> Self {
-        Self { status: StatusCode::NOT_FOUND, message: message.into() }
-    }
-
-    fn too_large() -> Self {
-        Self {
-            status: StatusCode::PAYLOAD_TOO_LARGE,
-            message: format!("That file is too large. The limit is {} MB.", MAX_UPLOAD_BYTES / 1024 / 1024),
-        }
-    }
-
-    fn multipart(e: axum::extract::multipart::MultipartError) -> Self {
-        if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
-            Self::too_large()
-        } else {
-            Self { status: e.status(), message: e.body_text() }
-        }
-    }
-
-    fn internal(e: impl Display) -> Self {
-        tracing::error!("internal error: {e}");
-        Self { status: StatusCode::INTERNAL_SERVER_ERROR, message: "Something went wrong on the server.".into() }
-    }
-}
-
-impl From<StoreError> for AppError {
-    fn from(e: StoreError) -> Self {
-        Self::internal(e)
-    }
-}
-
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
     }
 }
 

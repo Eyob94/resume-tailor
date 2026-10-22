@@ -1,25 +1,11 @@
-
 use std::{future::Future, time::Duration};
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use thiserror::Error;
+
+use crate::errors::AiError;
 
 pub const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
-
-#[derive(Debug, Error)]
-pub enum AiError {
-    #[error("Ollama isn't running at {0}. Start it with `ollama serve` or the Ollama app.")]
-    Unreachable(String),
-    #[error("The model \"{0}\" isn't installed. Run `ollama pull {0}`.")]
-    ModelMissing(String),
-    #[error("The model took too long to answer.")]
-    Timeout,
-    #[error("The model returned an error (HTTP {0}): {1}")]
-    Status(u16, String),
-    #[error("The model's answer didn't fit the expected format: {0}")]
-    BadOutput(String),
-}
 
 pub trait JsonModel {
     fn label(&self) -> String;

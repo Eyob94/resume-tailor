@@ -1,12 +1,4 @@
-use thiserror::Error;
-
-#[derive(Debug, Error)]
-pub enum PdfError {
-    #[error("file is not a PDF")]
-    NotPdf,
-    #[error("could not read PDF: {0}")]
-    Unreadable(String),
-}
+use crate::errors::PdfError;
 
 #[derive(Debug, Clone)]
 pub struct PdfInfo {

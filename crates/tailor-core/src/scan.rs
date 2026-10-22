@@ -1,13 +1,13 @@
-
 use std::{collections::HashSet, future::Future, time::Duration};
 
 use rand::Rng;
 
 use crate::{
-    linkedin::{JobCard, JobDetail, LinkedInClient, LinkedInError, SearchQuery},
+    errors::{LinkedInError, ScanError},
+    linkedin::{JobCard, JobDetail, LinkedInClient, SearchQuery},
     matching::{infer_work_mode, keyword_hits, title_matches},
     search::JobSearch,
-    store::{Store, StoreError},
+    store::Store,
 };
 
 pub trait JobSource {
@@ -52,14 +52,6 @@ pub struct ScanReport {
     pub details_paused: bool,
     pub search_blocked: bool,
     pub error: Option<String>,
-}
-
-#[derive(Debug, thiserror::Error)]
-enum ScanError {
-    #[error(transparent)]
-    Source(#[from] LinkedInError),
-    #[error(transparent)]
-    Store(#[from] StoreError),
 }
 
 struct Budget {

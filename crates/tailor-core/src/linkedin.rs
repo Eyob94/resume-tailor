@@ -1,9 +1,9 @@
-
 use std::time::Duration;
 
 use scraper::{ElementRef, Html, Selector};
 use serde::Serialize;
-use thiserror::Error;
+
+use crate::errors::LinkedInError;
 
 use crate::search::{PostedWithin, WorkMode};
 
@@ -12,16 +12,6 @@ const SEE_MORE_URL: &str = "https://www.linkedin.com/jobs-guest/jobs/api/seeMore
 const DETAIL_URL: &str = "https://www.linkedin.com/jobs/view";
 const USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
-
-#[derive(Debug, Error)]
-pub enum LinkedInError {
-    #[error("LinkedIn is rate-limiting requests (HTTP {0}); will retry next scan")]
-    Blocked(u16),
-    #[error("LinkedIn returned HTTP {0}")]
-    Status(u16),
-    #[error("couldn't reach LinkedIn: {0}")]
-    Network(#[from] reqwest::Error),
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct JobCard {
