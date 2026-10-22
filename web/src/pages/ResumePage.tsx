@@ -1,13 +1,33 @@
-import { useRef, useState } from "react";
-import { ExternalLink, FileText, Info, RefreshCw, Trash2 } from "lucide-react";
-import { MAX_UPLOAD_BYTES, api, errorMessage, useResume, type MasterResume } from "../api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { AlertTriangle, CheckCircle2, ExternalLink, FileText, Info, Loader2, RefreshCw, Sparkles, Trash2 } from "lucide-react";
+import { MAX_UPLOAD_BYTES, api, errorMessage, profileApi, useResume, type MasterResume, type ProfileRecord, type ResumeProfile } from "../api";
 import { Dropzone } from "../components/Dropzone";
 import { JsonView } from "../components/JsonView";
+import { ProfileEditor } from "../components/ProfileEditor";
 import { useDevMode } from "../devMode";
 import { Alert, Button, Card, PageHeader, Skeleton } from "../components/ui";
 import { formatBytes, formatDate, plural } from "../format";
 
-type Tab = "preview" | "text" | "json";
+type Tab = "profile" | "preview" | "text" | "json";
+
+/** The AI's reading of the resume; polls while it's still reading. */
+function useProfile(resumeVersion: string) {
+  const [record, setRecord] = useState<ProfileRecord | null | undefined>(undefined);
+  const load = useCallback(async () => setRecord(await profileApi.get()), []);
+
+  useEffect(() => {
+    setRecord(undefined);
+    void load();
+  }, [load, resumeVersion]);
+
+  useEffect(() => {
+    if (record?.status !== "reading") return;
+    const id = setInterval(() => void load(), 3000);
+    return () => clearInterval(id);
+  }, [record?.status, load]);
+
+  return { record, setRecord, load };
+}
 
 function validateFile(file: File): string | null {
   const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
@@ -83,12 +103,26 @@ function ResumeDetails({
   onReplace: (file: File) => void;
   onRemove: () => void;
 }) {
-  const [selectedTab, setTab] = useState<Tab>("preview");
+  const [selectedTab, setTab] = useState<Tab>("profile");
   const [devMode] = useDevMode();
   const replaceInput = useRef<HTMLInputElement>(null);
   const fileUrl = api.resumeFileUrl(resume.uploaded_at);
+  const { record, setRecord, load } = useProfile(resume.uploaded_at);
+  const [error, setError] = useState<string | null>(null);
+
+  async function readAgain() {
+    if (record?.profile && !confirm("Read your resume again? Corrections you made to this reading will be replaced.")) return;
+    setError(null);
+    try {
+      await profileApi.read();
+      await load();
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  }
 
   const tabs: [Tab, string][] = [
+    ["profile", "What the AI understood"],
     ["preview", "Preview"],
     ["text", "Extracted text"],
     ...(devMode ? [["json", "JSON"] as [Tab, string]] : []),
@@ -142,23 +176,18 @@ function ResumeDetails({
         </div>
       </Card>
 
-      <div className="flex items-start gap-3 rounded-lg border border-zinc-200 bg-zinc-100/60 px-4 py-3 text-sm text-zinc-600">
-        <Info className="mt-0.5 size-4 shrink-0" />
-        <p>
-          Next up: parsing this into structured sections (experience, skills, education) so it can be tailored. That arrives once the
-          AI backend is chosen.
-        </p>
-      </div>
+      {error && <Alert onDismiss={() => setError(null)}>{error}</Alert>}
+      <ReadingStatus record={record} onRead={readAgain} />
 
       <Card className="overflow-hidden">
-        <div role="tablist" className="flex gap-1 border-b border-zinc-200 px-3 pt-3">
+        <div role="tablist" className="flex gap-1 overflow-x-auto border-b border-zinc-200 px-3 pt-3">
           {tabs.map(([id, label]) => (
             <button
               key={id}
               role="tab"
               aria-selected={tab === id}
               onClick={() => setTab(id)}
-              className={`-mb-px border-b-2 px-3 pb-2.5 text-sm font-medium transition-colors ${
+              className={`-mb-px shrink-0 border-b-2 px-3 pb-2.5 text-sm font-medium transition-colors ${
                 tab === id ? "border-zinc-900 text-zinc-900" : "border-transparent text-zinc-500 hover:text-zinc-900"
               }`}
             >
@@ -168,7 +197,24 @@ function ResumeDetails({
         </div>
 
         {tab === "json" ? (
-          <JsonView value={resume} fileName="resume.json" note="Raw GET /api/resume response" />
+          <JsonView value={{ resume, reading: record ?? null }} fileName="resume.json" note="GET /api/resume and /api/resume/profile" />
+        ) : tab === "profile" ? (
+          record?.profile && (record.status === "ready" || record.status === "confirmed") ? (
+            <ProfileEditor
+              key={record.id}
+              record={record as ProfileRecord & { profile: ResumeProfile }}
+              onSave={async (profile) => setRecord(await profileApi.save(profile))}
+              onConfirm={async () => setRecord(await profileApi.confirm())}
+            />
+          ) : (
+            <p className="p-6 text-sm text-zinc-500">
+              {record === undefined
+                ? "Loading…"
+                : record?.status === "reading"
+                  ? "The AI is reading your resume. Its results will show up here."
+                  : "Nothing to show yet. Use “Read with AI” above."}
+            </p>
+          )
         ) : tab === "preview" ? (
           <>
             {/* Mobile browsers (iOS Safari especially) render embedded PDFs poorly, so link out instead. */}
@@ -201,6 +247,57 @@ function ResumeDetails({
           </div>
         )}
       </Card>
+    </div>
+  );
+}
+
+function ReadingStatus({ record, onRead }: { record: ProfileRecord | null | undefined; onRead: () => void }) {
+  if (record === undefined) return null;
+
+  const box = "flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border px-4 py-3 text-sm";
+  const readButton = (label: string) => (
+    <Button icon={Sparkles} onClick={onRead} className="ml-auto">
+      {label}
+    </Button>
+  );
+
+  if (record === null) {
+    return (
+      <div className={`${box} border-zinc-200 bg-zinc-100/60 text-zinc-600`}>
+        <Info className="size-4 shrink-0" />
+        <p className="flex-1">This resume hasn't been read by the AI yet.</p>
+        {readButton("Read with AI")}
+      </div>
+    );
+  }
+  if (record.status === "reading") {
+    return (
+      <div className={`${box} border-sky-200 bg-sky-50 text-sky-800`}>
+        <Loader2 className="size-4 shrink-0 animate-spin" />
+        <p className="flex-1">Reading your resume with {record.model}. This usually takes under a minute.</p>
+      </div>
+    );
+  }
+  if (record.status === "failed") {
+    return (
+      <div className={`${box} border-red-200 bg-red-50 text-red-800`}>
+        <AlertTriangle className="size-4 shrink-0" />
+        <p className="flex-1">Reading failed: {record.error}</p>
+        {readButton("Try again")}
+      </div>
+    );
+  }
+  const flagged = record.warnings.length;
+  return (
+    <div className={`${box} ${record.status === "confirmed" ? "border-emerald-200 bg-emerald-50 text-emerald-800" : "border-amber-200 bg-amber-50 text-amber-900"}`}>
+      {record.status === "confirmed" ? <CheckCircle2 className="size-4 shrink-0" /> : <Info className="size-4 shrink-0" />}
+      <p className="flex-1">
+        {record.status === "confirmed"
+          ? `Confirmed ${formatDate(record.confirmed_at!)} · read by ${record.model}`
+          : `Read by ${record.model}. Check it below, fix anything wrong, then confirm.`}
+        {flagged > 0 && record.status !== "confirmed" && ` ${plural(flagged, "bullet")} to double-check.`}
+      </p>
+      {readButton("Read again")}
     </div>
   );
 }

@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { errorMessage, jobsApi } from "../api";
+import { errorMessage, jobsApi, profileApi, type AiStatus } from "../api";
 import { ServerStatus } from "../components/Layout";
 import { Alert, Card, PageHeader } from "../components/ui";
 import { useDevMode } from "../devMode";
@@ -36,13 +36,26 @@ export function SettingsPage() {
   const [devMode, setDevMode] = useDevMode();
   const [scanInterval, setScanInterval] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [ai, setAi] = useState<AiStatus | null>(null);
 
   useEffect(() => {
     jobsApi.getSettings().then(
       (s) => setScanInterval(s.scan_interval_minutes),
       (e) => setError(errorMessage(e)),
     );
+    profileApi.aiStatus().then(setAi, (e) => setError(errorMessage(e)));
   }, []);
+
+  async function changeReaderModel(model: string) {
+    try {
+      setAi(await profileApi.setReaderModel(model));
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  }
+
+  // Keep the saved choice selectable even if that model was removed from Ollama.
+  const models = ai ? Array.from(new Set([ai.resume_reader_model, ...ai.ollama.models])) : [];
 
   async function changeInterval(minutes: number) {
     const previous = scanInterval;
@@ -78,7 +91,31 @@ export function SettingsPage() {
             ))}
           </select>
         </Row>
-        <Row label="AI backend">Not configured yet</Row>
+        <Row label="Resume reader" hint="Reads your uploaded resume. Runs locally in Ollama, for free.">
+          {ai === null ? (
+            "Checking…"
+          ) : (
+            <span className="flex flex-wrap items-center gap-3">
+              <span className="inline-flex items-center gap-1.5 text-xs">
+                <span className={`size-2 rounded-full ${ai.ollama.reachable ? "bg-emerald-500" : "bg-red-500"}`} />
+                {ai.ollama.reachable ? "Ollama running" : "Ollama not running"}
+              </span>
+              <select
+                aria-label="Resume reader model"
+                value={ai.resume_reader_model}
+                onChange={(e) => changeReaderModel(e.target.value)}
+                className="rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-sm text-zinc-900 shadow-sm"
+              >
+                {models.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                    {ai.ollama.reachable && !ai.ollama.models.includes(m) ? " (not installed)" : ""}
+                  </option>
+                ))}
+              </select>
+            </span>
+          )}
+        </Row>
         <Row label="Data">
           Stored locally in <code className="rounded bg-zinc-100 px-1.5 py-0.5 text-xs">./data</code>
         </Row>

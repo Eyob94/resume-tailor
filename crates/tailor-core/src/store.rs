@@ -11,7 +11,9 @@ use thiserror::Error;
 use crate::pdf::PdfInfo;
 
 mod jobs;
+mod profile;
 pub use jobs::*;
+pub use profile::*;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -92,6 +94,18 @@ const MIGRATIONS: &[&str] = &[
     );",
     // Set once a tailored resume exists for the job.
     "ALTER TABLE jobs ADD COLUMN tailored_at TEXT;",
+    "CREATE TABLE resume_profiles (
+        id                 INTEGER PRIMARY KEY,
+        resume_uploaded_at TEXT NOT NULL,  -- which upload this reading belongs to
+        status             TEXT NOT NULL,  -- reading | ready | failed | confirmed
+        model              TEXT NOT NULL,
+        data               TEXT,           -- JSON ResumeProfile
+        warnings           TEXT NOT NULL DEFAULT '[]',
+        error              TEXT,
+        created_at         TEXT NOT NULL,
+        updated_at         TEXT NOT NULL,
+        confirmed_at       TEXT
+    );",
 ];
 
 pub struct Store {
