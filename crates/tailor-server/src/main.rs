@@ -1,7 +1,6 @@
 use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
 
 mod errors;
-mod reader;
 mod scanner;
 
 use axum::{
@@ -11,41 +10,38 @@ use axum::{
     routing::{get, patch, post, put},
     Json, Router,
 };
-use errors::{AppError, StartError};
-use reader::{AiStatus, ResumeReader};
+use errors::AppError;
 use scanner::{Scanner, MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES};
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::json;
 use tailor_core::{
-    ai::DEFAULT_OLLAMA_URL,
     db::Db,
-    errors::PdfError,
+    errors::{ProfileError, ResumeError},
     linkedin::LinkedInClient,
-    pdf,
+    parse_stage::{
+        ollama_status, ParseMessage, ParseStage, DEFAULT_MODEL, DEFAULT_OLLAMA_URL, MODEL_KEY,
+    },
+    resume_stage::{ResumeMessage, ResumeStage, MAX_UPLOAD_BYTES},
     types::{
-        JobListing, JobSearch, JobStatus, MasterResume, ProfileRecord, ResumeProfile, ScanStatus,
-        SearchInput,
+        JobListing, JobSearch, JobStatus, MasterResume, OllamaStatus, ProfileRecord, ResumeProfile,
+        ScanStatus, SearchInput,
     },
 };
+use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
 use tracing_subscriber::EnvFilter;
 
-pub(crate) const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
-
 #[derive(Clone)]
 struct AppState {
     store: Arc<Db>,
     scanner: Arc<Scanner>,
-    reader: Arc<ResumeReader>,
-}
-
-impl FromRef<AppState> for Arc<ResumeReader> {
-    fn from_ref(state: &AppState) -> Self {
-        state.reader.clone()
-    }
+    resume: UnboundedSender<ResumeMessage>,
+    parse: UnboundedSender<ParseMessage>,
+    ollama_url: String,
 }
 
 impl FromRef<AppState> for Arc<Db> {
@@ -79,7 +75,10 @@ async fn main() -> anyhow::Result<()> {
     let scanner = Arc::new(Scanner::new(store.clone(), LinkedInClient::new()?));
     tokio::spawn(scanner.clone().run_forever());
     let ollama_url = env::var("OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.into());
-    let reader = Arc::new(ResumeReader::new(store.clone(), ollama_url));
+    let (parse_tx, parse_rx) = tokio::sync::mpsc::unbounded_channel();
+    let parse_stage = ParseStage::new(store.clone(), ollama_url.clone(), parse_rx);
+    let (resume_tx, resume_rx) = tokio::sync::mpsc::unbounded_channel();
+    let resume_stage = ResumeStage::new(store.clone(), resume_rx, parse_tx.clone());
 
     let api = Router::new()
         .route("/health", get(health))
@@ -104,7 +103,9 @@ async fn main() -> anyhow::Result<()> {
         .with_state(AppState {
             store,
             scanner,
-            reader,
+            resume: resume_tx,
+            parse: parse_tx,
+            ollama_url,
         });
 
     let mut app = Router::new().nest("/api", api);
@@ -118,7 +119,44 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("listening on http://{addr}");
     axum::serve(listener, app).await?;
+    resume_stage.join().await;
+    parse_stage.join().await;
     Ok(())
+}
+
+async fn ask<M, T>(
+    sender: &UnboundedSender<M>,
+    make: impl FnOnce(oneshot::Sender<T>) -> M,
+) -> Result<T, AppError> {
+    let (tx, rx) = oneshot::channel();
+    sender
+        .send(make(tx))
+        .map_err(|_| AppError::internal("pipeline stopped"))?;
+    rx.await.map_err(|_| AppError::internal("pipeline stopped"))
+}
+
+fn map_resume_error(error: ResumeError) -> AppError {
+    match error {
+        ResumeError::TooLarge(_) => AppError::too_large(),
+        ResumeError::NoResume => AppError::not_found(),
+        ResumeError::Db(error) => error.into(),
+        other => AppError::bad_request(other.to_string()),
+    }
+}
+
+fn map_profile_error(error: ProfileError) -> AppError {
+    match error {
+        ProfileError::NoResume => AppError::not_found(),
+        ProfileError::NotRead => AppError::not_found_msg("Your resume hasn't been read yet."),
+        ProfileError::MissingName => AppError::bad_request(error.to_string()),
+        ProfileError::AlreadyReading | ProfileError::NotEditable | ProfileError::NotConfirmable => {
+            AppError {
+                status: StatusCode::CONFLICT,
+                message: error.to_string(),
+            }
+        }
+        ProfileError::Db(error) => error.into(),
+    }
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -133,54 +171,29 @@ async fn upload_resume(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<MasterResume>, AppError> {
-    let store = state.store.clone();
     while let Some(field) = multipart.next_field().await.map_err(AppError::multipart)? {
         if field.name() != Some("file") {
             continue;
         }
-        let file_name = sanitize_file_name(field.file_name().unwrap_or_default());
-        let bytes = field.bytes().await.map_err(AppError::multipart)?;
-        if bytes.is_empty() {
-            return Err(AppError::bad_request("That file is empty."));
-        }
-        if bytes.len() > MAX_UPLOAD_BYTES {
-            return Err(AppError::too_large());
-        }
-
-        let info = {
-            let bytes = bytes.clone();
-            tokio::task::spawn_blocking(move || pdf::inspect(&bytes))
-                .await
-                .map_err(AppError::internal)?
-        }
-        .map_err(|e| match e {
-            PdfError::NotPdf => AppError::bad_request("That file isn't a PDF."),
-            PdfError::Unreadable(detail) => {
-                tracing::warn!("unreadable PDF: {detail}");
-                AppError::bad_request(
-                    "Couldn't read that PDF. It may be corrupted or password-protected.",
-                )
-            }
-        })?;
-
-        let saved =
-            tokio::task::spawn_blocking(move || store.save_resume(&file_name, &bytes, &info))
-                .await
-                .map_err(AppError::internal)??;
-        if let Err(StartError::Store(e)) = state.reader.start() {
-            tracing::error!("couldn't start reading the resume: {e}");
-        }
-        return Ok(Json(saved));
+        let file_name = field.file_name().unwrap_or_default().to_string();
+        let bytes = field.bytes().await.map_err(AppError::multipart)?.to_vec();
+        let resume = ask(&state.resume, |reply| ResumeMessage::Upload {
+            file_name,
+            bytes,
+            reply,
+        })
+        .await?
+        .map_err(map_resume_error)?;
+        return Ok(Json(resume));
     }
     Err(AppError::bad_request("No file was uploaded."))
 }
 
-async fn delete_resume(State(store): State<Arc<Db>>) -> Result<StatusCode, AppError> {
-    if store.delete_resume()? {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(AppError::not_found())
-    }
+async fn delete_resume(State(state): State<AppState>) -> Result<StatusCode, AppError> {
+    ask(&state.resume, |reply| ResumeMessage::Remove { reply })
+        .await?
+        .map_err(map_resume_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn resume_file(State(store): State<Arc<Db>>) -> Result<Response, AppError> {
@@ -223,65 +236,50 @@ async fn get_profile(
     Ok(Json(store.latest_profile(&resume.uploaded_at)?))
 }
 
-async fn read_profile(State(reader): State<Arc<ResumeReader>>) -> Result<StatusCode, AppError> {
-    match reader.start() {
-        Ok(()) => Ok(StatusCode::ACCEPTED),
-        Err(StartError::NoResume) => Err(AppError::not_found()),
-        Err(StartError::AlreadyReading) => Err(AppError {
-            status: StatusCode::CONFLICT,
-            message: "Your resume is already being read.".into(),
-        }),
-        Err(StartError::Store(e)) => Err(e.into()),
-    }
-}
-
-fn current_profile(store: &Db) -> Result<(MasterResume, ProfileRecord), AppError> {
-    let resume = store.get_resume()?.ok_or_else(AppError::not_found)?;
-    let record = store
-        .latest_profile(&resume.uploaded_at)?
-        .ok_or_else(|| AppError::not_found_msg("Your resume hasn't been read yet."))?;
-    Ok((resume, record))
+async fn read_profile(State(state): State<AppState>) -> Result<StatusCode, AppError> {
+    ask(&state.parse, |reply| ParseMessage::ReadAgain { reply })
+        .await?
+        .map_err(map_profile_error)?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 async fn update_profile(
-    State(store): State<Arc<Db>>,
-    Json(mut profile): Json<ResumeProfile>,
+    State(state): State<AppState>,
+    Json(profile): Json<ResumeProfile>,
 ) -> Result<Json<ProfileRecord>, AppError> {
-    let (resume, record) = current_profile(&store)?;
-    profile.tidy();
-    profile.assign_ids();
-    if profile.contact.name.is_empty() {
-        return Err(AppError::bad_request("Add your name."));
-    }
-    let warnings = profile.check_against(&resume.extracted_text);
-    if !store.save_profile_edits(record.id, &profile, &warnings)? {
-        return Err(AppError {
-            status: StatusCode::CONFLICT,
-            message: "This reading can't be edited right now. Reload the page.".into(),
-        });
-    }
-    let saved = store
-        .get_profile(record.id)?
-        .ok_or_else(|| AppError::internal("profile vanished"))?;
+    let saved = ask(&state.parse, |reply| ParseMessage::SaveEdits {
+        profile,
+        reply,
+    })
+    .await?
+    .map_err(map_profile_error)?;
     Ok(Json(saved))
 }
 
-async fn confirm_profile(State(store): State<Arc<Db>>) -> Result<Json<ProfileRecord>, AppError> {
-    let (_, record) = current_profile(&store)?;
-    if !store.confirm_profile(record.id)? {
-        return Err(AppError {
-            status: StatusCode::CONFLICT,
-            message: "Only a finished reading can be confirmed. Reload the page.".into(),
-        });
-    }
-    let saved = store
-        .get_profile(record.id)?
-        .ok_or_else(|| AppError::internal("profile vanished"))?;
+async fn confirm_profile(State(state): State<AppState>) -> Result<Json<ProfileRecord>, AppError> {
+    let saved = ask(&state.parse, |reply| ParseMessage::Confirm { reply })
+        .await?
+        .map_err(map_profile_error)?;
     Ok(Json(saved))
 }
 
-async fn ai_status(State(reader): State<Arc<ResumeReader>>) -> Json<AiStatus> {
-    Json(reader.status().await)
+#[derive(Debug, Serialize)]
+struct AiStatus {
+    ollama: OllamaStatus,
+    resume_reader_model: String,
+}
+
+async fn ai_status(State(state): State<AppState>) -> Result<Json<AiStatus>, AppError> {
+    let model = state
+        .store
+        .get_setting(MODEL_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| DEFAULT_MODEL.into());
+    Ok(Json(AiStatus {
+        ollama: ollama_status(&state.ollama_url).await,
+        resume_reader_model: model,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -290,15 +288,15 @@ struct AiSettings {
 }
 
 async fn update_ai_settings(
-    State(reader): State<Arc<ResumeReader>>,
+    State(state): State<AppState>,
     Json(settings): Json<AiSettings>,
 ) -> Result<Json<AiStatus>, AppError> {
     let model = settings.resume_reader_model.trim();
     if model.is_empty() || model.len() > 200 {
         return Err(AppError::bad_request("Pick a model."));
     }
-    reader.set_model(model)?;
-    Ok(Json(reader.status().await))
+    state.store.set_setting(MODEL_KEY, model)?;
+    ai_status(State(state)).await
 }
 
 async fn list_searches(State(store): State<Arc<Db>>) -> Result<Json<Vec<JobSearch>>, AppError> {
@@ -427,29 +425,4 @@ async fn update_settings(
     }
     scanner.set_interval_minutes(minutes)?;
     Ok(Json(settings))
-}
-
-fn sanitize_file_name(raw: &str) -> String {
-    let base = raw.rsplit(['/', '\\']).next().unwrap_or_default().trim();
-    let name: String = base.chars().filter(|c| !c.is_control()).take(200).collect();
-    if name.is_empty() {
-        "resume.pdf".into()
-    } else {
-        name
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::sanitize_file_name;
-
-    #[test]
-    fn sanitizes_file_names() {
-        assert_eq!(
-            sanitize_file_name("../../etc/My Resume.pdf"),
-            "My Resume.pdf"
-        );
-        assert_eq!(sanitize_file_name("C:\\Users\\me\\cv.pdf"), "cv.pdf");
-        assert_eq!(sanitize_file_name("   "), "resume.pdf");
-    }
 }

@@ -43,6 +43,40 @@ pub enum DbError {
 }
 
 #[derive(Debug, Error)]
+pub enum ResumeError {
+    #[error("That file is empty.")]
+    Empty,
+    #[error("That file is too large. The limit is {0} MB.")]
+    TooLarge(usize),
+    #[error("That file isn't a PDF.")]
+    NotPdf,
+    #[error("Couldn't read that PDF. It may be corrupted or password-protected.")]
+    Unreadable,
+    #[error("No master resume has been uploaded.")]
+    NoResume,
+    #[error(transparent)]
+    Db(#[from] DbError),
+}
+
+#[derive(Debug, Error)]
+pub enum ProfileError {
+    #[error("No master resume has been uploaded.")]
+    NoResume,
+    #[error("Your resume hasn't been read yet.")]
+    NotRead,
+    #[error("Your resume is already being read.")]
+    AlreadyReading,
+    #[error("Add your name.")]
+    MissingName,
+    #[error("This reading can't be edited right now. Reload the page.")]
+    NotEditable,
+    #[error("Only a finished reading can be confirmed. Reload the page.")]
+    NotConfirmable,
+    #[error(transparent)]
+    Db(#[from] DbError),
+}
+
+#[derive(Debug, Error)]
 #[error("{0}")]
 pub struct InvalidSearch(pub String);
 
