@@ -1,0 +1,104 @@
+name: CI and deploy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci --prefix web
+
+      - name: Check frontend and build assets
+        run: npm run build --prefix web
+
+      - name: Test Rust workspace
+        run: cargo test --locked --workspace
+
+      - name: Build server
+        if: github.event_name == 'push'
+        run: cargo build --release --locked -p tailor-server
+
+      - name: Package release
+        if: github.event_name == 'push'
+        run: |
+          mkdir -p release/web
+          cp target/release/tailor-server release/
+          cp -R web/dist release/web/dist
+          tar -czf resume-tailor-release.tar.gz -C release .
+
+      - name: Upload release artifact
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: resume-tailor-release
+          path: resume-tailor-release.tar.gz
+          if-no-files-found: error
+          retention-days: 3
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: production
+    steps:
+      - name: Download release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: resume-tailor-release
+
+      - name: Configure IPv6 SSH access
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$VPS_HOST" || { echo "Missing VPS_HOST secret" >&2; exit 1; }
+          test -n "$VPS_USER" || { echo "Missing VPS_USER secret" >&2; exit 1; }
+          test -n "$VPS_SSH_PRIVATE_KEY" || { echo "Missing VPS_SSH_PRIVATE_KEY secret" >&2; exit 1; }
+          test -n "$VPS_KNOWN_HOSTS" || { echo "Missing VPS_KNOWN_HOSTS secret" >&2; exit 1; }
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$VPS_SSH_PRIVATE_KEY" > ~/.ssh/resume_tailor_deploy
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/resume_tailor_deploy ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host resume-tailor-vps
+            HostName $VPS_HOST
+            User $VPS_USER
+            AddressFamily inet6
+            IdentityFile ~/.ssh/resume_tailor_deploy
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Copy release to VPS
+        run: scp -6 resume-tailor-release.tar.gz resume-tailor-vps:/tmp/resume-tailor-${GITHUB_SHA}.tar.gz
+
+      - name: Activate release and verify health
+        run: ssh -6 resume-tailor-vps "/usr/local/sbin/resume-tailor-deploy ${GITHUB_SHA} /tmp/resume-tailor-${GITHUB_SHA}.tar.gz"
