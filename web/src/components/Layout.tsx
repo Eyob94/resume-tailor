@@ -21,10 +21,24 @@ function Brand() {
 }
 
 export function Layout() {
+  const [username, setUsername] = useState("");
+
+  useEffect(() => {
+    api.currentUser().then((user) => setUsername(user.username), () => setUsername(""));
+  }, []);
+
+  async function signOut() {
+    await api.logout().catch(() => undefined);
+    window.location.assign("/login");
+  }
+
   return (
     <div className="flex min-h-screen flex-col md:flex-row">
       <header className="sticky top-0 z-10 border-b border-zinc-200 bg-white/90 px-4 py-3 backdrop-blur md:hidden">
-        <Brand />
+        <div className="flex items-center justify-between">
+          <Brand />
+          <button onClick={signOut} className="text-xs text-zinc-500 hover:text-zinc-900">Sign out</button>
+        </div>
       </header>
       <nav className="fixed inset-x-0 bottom-0 z-10 grid grid-cols-5 border-t border-zinc-200 bg-white/95 pb-[env(safe-area-inset-bottom)] backdrop-blur md:hidden">
         {nav.map(({ to, shortLabel, icon: Icon, end }) => (
@@ -45,8 +59,11 @@ export function Layout() {
       </nav>
 
       <aside className="sticky top-0 hidden h-screen w-60 shrink-0 flex-col border-r border-zinc-200 bg-white md:flex">
-        <div className="px-5 py-5">
+        <div className="flex items-center justify-between px-5 py-5">
           <Brand />
+          <button onClick={signOut} title={username ? `Signed in as ${username}` : "Sign out"} className="text-xs text-zinc-500 hover:text-zinc-900">
+            {username || "Sign out"}
+          </button>
         </div>
         <nav className="flex flex-col gap-1 px-3">
           {nav.map(({ to, label, icon: Icon, end }) => (

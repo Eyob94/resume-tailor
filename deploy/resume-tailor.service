@@ -1,0 +1,23 @@
+[Unit]
+Description=Resume Tailor web application
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=resume-tailor
+Group=resume-tailor
+EnvironmentFile=/etc/resume-tailor.env
+WorkingDirectory=/opt/resume-tailor/current
+ExecStart=/opt/resume-tailor/current/tailor-server
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/resume-tailor
+
+[Install]
+WantedBy=multi-user.target

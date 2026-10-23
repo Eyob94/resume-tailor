@@ -1,10 +1,13 @@
 use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
 
+mod auth;
 mod errors;
+mod settings;
 
 use axum::{
-    extract::{DefaultBodyLimit, FromRef, Multipart, Path, Query, State},
+    extract::{DefaultBodyLimit, Extension, Multipart, Path, Query},
     http::{header, StatusCode},
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, patch, post, put},
     Json, Router,
@@ -12,25 +15,20 @@ use axum::{
 use errors::AppError;
 
 use serde::Deserialize;
-use serde::Serialize;
 use serde_json::json;
 use tailor_core::{
     db::Db,
     errors::{ProfileError, ResumeError},
-    parse_stage::{
-        ollama_status, ParseMessage, DEFAULT_MODEL, DEFAULT_OLLAMA_URL, MODEL_KEY, OLLAMA_URL_KEY,
-    },
+    parse_stage::{ParseMessage, DEFAULT_OLLAMA_URL},
     pipeline::{Pipeline, PipelineConfig, PipelineSenders},
     resume_stage::{ResumeMessage, MAX_UPLOAD_BYTES},
-    scrape_stage::{
-        interval_minutes, ScrapeMessage, DEFAULT_COOLDOWN_SECONDS, MAX_INTERVAL_MINUTES,
-        MIN_INTERVAL_MINUTES,
-    },
+    scrape_stage::{ScrapeMessage, DEFAULT_COOLDOWN_SECONDS},
     types::{
-        JobListing, JobSearch, JobStatus, MasterResume, OllamaStatus, ProfileRecord, ResumeProfile,
-        ScanStatus, SearchInput,
+        JobListing, JobSearch, JobStatus, MasterResume, ProfileRecord, ResumeProfile, ScanStatus,
+        SearchInput,
     },
 };
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tower_http::{
     services::{ServeDir, ServeFile},
@@ -40,14 +38,55 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Clone)]
 struct AppState {
-    store: Arc<Db>,
-    senders: PipelineSenders,
+    auth: auth::AuthStore,
+    data_dir: PathBuf,
     ollama_url: String,
+    cooldown_seconds: i64,
+    users: Arc<AsyncMutex<std::collections::HashMap<i64, Arc<UserServices>>>>,
 }
 
-impl FromRef<AppState> for Arc<Db> {
-    fn from_ref(state: &AppState) -> Self {
-        state.store.clone()
+struct UserServices {
+    store: Arc<Db>,
+    senders: PipelineSenders,
+    username: String,
+    ollama_url: String,
+    _pipeline: Pipeline,
+}
+
+impl AppState {
+    async fn user_services(&self, user_id: i64) -> Result<Arc<UserServices>, String> {
+        let mut users = self.users.lock().await;
+        if let Some(user) = users.get(&user_id) {
+            return Ok(user.clone());
+        }
+        let data_dir = if user_id == 1 {
+            self.data_dir.clone()
+        } else {
+            self.data_dir.join("users").join(user_id.to_string())
+        };
+        let store = Arc::new(Db::open(&data_dir).map_err(|error| error.to_string())?);
+        let (pipeline, senders) = Pipeline::new(
+            store.clone(),
+            PipelineConfig {
+                ollama_url: self.ollama_url.clone(),
+                scan_cooldown_seconds: self.cooldown_seconds,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let username = self
+            .auth
+            .username(user_id)
+            .map_err(|error| format!("couldn't load user: {error:?}"))?
+            .ok_or_else(|| "user not found".to_string())?;
+        let user = Arc::new(UserServices {
+            store,
+            senders,
+            username,
+            ollama_url: self.ollama_url.clone(),
+            _pipeline: pipeline,
+        });
+        users.insert(user_id, user.clone());
+        Ok(user)
     }
 }
 
@@ -66,7 +105,6 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8787);
 
-    let store = Arc::new(Db::open(&data_dir)?);
     let ollama_url = env::var("OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.into());
     let cooldown_seconds = env::var("SCAN_COOLDOWN_SECONDS")
         .ok()
@@ -75,16 +113,16 @@ async fn main() -> anyhow::Result<()> {
     if cooldown_seconds != DEFAULT_COOLDOWN_SECONDS {
         tracing::warn!(cooldown_seconds, "manual scan cooldown overridden");
     }
-    let (pipeline, senders) = Pipeline::new(
-        store.clone(),
-        PipelineConfig {
-            ollama_url: ollama_url.clone(),
-            scan_cooldown_seconds: cooldown_seconds,
-        },
-    )?;
-
-    let api = Router::new()
-        .route("/health", get(health))
+    let data_dir = PathBuf::from(data_dir);
+    let state = AppState {
+        auth: auth::AuthStore::open(&data_dir)?,
+        data_dir,
+        ollama_url,
+        cooldown_seconds,
+        users: Arc::new(AsyncMutex::new(std::collections::HashMap::new())),
+    };
+    let protected = Router::new()
+        .merge(auth::protected_routes())
         .route(
             "/resume",
             get(get_resume).post(upload_resume).delete(delete_resume),
@@ -93,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/resume/profile", get(get_profile).put(update_profile))
         .route("/resume/profile/read", post(read_profile))
         .route("/resume/profile/confirm", post(confirm_profile))
-        .route("/ai", get(ai_status).put(update_ai_settings))
+        .merge(settings::routes())
         .route("/searches", get(list_searches).post(create_search))
         .route("/searches/{id}", put(update_search).delete(delete_search))
         .route("/jobs", get(list_jobs))
@@ -101,13 +139,16 @@ async fn main() -> anyhow::Result<()> {
         .route("/jobs/status", post(update_jobs_status))
         .route("/scan", get(scan_status))
         .route("/scan/run", post(run_scan_now))
-        .route("/settings", get(get_settings).put(update_settings))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES + 64 * 1024))
-        .with_state(AppState {
-            store,
-            senders: senders.clone(),
-            ollama_url,
-        });
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
+    let api = Router::new()
+        .route("/health", get(health))
+        .merge(auth::public_routes())
+        .merge(protected)
+        .with_state(state);
 
     let mut app = Router::new().nest("/api", api);
     if web_dist.join("index.html").exists() {
@@ -120,8 +161,6 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("listening on http://{addr}");
     axum::serve(listener, app).await?;
-    drop(senders);
-    pipeline.join().await;
     Ok(())
 }
 
@@ -164,12 +203,14 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({ "ok": true }))
 }
 
-async fn get_resume(State(store): State<Arc<Db>>) -> Result<Json<Option<MasterResume>>, AppError> {
-    Ok(Json(store.get_resume()?))
+async fn get_resume(
+    Extension(user): Extension<Arc<UserServices>>,
+) -> Result<Json<Option<MasterResume>>, AppError> {
+    Ok(Json(user.store.get_resume()?))
 }
 
 async fn upload_resume(
-    State(state): State<AppState>,
+    Extension(state): Extension<Arc<UserServices>>,
     mut multipart: Multipart,
 ) -> Result<Json<MasterResume>, AppError> {
     while let Some(field) = multipart.next_field().await.map_err(AppError::multipart)? {
@@ -190,7 +231,9 @@ async fn upload_resume(
     Err(AppError::bad_request("No file was uploaded."))
 }
 
-async fn delete_resume(State(state): State<AppState>) -> Result<StatusCode, AppError> {
+async fn delete_resume(
+    Extension(state): Extension<Arc<UserServices>>,
+) -> Result<StatusCode, AppError> {
     ask(&state.senders.resume, |reply| ResumeMessage::Remove {
         reply,
     })
@@ -199,11 +242,11 @@ async fn delete_resume(State(state): State<AppState>) -> Result<StatusCode, AppE
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn resume_file(State(store): State<Arc<Db>>) -> Result<Response, AppError> {
-    let Some(resume) = store.get_resume()? else {
+async fn resume_file(Extension(user): Extension<Arc<UserServices>>) -> Result<Response, AppError> {
+    let Some(resume) = user.store.get_resume()? else {
         return Err(AppError::not_found());
     };
-    let bytes = match tokio::fs::read(store.resume_pdf_path()).await {
+    let bytes = match tokio::fs::read(user.store.resume_pdf_path()).await {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(AppError::not_found()),
         Err(e) => return Err(AppError::internal(e)),
@@ -231,15 +274,17 @@ async fn resume_file(State(store): State<Arc<Db>>) -> Result<Response, AppError>
 }
 
 async fn get_profile(
-    State(store): State<Arc<Db>>,
+    Extension(user): Extension<Arc<UserServices>>,
 ) -> Result<Json<Option<ProfileRecord>>, AppError> {
-    let Some(resume) = store.get_resume()? else {
+    let Some(resume) = user.store.get_resume()? else {
         return Ok(Json(None));
     };
-    Ok(Json(store.latest_profile(&resume.uploaded_at)?))
+    Ok(Json(user.store.latest_profile(&resume.uploaded_at)?))
 }
 
-async fn read_profile(State(state): State<AppState>) -> Result<StatusCode, AppError> {
+async fn read_profile(
+    Extension(state): Extension<Arc<UserServices>>,
+) -> Result<StatusCode, AppError> {
     ask(&state.senders.parse, |reply| ParseMessage::ReadAgain {
         reply,
     })
@@ -249,7 +294,7 @@ async fn read_profile(State(state): State<AppState>) -> Result<StatusCode, AppEr
 }
 
 async fn update_profile(
-    State(state): State<AppState>,
+    Extension(state): Extension<Arc<UserServices>>,
     Json(profile): Json<ResumeProfile>,
 ) -> Result<Json<ProfileRecord>, AppError> {
     let saved = ask(&state.senders.parse, |reply| ParseMessage::SaveEdits {
@@ -261,7 +306,9 @@ async fn update_profile(
     Ok(Json(saved))
 }
 
-async fn confirm_profile(State(state): State<AppState>) -> Result<Json<ProfileRecord>, AppError> {
+async fn confirm_profile(
+    Extension(state): Extension<Arc<UserServices>>,
+) -> Result<Json<ProfileRecord>, AppError> {
     let saved = ask(&state.senders.parse, |reply| ParseMessage::Confirm {
         reply,
     })
@@ -270,70 +317,14 @@ async fn confirm_profile(State(state): State<AppState>) -> Result<Json<ProfileRe
     Ok(Json(saved))
 }
 
-#[derive(Debug, Serialize)]
-struct AiStatus {
-    ollama: OllamaStatus,
-    resume_reader_model: String,
-    ollama_url: String,
-}
-
-async fn ai_status(State(state): State<AppState>) -> Result<Json<AiStatus>, AppError> {
-    let model = state
-        .store
-        .get_setting(MODEL_KEY)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| DEFAULT_MODEL.into());
-    let ollama_url = state
-        .store
-        .get_setting(OLLAMA_URL_KEY)?
-        .unwrap_or_else(|| state.ollama_url.clone());
-    Ok(Json(AiStatus {
-        ollama: ollama_status(&ollama_url).await,
-        resume_reader_model: model,
-        ollama_url,
-    }))
-}
-
-#[derive(Deserialize)]
-struct AiSettings {
-    resume_reader_model: Option<String>,
-    ollama_url: Option<String>,
-}
-
-async fn update_ai_settings(
-    State(state): State<AppState>,
-    Json(settings): Json<AiSettings>,
-) -> Result<Json<AiStatus>, AppError> {
-    let url = settings.ollama_url.as_deref().map(|url| url.trim().trim_end_matches('/'));
-    if let Some(url) = url {
-        if url.len() > 2048 || !(url.starts_with("http://") || url.starts_with("https://")) {
-            return Err(AppError::bad_request(
-                "Enter a valid Ollama URL beginning with http:// or https://.",
-            ));
-        }
-    }
-    let model = settings.resume_reader_model.as_deref().map(str::trim);
-    if let Some(model) = model {
-        if model.is_empty() || model.len() > 200 {
-            return Err(AppError::bad_request("Pick a model."));
-        }
-    }
-    if let Some(url) = url {
-        state.store.set_setting(OLLAMA_URL_KEY, url)?;
-    }
-    if let Some(model) = model {
-        state.store.set_setting(MODEL_KEY, model)?;
-    }
-    ai_status(State(state)).await
-}
-
-async fn list_searches(State(store): State<Arc<Db>>) -> Result<Json<Vec<JobSearch>>, AppError> {
-    Ok(Json(store.list_searches()?))
+async fn list_searches(
+    Extension(user): Extension<Arc<UserServices>>,
+) -> Result<Json<Vec<JobSearch>>, AppError> {
+    Ok(Json(user.store.list_searches()?))
 }
 
 async fn create_search(
-    State(state): State<AppState>,
+    Extension(state): Extension<Arc<UserServices>>,
     Json(input): Json<SearchInput>,
 ) -> Result<(StatusCode, Json<JobSearch>), AppError> {
     let criteria = input.validate().map_err(|e| AppError::bad_request(e.0))?;
@@ -343,7 +334,7 @@ async fn create_search(
 }
 
 async fn update_search(
-    State(state): State<AppState>,
+    Extension(state): Extension<Arc<UserServices>>,
     Path(id): Path<i64>,
     Json(input): Json<SearchInput>,
 ) -> Result<Json<JobSearch>, AppError> {
@@ -357,7 +348,7 @@ async fn update_search(
 }
 
 async fn delete_search(
-    State(state): State<AppState>,
+    Extension(state): Extension<Arc<UserServices>>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, AppError> {
     if !state.store.delete_search(id)? {
@@ -373,10 +364,10 @@ struct JobsQuery {
 }
 
 async fn list_jobs(
-    State(store): State<Arc<Db>>,
+    Extension(user): Extension<Arc<UserServices>>,
     Query(query): Query<JobsQuery>,
 ) -> Result<Json<Vec<JobListing>>, AppError> {
-    Ok(Json(store.list_jobs(query.status)?))
+    Ok(Json(user.store.list_jobs(query.status)?))
 }
 
 #[derive(Deserialize)]
@@ -385,11 +376,11 @@ struct JobPatch {
 }
 
 async fn update_job(
-    State(store): State<Arc<Db>>,
+    Extension(user): Extension<Arc<UserServices>>,
     Path(id): Path<i64>,
     Json(patch): Json<JobPatch>,
 ) -> Result<StatusCode, AppError> {
-    if store.set_job_status(id, patch.status)? {
+    if user.store.set_job_status(id, patch.status)? {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::not_found_msg("Job not found."))
@@ -405,7 +396,7 @@ struct BulkJobStatus {
 const MAX_BULK_IDS: usize = 2000;
 
 async fn update_jobs_status(
-    State(store): State<Arc<Db>>,
+    Extension(user): Extension<Arc<UserServices>>,
     Json(body): Json<BulkJobStatus>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     if body.ids.len() > MAX_BULK_IDS {
@@ -413,11 +404,13 @@ async fn update_jobs_status(
             "Update at most {MAX_BULK_IDS} jobs at once."
         )));
     }
-    let updated = store.set_jobs_status(&body.ids, body.status)?;
+    let updated = user.store.set_jobs_status(&body.ids, body.status)?;
     Ok(Json(json!({ "updated": updated })))
 }
 
-async fn scan_status(State(state): State<AppState>) -> Result<Json<ScanStatus>, AppError> {
+async fn scan_status(
+    Extension(state): Extension<Arc<UserServices>>,
+) -> Result<Json<ScanStatus>, AppError> {
     let status = ask(&state.senders.scrape, |reply| ScrapeMessage::Status {
         reply,
     })
@@ -425,7 +418,9 @@ async fn scan_status(State(state): State<AppState>) -> Result<Json<ScanStatus>, 
     Ok(Json(status))
 }
 
-async fn run_scan_now(State(state): State<AppState>) -> Result<StatusCode, AppError> {
+async fn run_scan_now(
+    Extension(state): Extension<Arc<UserServices>>,
+) -> Result<StatusCode, AppError> {
     ask(&state.senders.scrape, |reply| ScrapeMessage::RunNow {
         reply,
     })
@@ -435,32 +430,4 @@ async fn run_scan_now(State(state): State<AppState>) -> Result<StatusCode, AppEr
         status: StatusCode::TOO_MANY_REQUESTS,
         message,
     })
-}
-
-#[derive(serde::Serialize, Deserialize)]
-struct Settings {
-    scan_interval_minutes: u32,
-}
-
-async fn get_settings(State(store): State<Arc<Db>>) -> Json<Settings> {
-    Json(Settings {
-        scan_interval_minutes: interval_minutes(&store),
-    })
-}
-
-async fn update_settings(
-    State(state): State<AppState>,
-    Json(settings): Json<Settings>,
-) -> Result<Json<Settings>, AppError> {
-    let minutes = settings.scan_interval_minutes;
-    if !(MIN_INTERVAL_MINUTES..=MAX_INTERVAL_MINUTES).contains(&minutes) {
-        return Err(AppError::bad_request(format!(
-            "Scan interval must be between {MIN_INTERVAL_MINUTES} and {MAX_INTERVAL_MINUTES} minutes."
-        )));
-    }
-    state
-        .store
-        .set_setting("scan_interval_minutes", &minutes.to_string())?;
-    let _ = state.senders.scrape.send(ScrapeMessage::Reschedule);
-    Ok(Json(settings))
 }
