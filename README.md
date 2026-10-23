@@ -47,7 +47,8 @@ One-time VPS setup:
    - `VPS_HOST`: the VPS IPv6 address (without brackets), or a hostname that resolves to it.
    - `VPS_USER`: the non-root deployment username.
    - `VPS_SSH_PRIVATE_KEY`: the matching private key.
-   - `VPS_KNOWN_HOSTS`: the VPS SSH host key line, gathered with `ssh-keyscan -6 <vps-ipv6>` and verified against the VPS.
+
+   The deployment SSH client skips host-key verification. This avoids needing a `VPS_KNOWN_HOSTS` secret, but does not verify the server's identity.
 
 After setup, pushes to `main` deploy automatically. Pull requests run checks without deployment. Each release is health-checked; a failed restart or check restores the previous release. User databases and uploaded resumes remain outside release directories. The VPS must be reachable by the GitHub-hosted runner over IPv6 SSH.
 
