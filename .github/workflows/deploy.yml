@@ -70,7 +70,7 @@ jobs:
         with:
           name: resume-tailor-release
 
-      - name: Configure IPv6 SSH access
+      - name: Configure IPv4 SSH access
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
@@ -87,7 +87,7 @@ jobs:
           Host resume-tailor-vps
             HostName $VPS_HOST
             User $VPS_USER
-            AddressFamily inet6
+            AddressFamily inet
             IdentityFile ~/.ssh/resume_tailor_deploy
             IdentitiesOnly yes
             StrictHostKeyChecking no
@@ -96,7 +96,7 @@ jobs:
           chmod 600 ~/.ssh/config
 
       - name: Copy release to VPS
-        run: scp -6 resume-tailor-release.tar.gz resume-tailor-vps:/tmp/resume-tailor-${GITHUB_SHA}.tar.gz
+        run: scp -4 resume-tailor-release.tar.gz resume-tailor-vps:/tmp/resume-tailor-${GITHUB_SHA}.tar.gz
 
       - name: Activate release and verify health
-        run: ssh -6 resume-tailor-vps "/usr/local/sbin/resume-tailor-deploy ${GITHUB_SHA} /tmp/resume-tailor-${GITHUB_SHA}.tar.gz"
+        run: ssh -4 resume-tailor-vps "/usr/local/sbin/resume-tailor-deploy ${GITHUB_SHA} /tmp/resume-tailor-${GITHUB_SHA}.tar.gz"
