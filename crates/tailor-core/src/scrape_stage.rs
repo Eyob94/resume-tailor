@@ -188,7 +188,7 @@ async fn run(
     }
 }
 
-pub const MIN_INTERVAL_MINUTES: u32 = 10;
+pub const MIN_INTERVAL_MINUTES: u32 = 1;
 pub const MAX_INTERVAL_MINUTES: u32 = 60;
 pub const DEFAULT_INTERVAL_MINUTES: u32 = 60;
 pub const INTERVAL_KEY: &str = "scan_interval_minutes";
@@ -205,7 +205,7 @@ pub fn interval_minutes(db: &Db) -> u32 {
 
 fn has_searches(db: &Db) -> bool {
     db.list_searches()
-        .map(|searches| !searches.is_empty())
+        .map(|searches| searches.iter().any(|search| search.enabled))
         .unwrap_or(false)
 }
 
@@ -328,7 +328,7 @@ async fn scrape_searches<S: JobSource>(
         details: limits.max_details_per_run,
     };
     let mut fetched_descriptions = HashMap::new();
-    for search in &searches {
+    for search in searches.iter().filter(|search| search.enabled) {
         let (jobs, result) = scrape_search(
             db,
             source,

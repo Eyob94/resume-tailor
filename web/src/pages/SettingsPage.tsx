@@ -98,7 +98,7 @@ export function SettingsPage() {
         <Row label="Server">
           <ServerStatus />
         </Row>
-        <Row label="Job scan interval" hint="How often saved searches are checked on LinkedIn.">
+        <Row label="Job scan interval" hint="How often enabled preferences are checked on LinkedIn.">
           <select
             aria-label="Job scan interval"
             value={scanInterval ?? ""}
@@ -106,7 +106,7 @@ export function SettingsPage() {
             onChange={(e) => changeInterval(Number(e.target.value))}
             className="rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-sm text-zinc-900 shadow-sm"
           >
-            {[10, 15, 20, 30, 45, 60].map((m) => (
+            {[1, 5, 10, 15, 20, 30, 45, 60].map((m) => (
               <option key={m} value={m}>
                 Every {m === 60 ? "hour" : `${m} min`}
               </option>

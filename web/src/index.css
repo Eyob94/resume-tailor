@@ -7,3 +7,12 @@
 body {
   @apply bg-zinc-50 text-zinc-900 antialiased;
 }
+
+.hide-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}

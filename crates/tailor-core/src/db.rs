@@ -96,6 +96,7 @@ const MIGRATIONS: &[&str] = &[
         updated_at         TEXT NOT NULL,
         confirmed_at       TEXT
     );",
+    "ALTER TABLE job_searches ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;",
 ];
 
 #[cfg(test)]
@@ -240,7 +241,7 @@ impl Db {
     pub fn list_searches(&self) -> Result<Vec<JobSearch>, DbError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-        "SELECT id, name, titles, keywords, location, work_modes, posted_within, created_at, updated_at
+        "SELECT id, name, titles, keywords, location, work_modes, posted_within, created_at, updated_at, enabled
          FROM job_searches ORDER BY id",
     )?;
         let rows = stmt.query_map([], |row| {
@@ -254,6 +255,7 @@ impl Db {
                 row.get::<_, String>(6)?,
                 row.get::<_, String>(7)?,
                 row.get::<_, String>(8)?,
+                row.get::<_, bool>(9)?,
             ))
         })?;
         rows.map(|row| {
@@ -267,9 +269,11 @@ impl Db {
                 posted_within,
                 created_at,
                 updated_at,
+                enabled,
             ) = row?;
             Ok(JobSearch {
                 id,
+                enabled,
                 criteria: SearchCriteria {
                     name,
                     titles: serde_json::from_str(&titles)?,
@@ -348,6 +352,20 @@ impl Db {
     pub fn delete_search(&self, id: i64) -> Result<bool, DbError> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.execute("DELETE FROM job_searches WHERE id = ?1", params![id])? > 0)
+    }
+
+    pub fn set_search_enabled(&self, id: i64, enabled: bool) -> Result<Option<JobSearch>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE job_searches SET enabled = ?2 WHERE id = ?1",
+            params![id, enabled],
+        )?;
+        drop(conn);
+        if changed == 0 {
+            Ok(None)
+        } else {
+            self.get_search(id)
+        }
     }
 
     pub(crate) fn known_job(&self, linkedin_id: &str) -> Result<Option<KnownJob>, DbError> {

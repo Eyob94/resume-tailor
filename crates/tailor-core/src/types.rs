@@ -187,6 +187,7 @@ pub struct SearchCriteria {
 #[derive(Debug, Clone, Serialize)]
 pub struct JobSearch {
     pub id: i64,
+    pub enabled: bool,
     #[serde(flatten)]
     pub criteria: SearchCriteria,
     pub created_at: String,
