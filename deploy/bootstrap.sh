@@ -7,14 +7,18 @@ if [[ "$EUID" -ne 0 ]]; then
 fi
 
 deploy_user="${1:?Usage: sudo ./deploy/bootstrap.sh DEPLOY_USER}"
-if [[ "$deploy_user" == root ]]; then
-  echo "Choose a non-root deployment user" >&2
-  exit 1
-fi
 id "$deploy_user" >/dev/null
-command -v caddy >/dev/null || { echo "Install Caddy before running bootstrap" >&2; exit 1; }
 command -v systemctl >/dev/null || { echo "systemd is required" >&2; exit 1; }
-command -v curl >/dev/null || { echo "Install curl before running bootstrap" >&2; exit 1; }
+
+missing_packages=()
+command -v caddy >/dev/null || missing_packages+=(caddy)
+command -v curl >/dev/null || missing_packages+=(curl)
+if (( ${#missing_packages[@]} > 0 )); then
+  command -v apt-get >/dev/null || { echo "Install ${missing_packages[*]} first; apt-get is not available" >&2; exit 1; }
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -q
+  apt-get install -y -q "${missing_packages[@]}"
+fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 deploy_group="$(id -gn "$deploy_user")"
@@ -45,10 +49,12 @@ systemctl enable resume-tailor.service
 systemctl enable --now caddy
 systemctl reload caddy
 
-systemctl_path="$(command -v systemctl)"
-printf '%s ALL=(root) NOPASSWD: %s restart resume-tailor.service\n' \
-  "$deploy_user" "$systemctl_path" > /etc/sudoers.d/resume-tailor-deploy
-chmod 440 /etc/sudoers.d/resume-tailor-deploy
-visudo -cf /etc/sudoers.d/resume-tailor-deploy
+if [[ "$deploy_user" != root ]]; then
+  systemctl_path="$(command -v systemctl)"
+  printf '%s ALL=(root) NOPASSWD: %s restart resume-tailor.service\n' \
+    "$deploy_user" "$systemctl_path" > /etc/sudoers.d/resume-tailor-deploy
+  chmod 440 /etc/sudoers.d/resume-tailor-deploy
+  visudo -cf /etc/sudoers.d/resume-tailor-deploy
+fi
 
-echo "Bootstrap complete. Edit /etc/resume-tailor.env and add GitHub Actions secrets before deploying."
+echo "Server setup complete."

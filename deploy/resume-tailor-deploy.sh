@@ -13,6 +13,14 @@ if [[ ! -f "$archive" ]]; then
   exit 2
 fi
 
+restart_service() {
+  if [[ "$EUID" -eq 0 ]]; then
+    systemctl restart resume-tailor.service
+  else
+    sudo -n systemctl restart resume-tailor.service
+  fi
+}
+
 base=/opt/resume-tailor
 releases="$base/releases"
 release="$releases/$release_id"
@@ -42,10 +50,10 @@ rollback() {
   else
     rm -f "$current"
   fi
-  sudo -n systemctl restart resume-tailor.service || true
+  restart_service || true
 }
 
-if ! sudo -n systemctl restart resume-tailor.service; then
+if ! restart_service; then
   rollback
   exit 1
 fi
