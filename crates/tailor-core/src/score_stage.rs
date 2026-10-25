@@ -23,6 +23,10 @@ pub enum ScoreMessage {
         job_id: i64,
         reply: oneshot::Sender<Result<(), ScoreError>>,
     },
+    Skip {
+        job_id: i64,
+        reply: oneshot::Sender<Result<(), ScoreError>>,
+    },
 }
 
 pub struct ScoreStage {
@@ -71,6 +75,9 @@ async fn run(db: Arc<Db>, default_ollama_url: String, mut rx: UnboundedReceiver<
                     }
                     let _ = reply.send(result);
                 }
+                Some(ScoreMessage::Skip { job_id, reply }) => {
+                    let _ = reply.send(skip(&db, job_id));
+                }
             },
             _ = done_rx.recv(), if running => {
                 running = false;
@@ -100,6 +107,17 @@ fn rescore(db: &Db, job_id: i64) -> Result<(), ScoreError> {
         return Err(ScoreError::AlreadyScoring);
     }
     db.clear_score(job_id)?;
+    Ok(())
+}
+
+fn skip(db: &Db, job_id: i64) -> Result<(), ScoreError> {
+    match db.job_status(job_id)? {
+        None => return Err(ScoreError::NotFound),
+        Some(JobStatus::Saved) => {}
+        Some(_) => return Err(ScoreError::NotSaved),
+    }
+    let profile_id = db.current_confirmed_profile()?.map(|p| p.id).unwrap_or(0);
+    db.skip_score(job_id, profile_id)?;
     Ok(())
 }
 

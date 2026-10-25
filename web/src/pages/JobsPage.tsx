@@ -8,6 +8,7 @@ import {
   CheckCircle2,
   ChevronDown,
   CircleDot,
+  CircleSlash,
   Check,
   Copy,
   Clock,
@@ -106,6 +107,15 @@ export function JobsPage() {
     const id = setInterval(() => void loadJobs().catch(() => undefined), 5_000);
     return () => clearInterval(id);
   }, [scoringPending, loadJobs]);
+
+  async function skipScore(job: JobListing) {
+    try {
+      await jobsApi.skipScore(job.id);
+      await loadJobs();
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  }
 
   async function rescore(job: JobListing) {
     try {
@@ -308,7 +318,7 @@ export function JobsPage() {
           ) : (
             <div className="space-y-3">
               {visible.map((job) => (
-                <JobRow key={job.id} job={job} resumeConfirmed={resumeConfirmed} onStatus={(s) => setStatus(job, s)} onRescore={() => rescore(job)} />
+                <JobRow key={job.id} job={job} resumeConfirmed={resumeConfirmed} onStatus={(s) => setStatus(job, s)} onRescore={() => rescore(job)} onSkip={() => skipScore(job)} />
               ))}
             </div>
           )}
@@ -506,6 +516,7 @@ function ScoreBadge({ job, resumeConfirmed }: { job: JobListing; resumeConfirmed
     );
   }
   if (score?.status === "failed") return <span className={`${base} bg-red-50 text-red-700`}>Score failed</span>;
+  if (score?.status === "skipped") return <span className={`${base} bg-zinc-100 text-zinc-500`}>Not scoring</span>;
   if (job.status !== "saved") return null;
   const hint = !resumeConfirmed ? "Confirm your resume to score" : !job.description ? "Waiting for description" : "Queued for scoring";
   return <span className={`${base} bg-zinc-100 text-zinc-500`}>{hint}</span>;
@@ -544,11 +555,13 @@ function JobRow({
   resumeConfirmed,
   onStatus,
   onRescore,
+  onSkip,
 }: {
   job: JobListing;
   resumeConfirmed: boolean;
   onStatus: (s: JobStatus) => void;
   onRescore: () => void;
+  onSkip: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [showJson, setShowJson] = useState(false);
@@ -666,10 +679,24 @@ function JobRow({
         <div className="border-t border-zinc-100 px-4 py-4">
           {job.score?.status === "ready" && <MatchDetails score={job.score} />}
           {job.score?.status === "failed" && job.score.error && <p className="mb-3 text-sm text-red-700">Scoring failed: {job.score.error}</p>}
-          {job.status === "saved" && resumeConfirmed && job.description && job.score?.status !== "scoring" && (
-            <Button icon={RotateCw} onClick={onRescore} className="mb-4">
-              Score again
-            </Button>
+          {job.status === "saved" && resumeConfirmed && job.description && (
+            <div className="mb-4 flex flex-wrap gap-2">
+              {(job.score?.status === "ready" || job.score?.status === "failed") && (
+                <Button icon={RotateCw} onClick={onRescore}>
+                  Score again
+                </Button>
+              )}
+              {job.score?.status === "skipped" && (
+                <Button icon={RotateCw} onClick={onRescore}>
+                  Score this job
+                </Button>
+              )}
+              {(!job.score || job.score.status === "scoring") && (
+                <Button icon={CircleSlash} onClick={onSkip}>
+                  {job.score?.status === "scoring" ? "Stop scoring" : "Don't score"}
+                </Button>
+              )}
+            </div>
           )}
           {(job.seniority || job.employment_type || job.industries) && (
             <p className="mb-3 text-xs text-zinc-500">{[job.seniority, job.employment_type, job.industries].filter(Boolean).join(" · ")}</p>

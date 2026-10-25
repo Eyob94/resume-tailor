@@ -490,7 +490,7 @@ impl Db {
                 "SELECT j.id, j.title, j.company, j.description
                  FROM jobs j LEFT JOIN job_scores s ON s.job_id = j.id
                  WHERE j.status = 'saved' AND j.description IS NOT NULL
-                   AND (s.job_id IS NULL OR (s.profile_id != ?1 AND s.status != 'scoring'))
+                   AND (s.job_id IS NULL OR (s.profile_id != ?1 AND s.status NOT IN ('scoring', 'skipped')))
                  ORDER BY EXISTS (
                      SELECT 1 FROM search_matches m JOIN job_searches q ON q.id = m.search_id
                      WHERE m.job_id = j.id AND q.enabled = 1
@@ -540,7 +540,7 @@ impl Db {
         conn.execute(
             "UPDATE job_scores SET status = 'ready', score = ?2, summary = ?3, requirements = ?4,
                 error = NULL, updated_at = ?5
-             WHERE job_id = ?1",
+             WHERE job_id = ?1 AND status = 'scoring'",
             params![job_id, score, summary, serde_json::to_string(requirements)?, now()],
         )?;
         Ok(())
@@ -549,8 +549,26 @@ impl Db {
     pub fn fail_score(&self, job_id: i64, error: &str) -> Result<(), DbError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE job_scores SET status = 'failed', error = ?2, updated_at = ?3 WHERE job_id = ?1",
+            "UPDATE job_scores SET status = 'failed', error = ?2, updated_at = ?3
+             WHERE job_id = ?1 AND status = 'scoring'",
             params![job_id, error, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn skip_score(&self, job_id: i64, profile_id: i64) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO job_scores (job_id, profile_id, status, model, updated_at)
+             VALUES (?1, ?2, 'skipped', '', ?3)
+             ON CONFLICT(job_id) DO UPDATE SET
+                status = 'skipped',
+                score = NULL,
+                summary = NULL,
+                requirements = '[]',
+                error = NULL,
+                updated_at = excluded.updated_at",
+            params![job_id, profile_id, now()],
         )?;
         Ok(())
     }
@@ -1036,6 +1054,13 @@ mod tests {
         store.set_job_status(job, JobStatus::Saved).unwrap();
         store.start_score(job, profile_id, "fake").unwrap();
         assert!(store.next_job_to_score(profile_id).unwrap().is_none());
+        store.skip_score(job, profile_id).unwrap();
+        store.finish_score(job, 90, "late result", &[]).unwrap();
+        assert_eq!(store.score_status(job).unwrap().as_deref(), Some("skipped"));
+        assert!(store.next_job_to_score(profile_id).unwrap().is_none());
+        assert!(store.next_job_to_score(profile_id + 1).unwrap().is_none());
+        store.clear_score(job).unwrap();
+        store.start_score(job, profile_id, "fake").unwrap();
         store.requeue_interrupted_scores().unwrap();
         assert_eq!(store.score_status(job).unwrap(), None);
         assert_eq!(store.next_job_to_score(profile_id).unwrap().unwrap().job_id, job);

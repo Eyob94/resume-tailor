@@ -143,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/jobs", get(list_jobs))
         .route("/jobs/{id}", patch(update_job))
         .route("/jobs/status", post(update_jobs_status))
-        .route("/jobs/{id}/score", post(rescore_job))
+        .route("/jobs/{id}/score", post(rescore_job).delete(skip_job_score))
         .route("/scan", get(scan_status))
         .route("/scan/run", post(run_scan_now))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES + 64 * 1024))
@@ -447,15 +447,29 @@ async fn rescore_job(
     ask(&user.senders.score, |reply| ScoreMessage::Rescore { job_id: id, reply })
         .await?
         .map(|()| StatusCode::ACCEPTED)
-        .map_err(|error| match error {
-            ScoreError::NotFound => AppError::not_found_msg("Job not found."),
-            ScoreError::NotSaved | ScoreError::NoProfile => AppError::bad_request(error.to_string()),
-            ScoreError::AlreadyScoring => AppError {
-                status: StatusCode::CONFLICT,
-                message: error.to_string(),
-            },
-            ScoreError::Db(error) => error.into(),
-        })
+        .map_err(map_score_error)
+}
+
+async fn skip_job_score(
+    Extension(user): Extension<Arc<UserServices>>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, AppError> {
+    ask(&user.senders.score, |reply| ScoreMessage::Skip { job_id: id, reply })
+        .await?
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(map_score_error)
+}
+
+fn map_score_error(error: ScoreError) -> AppError {
+    match error {
+        ScoreError::NotFound => AppError::not_found_msg("Job not found."),
+        ScoreError::NotSaved | ScoreError::NoProfile => AppError::bad_request(error.to_string()),
+        ScoreError::AlreadyScoring => AppError {
+            status: StatusCode::CONFLICT,
+            message: error.to_string(),
+        },
+        ScoreError::Db(error) => error.into(),
+    }
 }
 
 async fn scan_status(

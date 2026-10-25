@@ -111,7 +111,7 @@ export interface Requirement {
 }
 
 export interface JobScore {
-  status: "scoring" | "ready" | "failed";
+  status: "scoring" | "ready" | "failed" | "skipped";
   score: number | null;
   summary: string | null;
   requirements: Requirement[];
@@ -157,6 +157,7 @@ export const jobsApi = {
   setJobsStatus: (ids: number[], status: JobStatus) =>
     request<{ updated: number }>("/jobs/status", { method: "POST", ...json({ ids, status }) }),
   rescore: (id: number) => request<void>(`/jobs/${id}/score`, { method: "POST" }),
+  skipScore: (id: number) => request<void>(`/jobs/${id}/score`, { method: "DELETE" }),
   scanStatus: () => request<ScanStatus>("/scan"),
   runScan: () => request<void>("/scan/run", { method: "POST" }),
   getSettings: () => request<Settings>("/settings"),
