@@ -491,7 +491,10 @@ impl Db {
                  FROM jobs j LEFT JOIN job_scores s ON s.job_id = j.id
                  WHERE j.status = 'saved' AND j.description IS NOT NULL
                    AND (s.job_id IS NULL OR (s.profile_id != ?1 AND s.status != 'scoring'))
-                 ORDER BY j.updated_at DESC, j.id DESC
+                 ORDER BY EXISTS (
+                     SELECT 1 FROM search_matches m JOIN job_searches q ON q.id = m.search_id
+                     WHERE m.job_id = j.id AND q.enabled = 1
+                 ) DESC, j.updated_at DESC, j.id DESC
                  LIMIT 1",
                 params![profile_id],
                 |row| {
@@ -1036,6 +1039,32 @@ mod tests {
         store.requeue_interrupted_scores().unwrap();
         assert_eq!(store.score_status(job).unwrap(), None);
         assert_eq!(store.next_job_to_score(profile_id).unwrap().unwrap().job_id, job);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn scoring_queue_puts_enabled_preferences_first() {
+        let (store, dir) = temp_store();
+        let detail = JobDetail {
+            description: "Rust".into(),
+            seniority: None,
+            employment_type: None,
+            industries: None,
+        };
+        let paused_job = store.upsert_job(&card("1"), Some(&detail), None).unwrap();
+        let enabled_job = store.upsert_job(&card("2"), Some(&detail), None).unwrap();
+        store.set_jobs_status(&[enabled_job], JobStatus::Saved).unwrap();
+        store.set_jobs_status(&[paused_job], JobStatus::Saved).unwrap();
+
+        let paused = store.create_search(&criteria("Backend Engineer")).unwrap();
+        let enabled = store.create_search(&criteria("Platform Engineer")).unwrap();
+        store.set_search_enabled(paused.id, false).unwrap();
+        store.add_match(paused.id, paused_job, &[]).unwrap();
+        store.add_match(enabled.id, enabled_job, &[]).unwrap();
+
+        assert_eq!(store.next_job_to_score(1).unwrap().unwrap().job_id, enabled_job);
+        store.set_search_enabled(enabled.id, false).unwrap();
+        assert_eq!(store.next_job_to_score(1).unwrap().unwrap().job_id, paused_job);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
