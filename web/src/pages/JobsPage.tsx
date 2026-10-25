@@ -7,6 +7,7 @@ import {
   Braces,
   CheckCircle2,
   ChevronDown,
+  CircleDot,
   Check,
   Copy,
   Clock,
@@ -18,10 +19,22 @@ import {
   Play,
   Plus,
   RotateCcw,
+  RotateCw,
   Search,
   Trash2,
+  XCircle,
 } from "lucide-react";
-import { errorMessage, jobsApi, type JobListing, type JobSearch, type JobStatus, type ScanStatus, type SearchInput } from "../api";
+import {
+  errorMessage,
+  jobsApi,
+  profileApi,
+  type JobListing,
+  type JobScore,
+  type JobSearch,
+  type JobStatus,
+  type ScanStatus,
+  type SearchInput,
+} from "../api";
 import { Dialog } from "../components/Dialog";
 import { JsonView } from "../components/JsonView";
 import { SearchForm, WORK_MODE_LABELS } from "../components/SearchForm";
@@ -46,6 +59,15 @@ export function JobsPage() {
   const [pendingEdit, setPendingEdit] = useState<{ search: JobSearch; input: SearchInput; newJobIds: number[] } | null>(null);
   const [applyingEdit, setApplyingEdit] = useState<"save" | "discard" | null>(null);
   const [filter, setFilter] = useState<Filter>("new");
+  const [sort, setSort] = useState<"newest" | "match">("newest");
+  const [resumeConfirmed, setResumeConfirmed] = useState(false);
+
+  useEffect(() => {
+    profileApi.get().then(
+      (record) => setResumeConfirmed(record?.status === "confirmed"),
+      () => setResumeConfirmed(false),
+    );
+  }, []);
   const [error, setError] = useState<string | null>(null);
 
   const loadJobs = useCallback(async () => setJobs(await jobsApi.listJobs()), []);
@@ -76,6 +98,23 @@ export function JobsPage() {
     }, 5_000);
     return () => clearInterval(id);
   }, [loadJobs]);
+
+  const scoringPending =
+    resumeConfirmed && (jobs ?? []).some((j) => j.status === "saved" && j.description && (!j.score || j.score.status === "scoring"));
+  useEffect(() => {
+    if (!scoringPending) return;
+    const id = setInterval(() => void loadJobs().catch(() => undefined), 5_000);
+    return () => clearInterval(id);
+  }, [scoringPending, loadJobs]);
+
+  async function rescore(job: JobListing) {
+    try {
+      await jobsApi.rescore(job.id);
+      await loadJobs();
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  }
 
   async function saveSearch(input: SearchInput) {
     if (editing && editing !== "new") {
@@ -163,7 +202,9 @@ export function JobsPage() {
   const enabledSearchIds = new Set(searches?.filter((search) => search.enabled).map((search) => search.id) ?? []);
   const matchingJobs = jobs?.filter((job) => job.search_ids.some((id) => enabledSearchIds.has(id))) ?? [];
   const counts = Object.fromEntries(FILTERS.map(([f]) => [f, matchingJobs.filter((j) => f === "all" || j.status === f).length]));
-  const visible = matchingJobs.filter((j) => filter === "all" || j.status === filter);
+  const filtered = matchingJobs.filter((j) => filter === "all" || j.status === filter);
+  const matchScore = (j: JobListing) => (j.score?.status === "ready" ? (j.score.score ?? -1) : -1);
+  const visible = sort === "match" ? [...filtered].sort((a, b) => matchScore(b) - matchScore(a)) : filtered;
 
   return (
     <>
@@ -242,6 +283,15 @@ export function JobsPage() {
                 </button>
               ))}
             </div>
+            <select
+              aria-label="Sort jobs"
+              value={sort}
+              onChange={(e) => setSort(e.target.value as "newest" | "match")}
+              className="mb-2 shrink-0 rounded-lg border border-zinc-200 bg-white px-2 py-1.5 text-sm text-zinc-700 shadow-sm"
+            >
+              <option value="newest">Newest</option>
+              <option value="match">Best match</option>
+            </select>
             {filter === "new" && visible.length > 0 && (
               <Button icon={BookmarkPlus} onClick={() => saveAll(visible.map((j) => j.id))} className="mb-2 shrink-0">
                 Save all <span className="hidden sm:inline">({visible.length})</span>
@@ -258,7 +308,7 @@ export function JobsPage() {
           ) : (
             <div className="space-y-3">
               {visible.map((job) => (
-                <JobRow key={job.id} job={job} onStatus={(s) => setStatus(job, s)} />
+                <JobRow key={job.id} job={job} resumeConfirmed={resumeConfirmed} onStatus={(s) => setStatus(job, s)} onRescore={() => rescore(job)} />
               ))}
             </div>
           )}
@@ -439,7 +489,67 @@ function SearchCard({
   );
 }
 
-function JobRow({ job, onStatus }: { job: JobListing; onStatus: (s: JobStatus) => void }) {
+function ScoreBadge({ job, resumeConfirmed }: { job: JobListing; resumeConfirmed: boolean }) {
+  const base = "inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-xs font-medium";
+  const score = job.score;
+  if (score?.status === "ready" && score.score !== null) {
+    const tone =
+      score.score >= 75 ? "bg-emerald-50 text-emerald-700" : score.score >= 50 ? "bg-amber-50 text-amber-800" : "bg-red-50 text-red-700";
+    return <span className={`${base} ${tone}`}>{score.score}% match</span>;
+  }
+  if (score?.status === "scoring") {
+    return (
+      <span className={`${base} bg-zinc-100 text-zinc-600`}>
+        <Loader2 className="size-3 animate-spin" />
+        Scoring…
+      </span>
+    );
+  }
+  if (score?.status === "failed") return <span className={`${base} bg-red-50 text-red-700`}>Score failed</span>;
+  if (job.status !== "saved") return null;
+  const hint = !resumeConfirmed ? "Confirm your resume to score" : !job.description ? "Waiting for description" : "Queued for scoring";
+  return <span className={`${base} bg-zinc-100 text-zinc-500`}>{hint}</span>;
+}
+
+const VERDICT_ICONS = {
+  met: <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-emerald-600" aria-label="Met" />,
+  partial: <CircleDot className="mt-0.5 size-4 shrink-0 text-amber-600" aria-label="Partly met" />,
+  missing: <XCircle className="mt-0.5 size-4 shrink-0 text-red-500" aria-label="Missing" />,
+};
+
+function MatchDetails({ score }: { score: JobScore }) {
+  return (
+    <div className="mb-4 rounded-lg border border-zinc-200 bg-zinc-50 p-3">
+      <p className="text-sm font-medium">How you match</p>
+      {score.summary && <p className="mt-1 text-sm text-zinc-600">{score.summary}</p>}
+      <ul className="mt-3 space-y-2">
+        {score.requirements.map((r) => (
+          <li key={r.text} className="flex items-start gap-2 text-sm">
+            {VERDICT_ICONS[r.verdict]}
+            <div className="min-w-0">
+              <span className="text-zinc-800">{r.text}</span>
+              {r.importance === "nice" && <span className="ml-1.5 text-xs text-zinc-400">nice to have</span>}
+              {r.evidence && <p className="mt-0.5 text-xs text-zinc-500">“{r.evidence}”</p>}
+            </div>
+          </li>
+        ))}
+      </ul>
+      <p className="mt-3 text-xs text-zinc-400">Scored by {score.model}</p>
+    </div>
+  );
+}
+
+function JobRow({
+  job,
+  resumeConfirmed,
+  onStatus,
+  onRescore,
+}: {
+  job: JobListing;
+  resumeConfirmed: boolean;
+  onStatus: (s: JobStatus) => void;
+  onRescore: () => void;
+}) {
   const [open, setOpen] = useState(false);
   const [showJson, setShowJson] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -463,6 +573,9 @@ function JobRow({ job, onStatus }: { job: JobListing; onStatus: (s: JobStatus) =
           <a href={job.url} target="_blank" rel="noreferrer" className="font-medium hover:underline">
             {job.title}
           </a>
+          <span className="ml-2 align-middle">
+            <ScoreBadge job={job} resumeConfirmed={resumeConfirmed} />
+          </span>
           {job.tailored_at && (
             <span className="ml-2 inline-flex items-center gap-1 rounded-md bg-emerald-50 px-1.5 py-0.5 align-middle text-xs font-medium text-emerald-700">
               <CheckCircle2 className="size-3" />
@@ -551,6 +664,13 @@ function JobRow({ job, onStatus }: { job: JobListing; onStatus: (s: JobStatus) =
 
       {open && (
         <div className="border-t border-zinc-100 px-4 py-4">
+          {job.score?.status === "ready" && <MatchDetails score={job.score} />}
+          {job.score?.status === "failed" && job.score.error && <p className="mb-3 text-sm text-red-700">Scoring failed: {job.score.error}</p>}
+          {job.status === "saved" && resumeConfirmed && job.description && job.score?.status !== "scoring" && (
+            <Button icon={RotateCw} onClick={onRescore} className="mb-4">
+              Score again
+            </Button>
+          )}
           {(job.seniority || job.employment_type || job.industries) && (
             <p className="mb-3 text-xs text-zinc-500">{[job.seniority, job.employment_type, job.industries].filter(Boolean).join(" · ")}</p>
           )}

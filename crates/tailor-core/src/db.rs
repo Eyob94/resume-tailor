@@ -11,8 +11,9 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use crate::{
     errors::DbError,
     types::{
-        JobCard, JobDetail, JobListing, JobSearch, JobStatus, MasterResume, PdfInfo, PostedWithin,
-        ProfileRecord, ResumeProfile, ScanRun, SearchCriteria, Warning, WorkMode,
+        JobCard, JobDetail, JobListing, JobScore, JobSearch, JobStatus, JobToScore, MasterResume,
+        PdfInfo, PostedWithin, ProfileRecord, Requirement, ResumeProfile, ScanRun, SearchCriteria,
+        Warning, WorkMode,
     },
 };
 #[derive(Clone)]
@@ -97,6 +98,17 @@ const MIGRATIONS: &[&str] = &[
         confirmed_at       TEXT
     );",
     "ALTER TABLE job_searches ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;",
+    "CREATE TABLE job_scores (
+        job_id       INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+        profile_id   INTEGER NOT NULL,
+        status       TEXT NOT NULL,
+        score        INTEGER,
+        summary      TEXT,
+        requirements TEXT NOT NULL DEFAULT '[]',
+        model        TEXT NOT NULL,
+        error        TEXT,
+        updated_at   TEXT NOT NULL
+    );",
 ];
 
 #[cfg(test)]
@@ -462,13 +474,127 @@ impl Db {
         Ok(removed > 0)
     }
 
+    pub fn current_confirmed_profile(&self) -> Result<Option<ProfileRecord>, DbError> {
+        let Some(resume) = self.get_resume()? else {
+            return Ok(None);
+        };
+        Ok(self
+            .latest_profile(&resume.uploaded_at)?
+            .filter(|record| record.status == "confirmed" && record.profile.is_some()))
+    }
+
+    pub fn next_job_to_score(&self, profile_id: i64) -> Result<Option<JobToScore>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let job = conn
+            .query_row(
+                "SELECT j.id, j.title, j.company, j.description
+                 FROM jobs j LEFT JOIN job_scores s ON s.job_id = j.id
+                 WHERE j.status = 'saved' AND j.description IS NOT NULL
+                   AND (s.job_id IS NULL OR (s.profile_id != ?1 AND s.status != 'scoring'))
+                 ORDER BY j.updated_at DESC, j.id DESC
+                 LIMIT 1",
+                params![profile_id],
+                |row| {
+                    Ok(JobToScore {
+                        job_id: row.get(0)?,
+                        title: row.get(1)?,
+                        company: row.get(2)?,
+                        description: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(job)
+    }
+
+    pub fn start_score(&self, job_id: i64, profile_id: i64, model: &str) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO job_scores (job_id, profile_id, status, model, updated_at)
+             VALUES (?1, ?2, 'scoring', ?3, ?4)
+             ON CONFLICT(job_id) DO UPDATE SET
+                profile_id = excluded.profile_id,
+                status = 'scoring',
+                score = NULL,
+                summary = NULL,
+                requirements = '[]',
+                model = excluded.model,
+                error = NULL,
+                updated_at = excluded.updated_at",
+            params![job_id, profile_id, model, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_score(
+        &self,
+        job_id: i64,
+        score: u8,
+        summary: &str,
+        requirements: &[Requirement],
+    ) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE job_scores SET status = 'ready', score = ?2, summary = ?3, requirements = ?4,
+                error = NULL, updated_at = ?5
+             WHERE job_id = ?1",
+            params![job_id, score, summary, serde_json::to_string(requirements)?, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn fail_score(&self, job_id: i64, error: &str) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE job_scores SET status = 'failed', error = ?2, updated_at = ?3 WHERE job_id = ?1",
+            params![job_id, error, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn score_status(&self, job_id: i64) -> Result<Option<String>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let status = conn
+            .query_row("SELECT status FROM job_scores WHERE job_id = ?1", params![job_id], |row| row.get(0))
+            .optional()?;
+        Ok(status)
+    }
+
+    pub fn clear_score(&self, job_id: i64) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM job_scores WHERE job_id = ?1", params![job_id])?;
+        Ok(())
+    }
+
+    pub fn job_status(&self, job_id: i64) -> Result<Option<JobStatus>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let status = conn
+            .query_row("SELECT status FROM jobs WHERE id = ?1", params![job_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        Ok(status.as_deref().map(JobStatus::parse))
+    }
+
+    pub fn mark_interrupted_scores(&self) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE job_scores SET status = 'failed', error = 'Interrupted by a restart. Try again.', updated_at = ?1
+             WHERE status = 'scoring'",
+            params![now()],
+        )?;
+        Ok(())
+    }
+
     pub fn list_jobs(&self, status: Option<JobStatus>) -> Result<Vec<JobListing>, DbError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
         "SELECT j.id, j.linkedin_id, j.title, j.company, j.company_url, j.location, j.posted_on, j.url,
                 j.description, j.seniority, j.employment_type, j.industries, j.work_mode, j.status,
-                j.first_seen_at, m.search_id, m.matched_keywords, j.tailored_at
+                j.first_seen_at, m.search_id, m.matched_keywords, j.tailored_at,
+                s.status, s.score, s.summary, s.requirements, s.model, s.error, s.profile_id, s.updated_at
          FROM jobs j JOIN search_matches m ON m.job_id = j.id
+         LEFT JOIN job_scores s ON s.job_id = j.id
          WHERE ?1 IS NULL OR j.status = ?1
          ORDER BY COALESCE(j.posted_on, '') DESC, j.first_seen_at DESC, j.id DESC, m.search_id",
     )?;
@@ -495,15 +621,41 @@ impl Db {
                 tailored_at: row.get(17)?,
                 search_ids: vec![row.get(15)?],
                 matched_keywords: Vec::new(),
+                score: None,
             };
-            Ok((listing, row.get::<_, String>(16)?))
+            let score = match row.get::<_, Option<String>>(18)? {
+                Some(status) => Some((
+                    status,
+                    row.get::<_, Option<i64>>(19)?,
+                    row.get::<_, Option<String>>(20)?,
+                    row.get::<_, String>(21)?,
+                    row.get::<_, String>(22)?,
+                    row.get::<_, Option<String>>(23)?,
+                    row.get::<_, i64>(24)?,
+                    row.get::<_, String>(25)?,
+                )),
+                None => None,
+            };
+            Ok((listing, row.get::<_, String>(16)?, score))
         })?;
 
         let mut jobs: Vec<JobListing> = Vec::new();
         let mut index: HashMap<i64, usize> = HashMap::new();
         for row in rows {
-            let (listing, keywords) = row?;
+            let (mut listing, keywords, score) = row?;
             let keywords: Vec<String> = serde_json::from_str(&keywords)?;
+            if let Some((status, score, summary, requirements, model, error, profile_id, updated_at)) = score {
+                listing.score = Some(JobScore {
+                    status,
+                    score: score.map(|s| s.clamp(0, 100) as u8),
+                    summary,
+                    requirements: serde_json::from_str(&requirements)?,
+                    model,
+                    error,
+                    profile_id,
+                    updated_at,
+                });
+            }
             let job = match index.get(&listing.id) {
                 Some(&i) => {
                     jobs[i].search_ids.extend(listing.search_ids);
@@ -828,6 +980,63 @@ mod tests {
 
         assert!(store.delete_search(search.id).unwrap());
         assert!(store.list_searches().unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn scoring_queue_picks_saved_jobs_for_the_confirmed_profile() {
+        let (store, dir) = temp_store();
+        assert!(store.current_confirmed_profile().unwrap().is_none());
+
+        let resume = store
+            .save_resume("cv.pdf", b"%PDF-1", &PdfInfo { page_count: 1, text: "cv".into() })
+            .unwrap();
+        let profile_id = store.start_profile(&resume.uploaded_at, "fake").unwrap();
+        let profile = ResumeProfile::default();
+        store.finish_profile(profile_id, &profile, &[]).unwrap();
+        assert!(store.current_confirmed_profile().unwrap().is_none());
+        store.confirm_profile(profile_id).unwrap();
+        assert_eq!(store.current_confirmed_profile().unwrap().unwrap().id, profile_id);
+
+        let detail = JobDetail {
+            description: "Rust".into(),
+            seniority: None,
+            employment_type: None,
+            industries: None,
+        };
+        let job = store.upsert_job(&card("1"), Some(&detail), None).unwrap();
+        let undescribed = store.upsert_job(&card("2"), None, None).unwrap();
+        store.set_jobs_status(&[job, undescribed], JobStatus::Saved).unwrap();
+        assert_eq!(store.next_job_to_score(profile_id).unwrap().unwrap().job_id, job);
+
+        store.start_score(job, profile_id, "fake").unwrap();
+        assert!(store.next_job_to_score(profile_id).unwrap().is_none());
+        assert!(store.next_job_to_score(profile_id + 1).unwrap().is_none());
+
+        let reqs = vec![Requirement {
+            text: "Rust".into(),
+            importance: crate::types::Importance::Must,
+            verdict: crate::types::Verdict::Met,
+            evidence: None,
+        }];
+        store.finish_score(job, 80, "Good fit.", &reqs).unwrap();
+        assert!(store.next_job_to_score(profile_id).unwrap().is_none());
+        assert_eq!(store.next_job_to_score(profile_id + 1).unwrap().unwrap().job_id, job);
+
+        let search = store.create_search(&criteria("Backend Engineer")).unwrap();
+        store.add_match(search.id, job, &[]).unwrap();
+        let listed = store.list_jobs(None).unwrap();
+        let score = listed[0].score.as_ref().unwrap();
+        assert_eq!((score.status.as_str(), score.score, score.requirements.len()), ("ready", Some(80), 1));
+
+        store.clear_score(job).unwrap();
+        assert_eq!(store.next_job_to_score(profile_id).unwrap().unwrap().job_id, job);
+        store.set_job_status(job, JobStatus::New).unwrap();
+        assert!(store.next_job_to_score(profile_id).unwrap().is_none());
+
+        store.start_score(undescribed, profile_id, "fake").unwrap();
+        store.mark_interrupted_scores().unwrap();
+        assert_eq!(store.score_status(undescribed).unwrap().as_deref(), Some("failed"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

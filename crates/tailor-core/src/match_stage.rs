@@ -1,8 +1,12 @@
 use std::sync::Arc;
 
-use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
+use tokio::{
+    sync::mpsc::{UnboundedReceiver, UnboundedSender},
+    task::JoinHandle,
+};
 
 use crate::{
+    score_stage::ScoreMessage,
     db::Db,
     errors::DbError,
     scrape_stage::{ScanReport, ScrapedJob},
@@ -25,8 +29,8 @@ pub struct MatchStage {
 }
 
 impl MatchStage {
-    pub fn new(db: Arc<Db>, rx: UnboundedReceiver<MatchMessage>) -> Self {
-        let handle = tokio::spawn(run(db, rx));
+    pub fn new(db: Arc<Db>, rx: UnboundedReceiver<MatchMessage>, scorer: UnboundedSender<ScoreMessage>) -> Self {
+        let handle = tokio::spawn(run(db, rx, scorer));
         Self { handle }
     }
 
@@ -35,7 +39,7 @@ impl MatchStage {
     }
 }
 
-async fn run(db: Arc<Db>, mut rx: UnboundedReceiver<MatchMessage>) {
+async fn run(db: Arc<Db>, mut rx: UnboundedReceiver<MatchMessage>, scorer: UnboundedSender<ScoreMessage>) {
     let mut new_matches = 0;
     let mut match_error = None;
     while let Some(message) = rx.recv().await {
@@ -43,7 +47,10 @@ async fn run(db: Arc<Db>, mut rx: UnboundedReceiver<MatchMessage>) {
             MatchMessage::Batch { search, jobs } => {
                 let db = db.clone();
                 match tokio::task::spawn_blocking(move || apply_batch(&db, &search, jobs)).await {
-                    Ok(Ok(count)) => new_matches += count,
+                    Ok(Ok(count)) => {
+                        new_matches += count;
+                        let _ = scorer.send(ScoreMessage::Kick);
+                    }
                     Ok(Err(error)) => {
                         tracing::error!("couldn't match scanned jobs: {error}");
                         match_error = Some(error.to_string());

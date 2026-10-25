@@ -4,5 +4,6 @@ pub mod match_stage;
 pub mod parse_stage;
 pub mod pipeline;
 pub mod resume_stage;
+pub mod score_stage;
 pub mod scrape_stage;
 pub mod types;

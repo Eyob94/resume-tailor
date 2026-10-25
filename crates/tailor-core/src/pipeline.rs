@@ -7,6 +7,7 @@ use crate::{
     match_stage::{MatchMessage, MatchStage},
     parse_stage::{ParseMessage, ParseStage},
     resume_stage::{ResumeMessage, ResumeStage},
+    score_stage::{ScoreMessage, ScoreStage},
     scrape_stage::{LinkedInClient, ScrapeMessage, ScrapeStage},
 };
 
@@ -20,6 +21,7 @@ pub struct PipelineSenders {
     pub resume: UnboundedSender<ResumeMessage>,
     pub parse: UnboundedSender<ParseMessage>,
     pub scrape: UnboundedSender<ScrapeMessage>,
+    pub score: UnboundedSender<ScoreMessage>,
 }
 
 pub struct Pipeline {
@@ -27,6 +29,7 @@ pub struct Pipeline {
     parse_stage: ParseStage,
     scrape_stage: ScrapeStage,
     match_stage: MatchStage,
+    score_stage: ScoreStage,
 }
 
 impl Pipeline {
@@ -39,8 +42,10 @@ impl Pipeline {
         let (scrape_tx, scrape_rx) = tokio::sync::mpsc::unbounded_channel::<ScrapeMessage>();
         let (parse_tx, parse_rx) = tokio::sync::mpsc::unbounded_channel::<ParseMessage>();
         let (resume_tx, resume_rx) = tokio::sync::mpsc::unbounded_channel::<ResumeMessage>();
+        let (score_tx, score_rx) = tokio::sync::mpsc::unbounded_channel::<ScoreMessage>();
 
-        let match_stage = MatchStage::new(db.clone(), match_rx);
+        let score_stage = ScoreStage::new(db.clone(), config.ollama_url.clone(), score_rx);
+        let match_stage = MatchStage::new(db.clone(), match_rx, score_tx.clone());
         let scrape_stage = ScrapeStage::new(
             db.clone(),
             client,
@@ -55,12 +60,14 @@ impl Pipeline {
             resume: resume_tx,
             parse: parse_tx,
             scrape: scrape_tx,
+            score: score_tx,
         };
         let pipeline = Self {
             resume_stage,
             parse_stage,
             scrape_stage,
             match_stage,
+            score_stage,
         };
         Ok((pipeline, senders))
     }
@@ -70,5 +77,6 @@ impl Pipeline {
         self.parse_stage.join().await;
         self.scrape_stage.join().await;
         self.match_stage.join().await;
+        self.score_stage.join().await;
     }
 }

@@ -18,10 +18,11 @@ use serde::Deserialize;
 use serde_json::json;
 use tailor_core::{
     db::Db,
-    errors::{ProfileError, ResumeError},
+    errors::{ProfileError, ResumeError, ScoreError},
     parse_stage::{ParseMessage, DEFAULT_OLLAMA_URL},
     pipeline::{Pipeline, PipelineConfig, PipelineSenders},
     resume_stage::{ResumeMessage, MAX_UPLOAD_BYTES},
+    score_stage::ScoreMessage,
     scrape_stage::{ScrapeMessage, DEFAULT_COOLDOWN_SECONDS},
     types::{
         JobListing, JobSearch, JobStatus, MasterResume, ProfileRecord, ResumeProfile, ScanStatus,
@@ -142,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/jobs", get(list_jobs))
         .route("/jobs/{id}", patch(update_job))
         .route("/jobs/status", post(update_jobs_status))
+        .route("/jobs/{id}/score", post(rescore_job))
         .route("/scan", get(scan_status))
         .route("/scan/run", post(run_scan_now))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES + 64 * 1024))
@@ -319,6 +321,7 @@ async fn confirm_profile(
     })
     .await?
     .map_err(map_profile_error)?;
+    let _ = state.senders.score.send(ScoreMessage::Kick);
     Ok(Json(saved))
 }
 
@@ -404,6 +407,9 @@ async fn update_job(
     Json(patch): Json<JobPatch>,
 ) -> Result<StatusCode, AppError> {
     if user.store.set_job_status(id, patch.status)? {
+        if patch.status == JobStatus::Saved {
+            let _ = user.senders.score.send(ScoreMessage::Kick);
+        }
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::not_found_msg("Job not found."))
@@ -428,7 +434,28 @@ async fn update_jobs_status(
         )));
     }
     let updated = user.store.set_jobs_status(&body.ids, body.status)?;
+    if body.status == JobStatus::Saved {
+        let _ = user.senders.score.send(ScoreMessage::Kick);
+    }
     Ok(Json(json!({ "updated": updated })))
+}
+
+async fn rescore_job(
+    Extension(user): Extension<Arc<UserServices>>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, AppError> {
+    ask(&user.senders.score, |reply| ScoreMessage::Rescore { job_id: id, reply })
+        .await?
+        .map(|()| StatusCode::ACCEPTED)
+        .map_err(|error| match error {
+            ScoreError::NotFound => AppError::not_found_msg("Job not found."),
+            ScoreError::NotSaved | ScoreError::NoProfile => AppError::bad_request(error.to_string()),
+            ScoreError::AlreadyScoring => AppError {
+                status: StatusCode::CONFLICT,
+                message: error.to_string(),
+            },
+            ScoreError::Db(error) => error.into(),
+        })
 }
 
 async fn scan_status(
