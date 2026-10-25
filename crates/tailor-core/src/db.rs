@@ -576,13 +576,9 @@ impl Db {
         Ok(status.as_deref().map(JobStatus::parse))
     }
 
-    pub fn mark_interrupted_scores(&self) -> Result<(), DbError> {
+    pub fn requeue_interrupted_scores(&self) -> Result<(), DbError> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE job_scores SET status = 'failed', error = 'Interrupted by a restart. Try again.', updated_at = ?1
-             WHERE status = 'scoring'",
-            params![now()],
-        )?;
+        conn.execute("DELETE FROM job_scores WHERE status = 'scoring'", [])?;
         Ok(())
     }
 
@@ -1034,9 +1030,12 @@ mod tests {
         store.set_job_status(job, JobStatus::New).unwrap();
         assert!(store.next_job_to_score(profile_id).unwrap().is_none());
 
-        store.start_score(undescribed, profile_id, "fake").unwrap();
-        store.mark_interrupted_scores().unwrap();
-        assert_eq!(store.score_status(undescribed).unwrap().as_deref(), Some("failed"));
+        store.set_job_status(job, JobStatus::Saved).unwrap();
+        store.start_score(job, profile_id, "fake").unwrap();
+        assert!(store.next_job_to_score(profile_id).unwrap().is_none());
+        store.requeue_interrupted_scores().unwrap();
+        assert_eq!(store.score_status(job).unwrap(), None);
+        assert_eq!(store.next_job_to_score(profile_id).unwrap().unwrap().job_id, job);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

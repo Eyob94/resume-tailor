@@ -41,8 +41,8 @@ impl ScoreStage {
 }
 
 async fn run(db: Arc<Db>, default_ollama_url: String, mut rx: UnboundedReceiver<ScoreMessage>) {
-    if let Err(e) = db.mark_interrupted_scores() {
-        tracing::error!("couldn't tidy interrupted job scores: {e}");
+    if let Err(e) = db.requeue_interrupted_scores() {
+        tracing::error!("couldn't requeue interrupted job scores: {e}");
     }
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let mut running = false;
