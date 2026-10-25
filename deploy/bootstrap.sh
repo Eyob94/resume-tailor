@@ -7,10 +7,6 @@ if [[ "$EUID" -ne 0 ]]; then
 fi
 
 deploy_user="${1:?Usage: sudo ./deploy/bootstrap.sh DEPLOY_USER}"
-if [[ "$deploy_user" == root ]]; then
-  echo "Choose a non-root deployment user" >&2
-  exit 1
-fi
 id "$deploy_user" >/dev/null
 command -v systemctl >/dev/null || { echo "systemd is required" >&2; exit 1; }
 
@@ -53,10 +49,12 @@ systemctl enable resume-tailor.service
 systemctl enable --now caddy
 systemctl reload caddy
 
-systemctl_path="$(command -v systemctl)"
-printf '%s ALL=(root) NOPASSWD: %s restart resume-tailor.service\n' \
-  "$deploy_user" "$systemctl_path" > /etc/sudoers.d/resume-tailor-deploy
-chmod 440 /etc/sudoers.d/resume-tailor-deploy
-visudo -cf /etc/sudoers.d/resume-tailor-deploy
+if [[ "$deploy_user" != root ]]; then
+  systemctl_path="$(command -v systemctl)"
+  printf '%s ALL=(root) NOPASSWD: %s restart resume-tailor.service\n' \
+    "$deploy_user" "$systemctl_path" > /etc/sudoers.d/resume-tailor-deploy
+  chmod 440 /etc/sudoers.d/resume-tailor-deploy
+  visudo -cf /etc/sudoers.d/resume-tailor-deploy
+fi
 
 echo "Server setup complete."

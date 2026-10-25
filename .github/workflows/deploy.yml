@@ -103,10 +103,10 @@ jobs:
           EOF
           chmod 600 ~/.ssh/config
 
-      - name: Check passwordless sudo on VPS
+      - name: Check root access on VPS
         run: |
-          ssh -4 resume-tailor-vps "sudo -n true" || {
-            echo "The deploy user needs passwordless sudo. On the VPS run: echo \"\$USER ALL=(ALL) NOPASSWD: ALL\" | sudo tee /etc/sudoers.d/resume-tailor-admin" >&2
+          ssh -4 resume-tailor-vps '[ "$(id -u)" -eq 0 ] || sudo -n true' || {
+            echo "Deploy as root, or give the deploy user passwordless sudo." >&2
             exit 1
           }
 
@@ -116,7 +116,7 @@ jobs:
           setup_dir="/tmp/resume-tailor-setup-${GITHUB_SHA}"
           ssh -4 resume-tailor-vps "rm -rf '$setup_dir' && mkdir -p '$setup_dir'"
           scp -4 -r deploy Caddyfile "resume-tailor-vps:$setup_dir/"
-          ssh -4 resume-tailor-vps "sudo -n bash '$setup_dir/deploy/bootstrap.sh' \"\$USER\" && rm -rf '$setup_dir'"
+          ssh -4 resume-tailor-vps "if [ \"\$(id -u)\" -eq 0 ]; then bash '$setup_dir/deploy/bootstrap.sh' root; else sudo -n bash '$setup_dir/deploy/bootstrap.sh' \"\$USER\"; fi && rm -rf '$setup_dir'"
 
       - name: Copy release to VPS
         run: scp -4 resume-tailor-release.tar.gz resume-tailor-vps:/tmp/resume-tailor-${GITHUB_SHA}.tar.gz
