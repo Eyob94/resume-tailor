@@ -3,9 +3,7 @@ import { createRoot } from "react-dom/client";
 import { BrowserRouter, Navigate, Outlet, Route, Routes } from "react-router-dom";
 import "./index.css";
 import { Layout } from "./components/Layout";
-import { ApplicationsPage } from "./pages/ApplicationsPage";
 import { JobsPage } from "./pages/JobsPage";
-import { NewApplicationPage } from "./pages/NewApplicationPage";
 import { ResumePage } from "./pages/ResumePage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { LoginPage } from "./pages/LoginPage";
@@ -28,9 +26,8 @@ createRoot(document.getElementById("root")!).render(
         <Route path="login" element={<LoginPage />} />
         <Route element={<RequireLogin />}>
           <Route element={<Layout />}>
-            <Route index element={<ApplicationsPage />} />
+            <Route index element={<Navigate to="/jobs" replace />} />
             <Route path="jobs" element={<JobsPage />} />
-            <Route path="new" element={<NewApplicationPage />} />
             <Route path="resume" element={<ResumePage />} />
             <Route path="settings" element={<SettingsPage />} />
           </Route>

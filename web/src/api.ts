@@ -70,6 +70,7 @@ export interface SearchInput {
 
 export interface JobSearch {
   id: number;
+  enabled: boolean;
   name: string;
   titles: string[];
   keywords: string[];
@@ -130,6 +131,7 @@ export const jobsApi = {
   listSearches: () => request<JobSearch[]>("/searches"),
   createSearch: (input: SearchInput) => request<JobSearch>("/searches", { method: "POST", ...json(input) }),
   updateSearch: (id: number, input: SearchInput) => request<JobSearch>(`/searches/${id}`, { method: "PUT", ...json(input) }),
+  setSearchEnabled: (id: number, enabled: boolean) => request<JobSearch>(`/searches/${id}`, { method: "PATCH", ...json({ enabled }) }),
   deleteSearch: (id: number) => request<void>(`/searches/${id}`, { method: "DELETE" }),
   listJobs: (status?: JobStatus) => request<JobListing[]>(status ? `/jobs?status=${status}` : "/jobs"),
   setJobStatus: (id: number, status: JobStatus) => request<void>(`/jobs/${id}`, { method: "PATCH", ...json({ status }) }),

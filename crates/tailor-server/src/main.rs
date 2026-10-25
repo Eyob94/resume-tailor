@@ -133,7 +133,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/resume/profile/confirm", post(confirm_profile))
         .merge(settings::routes())
         .route("/searches", get(list_searches).post(create_search))
-        .route("/searches/{id}", put(update_search).delete(delete_search))
+        .route(
+            "/searches/{id}",
+            put(update_search)
+                .patch(update_search_enabled)
+                .delete(delete_search),
+        )
         .route("/jobs", get(list_jobs))
         .route("/jobs/{id}", patch(update_job))
         .route("/jobs/status", post(update_jobs_status))
@@ -343,6 +348,24 @@ async fn update_search(
         .store
         .update_search(id, &criteria)?
         .ok_or_else(|| AppError::not_found_msg("Search not found."))?;
+    let _ = state.senders.scrape.send(ScrapeMessage::Reschedule);
+    Ok(Json(search))
+}
+
+#[derive(Deserialize)]
+struct SearchEnabledInput {
+    enabled: bool,
+}
+
+async fn update_search_enabled(
+    Extension(state): Extension<Arc<UserServices>>,
+    Path(id): Path<i64>,
+    Json(input): Json<SearchEnabledInput>,
+) -> Result<Json<JobSearch>, AppError> {
+    let search = state
+        .store
+        .set_search_enabled(id, input.enabled)?
+        .ok_or_else(|| AppError::not_found_msg("Preference not found."))?;
     let _ = state.senders.scrape.send(ScrapeMessage::Reschedule);
     Ok(Json(search))
 }

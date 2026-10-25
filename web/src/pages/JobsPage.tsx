@@ -7,6 +7,8 @@ import {
   Braces,
   CheckCircle2,
   ChevronDown,
+  Check,
+  Copy,
   Clock,
   ExternalLink,
   EyeOff,
@@ -46,7 +48,13 @@ export function JobsPage() {
   const loadJobs = useCallback(async () => setJobs(await jobsApi.listJobs()), []);
 
   useEffect(() => {
-    Promise.all([jobsApi.listSearches().then(setSearches), loadJobs(), jobsApi.scanStatus().then(setScan)]).catch((e) =>
+    Promise.all([
+      jobsApi.listSearches().then((all) => {
+        setSearches(all);
+      }),
+      loadJobs(),
+      jobsApi.scanStatus().then(setScan),
+    ]).catch((e) =>
       setError(errorMessage(e)),
     );
   }, [loadJobs]);
@@ -80,7 +88,7 @@ export function JobsPage() {
   }
 
   async function removeSearch(search: JobSearch) {
-    if (!confirm(`Delete the search "${search.name}"? Jobs only it matched will disappear from the list.`)) return;
+    if (!confirm(`Delete the preference "${search.name}"? Jobs matched only by it will disappear from the list.`)) return;
     try {
       await jobsApi.deleteSearch(search.id);
       setSearches((all) => all?.filter((s) => s.id !== search.id) ?? null);
@@ -112,18 +120,32 @@ export function JobsPage() {
     }
   }
 
-  const counts = Object.fromEntries(FILTERS.map(([f]) => [f, jobs?.filter((j) => f === "all" || j.status === f).length ?? 0]));
-  const visible = jobs?.filter((j) => filter === "all" || j.status === filter) ?? [];
+  async function toggleSearch(search: JobSearch) {
+    const enabled = !search.enabled;
+    setSearches((all) => all?.map((item) => (item.id === search.id ? { ...item, enabled } : item)) ?? null);
+    try {
+      const updated = await jobsApi.setSearchEnabled(search.id, enabled);
+      setSearches((all) => all?.map((item) => (item.id === updated.id ? updated : item)) ?? null);
+    } catch (e) {
+      setSearches((all) => all?.map((item) => (item.id === search.id ? { ...item, enabled: search.enabled } : item)) ?? null);
+      setError(errorMessage(e));
+    }
+  }
+
+  const enabledSearchIds = new Set(searches?.filter((search) => search.enabled).map((search) => search.id) ?? []);
+  const matchingJobs = jobs?.filter((job) => job.search_ids.some((id) => enabledSearchIds.has(id))) ?? [];
+  const counts = Object.fromEntries(FILTERS.map(([f]) => [f, matchingJobs.filter((j) => f === "all" || j.status === f).length]));
+  const visible = matchingJobs.filter((j) => filter === "all" || j.status === filter);
 
   return (
     <>
       <PageHeader
         title="Jobs"
-        description="LinkedIn jobs matching your saved searches."
+        description="LinkedIn jobs matching your preferences."
         actions={
           searches?.length && !editing ? (
             <Button variant="primary" icon={Plus} onClick={() => setEditing("new")}>
-              New search
+              New preference
             </Button>
           ) : null
         }
@@ -136,7 +158,7 @@ export function JobsPage() {
         <section className="mb-10 space-y-4">
           {editing && (
             <Card>
-              <h2 className="border-b border-zinc-100 px-5 py-4 font-semibold">{editing === "new" ? "New search" : `Edit “${editing.name}”`}</h2>
+              <h2 className="border-b border-zinc-100 px-5 py-4 font-semibold">{editing === "new" ? "New preference" : `Edit “${editing.name}”`}</h2>
               <SearchForm initial={editing === "new" ? undefined : editing} onSubmit={saveSearch} onCancel={() => setEditing(null)} />
             </Card>
           )}
@@ -144,21 +166,28 @@ export function JobsPage() {
           {searches.length === 0 && !editing ? (
             <EmptyState
               icon={Search}
-              title="No saved searches yet"
+              title="No preferences yet"
               action={
                 <Button variant="primary" icon={Plus} onClick={() => setEditing("new")}>
-                  Create a search
+                  Create a preference
                 </Button>
               }
             >
-              Tell it the titles, keywords, location and work mode you're after. It checks LinkedIn on a schedule.
+              Add the titles, keywords, location and work mode you want LinkedIn to check on a schedule.
             </EmptyState>
           ) : (
             <>
               {scan && searches.length > 0 && <ScanBar scan={scan} onChange={setScan} onError={setError} />}
               <div className="grid gap-3 sm:grid-cols-2">
                 {searches.map((search) => (
-                  <SearchCard key={search.id} search={search} onEdit={() => setEditing(search)} onDelete={() => removeSearch(search)} />
+                  <SearchCard
+                    key={search.id}
+                    search={search}
+                    selected={search.enabled}
+                    onToggle={() => void toggleSearch(search)}
+                    onEdit={() => setEditing(search)}
+                    onDelete={() => removeSearch(search)}
+                  />
                 ))}
               </div>
             </>
@@ -260,11 +289,59 @@ function ScanBar({ scan, onChange, onError }: { scan: ScanStatus; onChange: (s: 
   );
 }
 
-function SearchCard({ search, onEdit, onDelete }: { search: JobSearch; onEdit: () => void; onDelete: () => void }) {
+function linkedinSearchUrl(search: JobSearch) {
+  const params = new URLSearchParams({
+    keywords: search.titles[0] ?? search.keywords.join(" "),
+    f_TPR: { day: "r86400", week: "r604800", month: "r2592000" }[search.posted_within],
+    sortBy: "DD",
+  });
+  if (search.location) params.set("location", search.location);
+  if (search.work_modes.length) {
+    params.set("f_WT", search.work_modes.map((mode) => ({ onsite: "1", remote: "2", hybrid: "3" })[mode]).join(","));
+  }
+  return `https://www.linkedin.com/jobs/search?${params.toString()}`;
+}
+
+function SearchCard({
+  search,
+  selected,
+  onToggle,
+  onEdit,
+  onDelete,
+}: {
+  search: JobSearch;
+  selected: boolean;
+  onToggle: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  const [devMode] = useDevMode();
+  const [copiedUrl, setCopiedUrl] = useState(false);
+  const linkedinUrl = linkedinSearchUrl(search);
+
+  async function copyLinkedinUrl() {
+    try {
+      await navigator.clipboard.writeText(linkedinUrl);
+      setCopiedUrl(true);
+      window.setTimeout(() => setCopiedUrl(false), 2000);
+    } catch {
+      setCopiedUrl(false);
+    }
+  }
+
   return (
-    <Card className="flex flex-col gap-3 p-4">
+    <Card className="flex flex-col gap-2 p-4">
       <div className="flex items-start justify-between gap-3">
-        <h3 className="font-medium">{search.name}</h3>
+        <div className="flex min-w-0 items-center gap-2">
+          <input
+            type="checkbox"
+            checked={selected}
+            onChange={onToggle}
+            aria-label={`Enable LinkedIn scans for ${search.name}`}
+            className="size-4 shrink-0 accent-zinc-900"
+          />
+          <h3 className="min-w-0 truncate whitespace-nowrap font-medium" title={search.name}>{search.name}</h3>
+        </div>
         <div className="-mt-1 -mr-1 flex shrink-0">
           <button onClick={onEdit} className="rounded-md p-1.5 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700" aria-label={`Edit ${search.name}`}>
             <Pencil className="size-4" />
@@ -274,14 +351,14 @@ function SearchCard({ search, onEdit, onDelete }: { search: JobSearch; onEdit: (
           </button>
         </div>
       </div>
-      <div className="flex flex-wrap gap-1.5">
+      <div className="hide-scrollbar flex min-w-0 gap-1.5 overflow-x-auto whitespace-nowrap py-1" aria-label={`${search.name} titles and keywords`}>
         {search.titles.map((t) => (
-          <span key={t} className="rounded-md bg-zinc-900 px-2 py-0.5 text-xs font-medium text-white">
+          <span key={t} className="shrink-0 rounded-md bg-zinc-900 px-2 py-0.5 text-xs font-medium text-white">
             {t}
           </span>
         ))}
         {search.keywords.map((k) => (
-          <span key={k} className="rounded-md bg-zinc-100 px-2 py-0.5 text-xs text-zinc-700">
+          <span key={k} className="shrink-0 rounded-md bg-zinc-100 px-2 py-0.5 text-xs text-zinc-700">
             {k}
           </span>
         ))}
@@ -294,6 +371,18 @@ function SearchCard({ search, onEdit, onDelete }: { search: JobSearch; onEdit: (
         <span>{search.work_modes.map((m) => WORK_MODE_LABELS[m]).join(" · ")}</span>
         <span>Past {POSTED_SHORT[search.posted_within]}</span>
       </p>
+      {devMode && (
+        <div className="flex items-center gap-3 border-t border-zinc-100 pt-2 text-xs">
+          <a href={linkedinUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-zinc-500 hover:text-zinc-900">
+            <ExternalLink className="size-3.5" />
+            LinkedIn
+          </a>
+          <button onClick={copyLinkedinUrl} className="inline-flex items-center gap-1 text-zinc-500 hover:text-zinc-900">
+            {copiedUrl ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+            {copiedUrl ? "Copied" : "Copy URL"}
+          </button>
+        </div>
+      )}
     </Card>
   );
 }
@@ -301,7 +390,19 @@ function SearchCard({ search, onEdit, onDelete }: { search: JobSearch; onEdit: (
 function JobRow({ job, onStatus }: { job: JobListing; onStatus: (s: JobStatus) => void }) {
   const [open, setOpen] = useState(false);
   const [showJson, setShowJson] = useState(false);
+  const [copied, setCopied] = useState(false);
   const [devMode] = useDevMode();
+
+  async function copyDescription() {
+    if (!job.description) return;
+    try {
+      await navigator.clipboard.writeText(job.description);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setCopied(false);
+    }
+  }
 
   return (
     <Card className={job.status === "dismissed" ? "opacity-60" : ""}>
@@ -374,6 +475,15 @@ function JobRow({ job, onStatus }: { job: JobListing; onStatus: (s: JobStatus) =
         <button onClick={() => setOpen(!open)} className="inline-flex items-center gap-1 font-medium text-zinc-600 hover:text-zinc-900" aria-expanded={open}>
           <ChevronDown className={`size-4 transition-transform ${open ? "rotate-180" : ""}`} />
           {open ? "Hide description" : "Description"}
+        </button>
+        <button
+          onClick={copyDescription}
+          disabled={!job.description}
+          className="inline-flex items-center gap-1 text-zinc-500 hover:text-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+          aria-label={`Copy ${job.title} description`}
+        >
+          {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+          {copied ? "Copied" : "Copy description"}
         </button>
         <a href={job.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-zinc-500 hover:text-zinc-900">
           <ExternalLink className="size-3.5" />
