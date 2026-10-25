@@ -37,7 +37,7 @@ GitHub Actions runs the Rust tests and the frontend build on pull requests. A pu
 
 One-time setup:
 
-1. Point the `codpal.io` A record at the VPS IPv4 address and allow inbound TCP ports 22, 80 and 443.
+1. Point the `codpal.io` A record at the VPS IPv4 address, add a `www` CNAME to `codpal.io` (it redirects to `codpal.io`), and allow inbound TCP ports 22, 80 and 443.
 2. Add a public key for GitHub Actions to `~/.ssh/authorized_keys` of the deploy user. That user must be `root` or have passwordless sudo.
 3. In GitHub, create the `production` environment with these secrets:
 
