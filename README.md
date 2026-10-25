@@ -33,24 +33,23 @@ Open http://localhost:5173 (proxies `/api` to the Rust server).
 
 ## VPS deployment
 
-GitHub Actions runs the Rust workspace tests and frontend production build on pull requests. A push to `main` also builds a release binary and deploys it to an Ubuntu 24.04 x86_64 VPS over IPv6 SSH. The app runs under systemd, with persistent data at `/var/lib/resume-tailor`; Caddy serves `ticklake.io` over HTTPS and proxies to the app on `127.0.0.1:8787`.
+GitHub Actions runs the Rust tests and the frontend build on pull requests. A push to `main` also builds a release and deploys it to an Ubuntu VPS over IPv4 SSH. Each deploy first runs `deploy/bootstrap.sh` on the server, which installs Caddy, the systemd service and the deploy script if they're missing; it's safe to re-run. Data lives in `/var/lib/resume-tailor`, and Caddy serves `codpal.io` over HTTPS, proxying to the app on `127.0.0.1:8787`.
 
-One-time VPS setup:
+One-time setup:
 
-1. Point the `ticklake.io` AAAA record at the VPS IPv6 address and allow inbound TCP ports 22, 80, and 443.
-2. Install Caddy on the VPS using its [official installation instructions](https://caddyserver.com/docs/install).
-3. Create a non-root SSH deployment user and add a public key for GitHub Actions to that user's `~/.ssh/authorized_keys`.
-4. From a checkout of this repository on the VPS, run `sudo ./deploy/bootstrap.sh <deploy-user>`.
-5. Edit `/etc/resume-tailor.env`. Set `OLLAMA_URL` to the URL of the Ollama machine reachable from the VPS. Keep `PORT`, `DATA_DIR`, and `WEB_DIST` as provided.
-6. In GitHub, create the `production` environment and add these environment secrets:
+1. Point the `codpal.io` A record at the VPS IPv4 address, add a `www` CNAME to `codpal.io` (it redirects to `codpal.io`), and allow inbound TCP ports 22, 80 and 443.
+2. Add a public key for GitHub Actions to `~/.ssh/authorized_keys` of the deploy user. That user must be `root` or have passwordless sudo.
+3. In GitHub, create the `production` environment with these secrets:
 
-   - `VPS_HOST`: the VPS IPv6 address (without brackets), or a hostname that resolves to it.
-   - `VPS_USER`: the non-root deployment username.
+   - `VPS_HOST`: the VPS IPv4 address, or a hostname that resolves to it.
+   - `VPS_USER`: the deploy user, e.g. `root`.
    - `VPS_SSH_PRIVATE_KEY`: the matching private key.
 
-   The deployment SSH client skips host-key verification. This avoids needing a `VPS_KNOWN_HOSTS` secret, but does not verify the server's identity.
+   The deploy skips SSH host-key verification, so it does not check the server's identity.
 
-After setup, pushes to `main` deploy automatically. Pull requests run checks without deployment. Each release is health-checked; a failed restart or check restores the previous release. User databases and uploaded resumes remain outside release directories. The VPS must be reachable by the GitHub-hosted runner over IPv6 SSH.
+4. Optional: edit `/etc/resume-tailor.env` on the server after the first deploy, e.g. to point `OLLAMA_URL` at another machine. Later deploys keep your changes.
+
+Each release is health-checked; a failed restart or check restores the previous release. User data stays outside the release folders.
 
 ## Config (env vars)
 

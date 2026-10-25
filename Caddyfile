@@ -1,3 +1,7 @@
-ticklake.io {
+codpal.io {
 	reverse_proxy 127.0.0.1:8787
+}
+
+www.codpal.io {
+	redir https://codpal.io{uri} permanent
 }
