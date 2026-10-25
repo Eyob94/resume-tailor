@@ -21,7 +21,8 @@ import {
   Search,
   Trash2,
 } from "lucide-react";
-import { errorMessage, jobsApi, type JobListing, type JobSearch, type JobStatus, type ScanStatus } from "../api";
+import { errorMessage, jobsApi, type JobListing, type JobSearch, type JobStatus, type ScanStatus, type SearchInput } from "../api";
+import { Dialog } from "../components/Dialog";
 import { JsonView } from "../components/JsonView";
 import { SearchForm, WORK_MODE_LABELS } from "../components/SearchForm";
 import { Alert, Button, Card, EmptyState, PageHeader, Skeleton } from "../components/ui";
@@ -42,6 +43,8 @@ export function JobsPage() {
   const [jobs, setJobs] = useState<JobListing[] | null>(null);
   const [scan, setScan] = useState<ScanStatus | null>(null);
   const [editing, setEditing] = useState<JobSearch | "new" | null>(null);
+  const [pendingEdit, setPendingEdit] = useState<{ search: JobSearch; input: SearchInput; newJobIds: number[] } | null>(null);
+  const [applyingEdit, setApplyingEdit] = useState<"save" | "discard" | null>(null);
   const [filter, setFilter] = useState<Filter>("new");
   const [error, setError] = useState<string | null>(null);
 
@@ -74,17 +77,42 @@ export function JobsPage() {
     return () => clearInterval(id);
   }, [loadJobs]);
 
-  async function saveSearch(input: Parameters<typeof jobsApi.createSearch>[0]) {
+  async function saveSearch(input: SearchInput) {
     if (editing && editing !== "new") {
-      const updated = await jobsApi.updateSearch(editing.id, input);
-      setSearches((all) => all?.map((s) => (s.id === updated.id ? updated : s)) ?? null);
-      await loadJobs();
-    } else {
-      const created = await jobsApi.createSearch(input);
-      setSearches((all) => [...(all ?? []), created]);
+      const newJobIds = (jobs ?? []).filter((j) => j.status === "new" && j.search_ids.includes(editing.id)).map((j) => j.id);
+      if (newJobIds.length > 0) {
+        setPendingEdit({ search: editing, input, newJobIds });
+        return;
+      }
+      await applyEdit(editing, input);
+      return;
     }
+    const created = await jobsApi.createSearch(input);
+    setSearches((all) => [...(all ?? []), created]);
     setEditing(null);
     setScan(await jobsApi.scanStatus());
+  }
+
+  async function applyEdit(search: JobSearch, input: SearchInput) {
+    const updated = await jobsApi.updateSearch(search.id, input);
+    setSearches((all) => all?.map((s) => (s.id === updated.id ? updated : s)) ?? null);
+    await loadJobs();
+    setEditing(null);
+    setScan(await jobsApi.scanStatus());
+  }
+
+  async function finishPendingEdit(saveJobs: boolean) {
+    if (!pendingEdit) return;
+    setApplyingEdit(saveJobs ? "save" : "discard");
+    try {
+      if (saveJobs) await jobsApi.setJobsStatus(pendingEdit.newJobIds, "saved");
+      await applyEdit(pendingEdit.search, pendingEdit.input);
+      setPendingEdit(null);
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setApplyingEdit(null);
+    }
   }
 
   async function removeSearch(search: JobSearch) {
@@ -235,6 +263,30 @@ export function JobsPage() {
             </div>
           )}
         </section>
+      )}
+      {pendingEdit && (
+        <Dialog
+          title="Start a new search?"
+          onClose={() => !applyingEdit && setPendingEdit(null)}
+          actions={
+            <>
+              <Button onClick={() => setPendingEdit(null)} disabled={applyingEdit !== null}>
+                Cancel
+              </Button>
+              <Button variant="danger" onClick={() => finishPendingEdit(false)} loading={applyingEdit === "discard"} disabled={applyingEdit !== null}>
+                Continue without saving
+              </Button>
+              <Button variant="primary" onClick={() => finishPendingEdit(true)} loading={applyingEdit === "save"} disabled={applyingEdit !== null}>
+                Save {plural(pendingEdit.newJobIds.length, "job")} and continue
+              </Button>
+            </>
+          }
+        >
+          <p>
+            “{pendingEdit.search.name}” has {plural(pendingEdit.newJobIds.length, "new job")}. Changing it starts a fresh search, and new jobs you haven't
+            saved will be removed. Saved and dismissed jobs are kept.
+          </p>
+        </Dialog>
       )}
     </>
   );

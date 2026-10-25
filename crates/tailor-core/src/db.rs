@@ -341,7 +341,8 @@ impl Db {
                 return Ok(None);
             }
             tx.execute(
-                "DELETE FROM search_matches WHERE search_id = ?1",
+                "DELETE FROM search_matches
+                 WHERE search_id = ?1 AND job_id IN (SELECT id FROM jobs WHERE status = 'new')",
                 params![id],
             )?;
             tx.commit()?;
@@ -888,6 +889,12 @@ mod tests {
             1
         );
 
+        store
+            .update_search(a.id, &criteria("Backend Engineer"))
+            .unwrap();
+        assert_eq!(store.list_jobs(None).unwrap()[0].search_ids, vec![a.id, b.id]);
+
+        store.set_job_status(id, JobStatus::New).unwrap();
         store
             .update_search(a.id, &criteria("Backend Engineer"))
             .unwrap();
