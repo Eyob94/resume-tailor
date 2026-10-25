@@ -65,6 +65,14 @@ jobs:
     runs-on: ubuntu-24.04
     environment: production
     steps:
+      - name: Check out server setup files
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            deploy
+            Caddyfile
+          sparse-checkout-cone-mode: false
+
       - name: Download release artifact
         uses: actions/download-artifact@v4
         with:
@@ -94,6 +102,21 @@ jobs:
             UserKnownHostsFile /dev/null
           EOF
           chmod 600 ~/.ssh/config
+
+      - name: Check passwordless sudo on VPS
+        run: |
+          ssh -4 resume-tailor-vps "sudo -n true" || {
+            echo "The deploy user needs passwordless sudo. On the VPS run: echo \"\$USER ALL=(ALL) NOPASSWD: ALL\" | sudo tee /etc/sudoers.d/resume-tailor-admin" >&2
+            exit 1
+          }
+
+      - name: Set up VPS
+        run: |
+          set -euo pipefail
+          setup_dir="/tmp/resume-tailor-setup-${GITHUB_SHA}"
+          ssh -4 resume-tailor-vps "rm -rf '$setup_dir' && mkdir -p '$setup_dir'"
+          scp -4 -r deploy Caddyfile "resume-tailor-vps:$setup_dir/"
+          ssh -4 resume-tailor-vps "sudo -n bash '$setup_dir/deploy/bootstrap.sh' \"\$USER\" && rm -rf '$setup_dir'"
 
       - name: Copy release to VPS
         run: scp -4 resume-tailor-release.tar.gz resume-tailor-vps:/tmp/resume-tailor-${GITHUB_SHA}.tar.gz
