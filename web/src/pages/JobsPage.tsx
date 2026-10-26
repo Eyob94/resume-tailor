@@ -14,6 +14,7 @@ import {
   Clock,
   ExternalLink,
   EyeOff,
+  Globe,
   Loader2,
   MapPin,
   Pencil,
@@ -667,6 +668,12 @@ function JobRow({
           <ExternalLink className="size-3.5" />
           LinkedIn
         </a>
+        {job.company_website && (
+          <a href={job.company_website} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-zinc-500 hover:text-zinc-900">
+            <Globe className="size-3.5" />
+            Company site
+          </a>
+        )}
         {devMode && (
           <button onClick={() => setShowJson(!showJson)} className="inline-flex items-center gap-1 text-zinc-500 hover:text-zinc-900">
             <Braces className="size-3.5" />

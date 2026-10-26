@@ -73,6 +73,12 @@ pub trait JobSource {
         &self,
         linkedin_id: &str,
     ) -> impl Future<Output = Result<Option<JobDetail>, LinkedInError>> + Send;
+    fn company_website(
+        &self,
+        _company_url: &str,
+    ) -> impl Future<Output = Result<Option<String>, LinkedInError>> + Send {
+        async { Ok(None) }
+    }
 }
 
 impl JobSource for LinkedInClient {
@@ -88,6 +94,13 @@ impl JobSource for LinkedInClient {
         linkedin_id: &str,
     ) -> impl Future<Output = Result<Option<JobDetail>, LinkedInError>> + Send {
         LinkedInClient::job_detail(self, linkedin_id)
+    }
+
+    fn company_website(
+        &self,
+        company_url: &str,
+    ) -> impl Future<Output = Result<Option<String>, LinkedInError>> + Send {
+        LinkedInClient::company_website(self, company_url)
     }
 }
 
@@ -296,6 +309,58 @@ async fn scrape_run<S: JobSource + Send + Sync + 'static>(
     )
     .await;
     let _ = matcher.send(MatchMessage::RunFinished { run_id, report });
+    let (flushed_tx, flushed_rx) = oneshot::channel();
+    if matcher.send(MatchMessage::Flush { reply: flushed_tx }).is_ok() {
+        let _ = flushed_rx.await;
+    }
+    fetch_company_sites(&db, source.as_ref(), &ScanLimits::default()).await;
+}
+
+const MAX_COMPANIES_PER_RUN: usize = 8;
+
+async fn fetch_company_sites<S: JobSource>(db: &Db, source: &S, limits: &ScanLimits) {
+    let db_for_list = db.clone();
+    let urls = match tokio::task::spawn_blocking(move || {
+        db_for_list.companies_missing_site(MAX_COMPANIES_PER_RUN)
+    })
+    .await
+    {
+        Ok(Ok(urls)) => urls,
+        Ok(Err(e)) => {
+            tracing::error!("couldn't list companies: {e}");
+            return;
+        }
+        Err(e) => {
+            tracing::error!("couldn't list companies: {e}");
+            return;
+        }
+    };
+    for url in urls {
+        pause(limits).await;
+        let website = match source.company_website(&url).await {
+            Ok(website) => website,
+            Err(LinkedInError::Blocked(status)) => {
+                tracing::warn!(status, "company pages refused, trying again next scan");
+                return;
+            }
+            Err(LinkedInError::Status(status)) => {
+                tracing::warn!(status, url, "company page unavailable");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(url, "company page failed: {e}");
+                continue;
+            }
+        };
+        let db = db.clone();
+        match tokio::task::spawn_blocking(move || db.save_company_site(&url, website.as_deref()))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!("couldn't save company site: {e}"),
+            Err(e) => tracing::error!("couldn't save company site: {e}"),
+        }
+    }
 }
 
 async fn scrape_searches<S: JobSource>(
@@ -601,6 +666,11 @@ impl LinkedInClient {
         }
     }
 
+    pub async fn company_website(&self, company_url: &str) -> Result<Option<String>, LinkedInError> {
+        let html = self.get("company", company_url, &[], None).await?;
+        Ok(parse_company_website(&html))
+    }
+
     async fn get(
         &self,
         kind: &str,
@@ -697,6 +767,24 @@ fn parse_card(card: ElementRef) -> Option<JobCard> {
         posted_on,
         url,
     })
+}
+
+pub fn parse_company_website(html: &str) -> Option<String> {
+    let doc = Html::parse_document(html);
+    let href = doc
+        .select(&selector(r#"[data-test-id="about-us__website"] a[href]"#))
+        .next()?
+        .value()
+        .attr("href")?;
+    let mut url = reqwest::Url::parse(href.trim()).ok()?;
+    if url.path().starts_with("/redir/redirect") {
+        let target = url
+            .query_pairs()
+            .find(|(key, _)| key == "url")
+            .map(|(_, value)| value.into_owned())?;
+        url = reqwest::Url::parse(target.trim()).ok()?;
+    }
+    matches!(url.scheme(), "http" | "https").then(|| url.to_string())
 }
 
 pub fn parse_job_detail(html: &str) -> Option<JobDetail> {
@@ -1172,5 +1260,23 @@ mod linkedin_tests {
     #[test]
     fn detail_without_description_is_none() {
         assert!(parse_job_detail("<html><body>Sign in</body></html>").is_none());
+    }
+
+    #[test]
+    fn company_website_is_unwrapped_from_redirect() {
+        let html = r#"<dl><div data-test-id="about-us__website"><dt>Website</dt><dd>
+            <a class="link-no-visited-state" href="https://www.linkedin.com/redir/redirect?url=https%3A%2F%2Fcmhs%2Euaeu%2Eac%2Eae%2Fen%2Fdepartments%2Ffmd%2F&amp;urlhash=3-Nx&amp;trk=about_website">cmhs.uaeu.ac.ae</a>
+        </dd></div></dl>"#;
+        assert_eq!(
+            parse_company_website(html).as_deref(),
+            Some("https://cmhs.uaeu.ac.ae/en/departments/fmd/")
+        );
+    }
+
+    #[test]
+    fn company_website_rejects_missing_or_unsafe_links() {
+        assert!(parse_company_website("<html><body>Sign in</body></html>").is_none());
+        let html = r#"<div data-test-id="about-us__website"><a href="javascript:alert(1)">x</a></div>"#;
+        assert!(parse_company_website(html).is_none());
     }
 }

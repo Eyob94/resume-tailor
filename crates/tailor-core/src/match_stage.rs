@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use tokio::{
-    sync::mpsc::{UnboundedReceiver, UnboundedSender},
+    sync::{
+        mpsc::{UnboundedReceiver, UnboundedSender},
+        oneshot,
+    },
     task::JoinHandle,
 };
 
@@ -21,6 +24,9 @@ pub enum MatchMessage {
     RunFinished {
         run_id: i64,
         report: ScanReport,
+    },
+    Flush {
+        reply: oneshot::Sender<()>,
     },
 }
 
@@ -69,6 +75,9 @@ async fn run(db: Arc<Db>, mut rx: UnboundedReceiver<MatchMessage>, scorer: Unbou
                 }
                 finish_run(&db, run_id, &report).await;
                 new_matches = 0;
+            }
+            MatchMessage::Flush { reply } => {
+                let _ = reply.send(());
             }
         }
     }
