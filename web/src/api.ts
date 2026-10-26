@@ -100,6 +100,25 @@ export interface JobListing {
   tailored_at: string | null;
   search_ids: number[];
   matched_keywords: string[];
+  score: JobScore | null;
+}
+
+export interface Requirement {
+  text: string;
+  importance: "must" | "nice";
+  verdict: "met" | "partial" | "missing";
+  evidence: string | null;
+}
+
+export interface JobScore {
+  status: "scoring" | "ready" | "failed" | "skipped";
+  score: number | null;
+  summary: string | null;
+  requirements: Requirement[];
+  model: string;
+  error: string | null;
+  profile_id: number;
+  updated_at: string;
 }
 
 export interface ScanRun {
@@ -137,6 +156,8 @@ export const jobsApi = {
   setJobStatus: (id: number, status: JobStatus) => request<void>(`/jobs/${id}`, { method: "PATCH", ...json({ status }) }),
   setJobsStatus: (ids: number[], status: JobStatus) =>
     request<{ updated: number }>("/jobs/status", { method: "POST", ...json({ ids, status }) }),
+  rescore: (id: number) => request<void>(`/jobs/${id}/score`, { method: "POST" }),
+  skipScore: (id: number) => request<void>(`/jobs/${id}/score`, { method: "DELETE" }),
   scanStatus: () => request<ScanStatus>("/scan"),
   runScan: () => request<void>("/scan/run", { method: "POST" }),
   getSettings: () => request<Settings>("/settings"),

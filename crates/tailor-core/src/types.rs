@@ -332,6 +332,50 @@ pub struct JobListing {
     pub tailored_at: Option<String>,
     pub search_ids: Vec<i64>,
     pub matched_keywords: Vec<String>,
+    pub score: Option<JobScore>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Importance {
+    Must,
+    Nice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Verdict {
+    Met,
+    Partial,
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Requirement {
+    pub text: String,
+    pub importance: Importance,
+    pub verdict: Verdict,
+    pub evidence: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JobScore {
+    pub status: String,
+    pub score: Option<u8>,
+    pub summary: Option<String>,
+    pub requirements: Vec<Requirement>,
+    pub model: String,
+    pub error: Option<String>,
+    pub profile_id: i64,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct JobToScore {
+    pub job_id: i64,
+    pub title: String,
+    pub company: String,
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -106,7 +106,7 @@ async fn run(db: Arc<Db>, default_ollama_url: String, mut rx: UnboundedReceiver<
     }
 }
 
-fn configured_ollama_url(db: &Db, default_url: &str) -> String {
+pub fn configured_ollama_url(db: &Db, default_url: &str) -> String {
     db.get_setting(OLLAMA_URL_KEY)
         .ok()
         .flatten()

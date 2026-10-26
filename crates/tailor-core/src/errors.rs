@@ -87,3 +87,17 @@ pub(crate) enum ScanError {
     #[error(transparent)]
     Db(#[from] DbError),
 }
+
+#[derive(Debug, Error)]
+pub enum ScoreError {
+    #[error("Job not found.")]
+    NotFound,
+    #[error("Save the job first to score it.")]
+    NotSaved,
+    #[error("Confirm your resume first, so there's something to compare against.")]
+    NoProfile,
+    #[error("This job is already being scored.")]
+    AlreadyScoring,
+    #[error(transparent)]
+    Db(#[from] DbError),
+}
