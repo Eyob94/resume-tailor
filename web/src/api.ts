@@ -87,6 +87,7 @@ export interface JobListing {
   title: string;
   company: string;
   company_url: string | null;
+  company_website: string | null;
   location: string;
   posted_on: string | null;
   url: string;

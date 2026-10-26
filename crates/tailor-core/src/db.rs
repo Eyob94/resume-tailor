@@ -109,6 +109,11 @@ const MIGRATIONS: &[&str] = &[
         error        TEXT,
         updated_at   TEXT NOT NULL
     );",
+    "CREATE TABLE companies (
+        url        TEXT PRIMARY KEY,
+        website    TEXT,
+        fetched_at TEXT NOT NULL
+    );",
 ];
 
 #[cfg(test)]
@@ -483,6 +488,33 @@ impl Db {
             .filter(|record| record.status == "confirmed" && record.profile.is_some()))
     }
 
+    pub fn companies_missing_site(&self, limit: usize) -> Result<Vec<String>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT j.company_url
+             FROM jobs j JOIN search_matches m ON m.job_id = j.id
+             LEFT JOIN companies c ON c.url = j.company_url
+             WHERE j.company_url IS NOT NULL AND c.url IS NULL
+             GROUP BY j.company_url
+             ORDER BY MAX(j.status = 'saved') DESC, MAX(j.first_seen_at) DESC
+             LIMIT ?1",
+        )?;
+        let urls = stmt
+            .query_map(params![limit as i64], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(urls)
+    }
+
+    pub fn save_company_site(&self, url: &str, website: Option<&str>) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO companies (url, website, fetched_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(url) DO UPDATE SET website = excluded.website, fetched_at = excluded.fetched_at",
+            params![url, website, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     pub fn next_job_to_score(&self, profile_id: i64) -> Result<Option<JobToScore>, DbError> {
         let conn = self.conn.lock().unwrap();
         let job = conn
@@ -609,9 +641,11 @@ impl Db {
         "SELECT j.id, j.linkedin_id, j.title, j.company, j.company_url, j.location, j.posted_on, j.url,
                 j.description, j.seniority, j.employment_type, j.industries, j.work_mode, j.status,
                 j.first_seen_at, m.search_id, m.matched_keywords, j.tailored_at,
-                s.status, s.score, s.summary, s.requirements, s.model, s.error, s.profile_id, s.updated_at
+                s.status, s.score, s.summary, s.requirements, s.model, s.error, s.profile_id, s.updated_at,
+                c.website
          FROM jobs j JOIN search_matches m ON m.job_id = j.id
          LEFT JOIN job_scores s ON s.job_id = j.id
+         LEFT JOIN companies c ON c.url = j.company_url
          WHERE ?1 IS NULL OR j.status = ?1
          ORDER BY COALESCE(j.posted_on, '') DESC, j.first_seen_at DESC, j.id DESC, m.search_id",
     )?;
@@ -622,6 +656,7 @@ impl Db {
                 title: row.get(2)?,
                 company: row.get(3)?,
                 company_url: row.get(4)?,
+                company_website: row.get(26)?,
                 location: row.get(5)?,
                 posted_on: row.get(6)?,
                 url: row.get(7)?,
@@ -1237,6 +1272,25 @@ mod tests {
         store.mark_interrupted_profiles().unwrap();
         let record = store.latest_profile("t1").unwrap().unwrap();
         assert_eq!((record.id, record.status.as_str()), (other, "failed"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn company_sites_are_fetched_once_and_listed() {
+        let (store, dir) = temp_store();
+        let company = "https://ae.linkedin.com/company/acme";
+        let mut with_company = card("1");
+        with_company.company_url = Some(company.into());
+        let job = store.upsert_job(&with_company, None, None).unwrap();
+        store.upsert_job(&card("2"), None, None).unwrap();
+        let search = store.create_search(&criteria("Backend Engineer")).unwrap();
+        store.add_match(search.id, job, &[]).unwrap();
+
+        assert_eq!(store.companies_missing_site(8).unwrap(), vec![company.to_string()]);
+        store.save_company_site(company, Some("https://acme.com/")).unwrap();
+        assert!(store.companies_missing_site(8).unwrap().is_empty());
+        let listed = store.list_jobs(None).unwrap();
+        assert_eq!(listed[0].company_website.as_deref(), Some("https://acme.com/"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

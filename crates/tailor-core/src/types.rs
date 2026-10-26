@@ -319,6 +319,7 @@ pub struct JobListing {
     pub title: String,
     pub company: String,
     pub company_url: Option<String>,
+    pub company_website: Option<String>,
     pub location: String,
     pub posted_on: Option<String>,
     pub url: String,
