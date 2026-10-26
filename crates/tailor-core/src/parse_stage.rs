@@ -258,7 +258,8 @@ pub struct Ollama {
 impl Ollama {
     pub fn new(base_url: &str, model: &str) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(600))
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(300))
             .build()
             .expect("static client config is valid");
         Self {
@@ -290,7 +291,7 @@ impl JsonModel for Ollama {
     ) -> Result<Value, AiError> {
         let body = json!({
             "model": self.model,
-            "stream": false,
+            "stream": true,
             "format": schema,
             "options": {
                 "temperature": 0,
@@ -310,20 +311,48 @@ impl JsonModel for Ollama {
             .map_err(|e| self.map_send_error(e))?;
 
         let status = res.status().as_u16();
-        let text = res.text().await.map_err(|e| self.map_send_error(e))?;
-        if status == 404 && text.contains("not found") {
-            return Err(AiError::ModelMissing(self.model.clone()));
-        }
         if !(200..300).contains(&status) {
+            let text = res.text().await.map_err(|e| self.map_send_error(e))?;
+            if status == 404 && text.contains("not found") {
+                return Err(AiError::ModelMissing(self.model.clone()));
+            }
             return Err(AiError::Status(status, text.chars().take(300).collect()));
         }
 
-        let reply: Value =
-            serde_json::from_str(&text).map_err(|e| AiError::BadOutput(e.to_string()))?;
-        let content = reply["message"]["content"]
-            .as_str()
-            .ok_or_else(|| AiError::BadOutput("no message content".into()))?;
-        serde_json::from_str(content).map_err(|e| AiError::BadOutput(e.to_string()))
+        let mut res = res;
+        let mut pending: Vec<u8> = Vec::new();
+        let mut content = String::new();
+        while let Some(chunk) = res.chunk().await.map_err(|e| self.map_send_error(e))? {
+            pending.extend_from_slice(&chunk);
+            while let Some(end) = pending.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = pending.drain(..=end).collect();
+                self.read_stream_line(&line, &mut content)?;
+            }
+        }
+        self.read_stream_line(&pending, &mut content)?;
+        serde_json::from_str(&content).map_err(|e| AiError::BadOutput(e.to_string()))
+    }
+}
+
+impl Ollama {
+    fn read_stream_line(&self, line: &[u8], content: &mut String) -> Result<(), AiError> {
+        let line = String::from_utf8_lossy(line);
+        let line = line.trim();
+        if line.is_empty() {
+            return Ok(());
+        }
+        let part: Value =
+            serde_json::from_str(line).map_err(|e| AiError::BadOutput(e.to_string()))?;
+        if let Some(error) = part["error"].as_str() {
+            if error.contains("not found") {
+                return Err(AiError::ModelMissing(self.model.clone()));
+            }
+            return Err(AiError::Status(200, error.chars().take(300).collect()));
+        }
+        if let Some(text) = part["message"]["content"].as_str() {
+            content.push_str(text);
+        }
+        Ok(())
     }
 }
 
