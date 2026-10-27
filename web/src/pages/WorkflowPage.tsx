@@ -118,13 +118,13 @@ export function WorkflowPage() {
       <section aria-label={`${name} workflow`} className="mb-5">
         <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500">{name}</h2>
         <div className="overflow-x-auto pb-1">
-          <div className="flex min-w-0 flex-col gap-2 md:min-w-max md:flex-row md:items-stretch">
+          <div className="flex min-w-0 flex-col gap-2 md:min-w-max md:flex-row md:items-stretch md:gap-0">
           {laneSteps.map((step, index) => {
             const stepConfig = aiFor[step.id] ? configs.find((item) => item.step === aiFor[step.id]) : undefined;
             const selectedStyle = selected === step.id ? "ring-2 ring-zinc-900" : "";
             const style = step.kind === "ai" ? "border-violet-200 bg-violet-50" : step.kind === "planned" ? "border-dashed border-zinc-300 opacity-50" : "border-zinc-200 bg-white";
             return (
-              <div key={step.id} className="flex flex-col gap-2 md:flex-row md:items-center md:gap-2">
+              <div key={step.id} className="flex flex-col gap-2 md:flex-row md:items-center md:gap-1">
                 {index > 0 && <ChevronDown className="mx-auto size-4 text-zinc-400 md:hidden" />}
                 {index > 0 && <ChevronRight className="hidden size-4 shrink-0 text-zinc-400 md:block" />}
                 <button
@@ -132,14 +132,12 @@ export function WorkflowPage() {
                   aria-disabled={step.kind === "planned" ? "true" : undefined}
                   disabled={step.kind === "planned"}
                   onClick={() => requestSelect(step.id)}
-                  className={`min-w-0 flex-1 rounded-xl border p-3 text-left ${style} ${selectedStyle} ${step.kind === "planned" ? "cursor-not-allowed" : "transition-shadow hover:shadow-sm"} md:w-36 md:flex-none`}
+                  className={`min-w-0 flex-1 rounded-xl border p-3 text-left ${style} ${selectedStyle} ${step.kind === "planned" ? "cursor-not-allowed" : "transition-shadow hover:shadow-sm"} md:w-[104px] md:flex-none`}
                 >
                   <span className="flex items-center justify-between gap-2">
-                    <span className="truncate text-sm font-medium text-zinc-900">{step.title}</span>
-                    {step.kind === "ai" && <span className="rounded-full bg-violet-100 px-2 py-0.5 text-[10px] font-semibold text-violet-800">AI</span>}
-                    {step.kind === "planned" && <span className="shrink-0 rounded-full bg-zinc-100 px-2 py-0.5 text-[10px] text-zinc-500">Not built yet</span>}
+                    <span className="truncate text-xs font-medium text-zinc-900 md:text-[11px]">{step.title}</span>
                   </span>
-                  <span className="mt-1 block truncate text-xs text-zinc-500">{step.subtitle}</span>
+                  <span className="mt-1 block truncate text-xs text-zinc-500">{step.kind === "ai" ? <span className="rounded-full bg-violet-100 px-2 py-0.5 text-[10px] font-semibold text-violet-800">{step.subtitle}</span> : step.kind === "planned" ? <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-[10px] text-zinc-500">{step.subtitle}</span> : step.subtitle}</span>
                   {stepConfig && <span className="mt-2 block truncate text-xs font-medium text-violet-800">{stepConfig.model}</span>}
                   {step.id === "score_jobs" && <span className="mt-2 inline-block rounded bg-white/80 px-2 py-1 text-[10px] text-zinc-600">Uses: Read resume</span>}
                   {step.id === "tailor_resume" && <span className="mt-2 inline-block rounded bg-white/80 px-2 py-1 text-[10px] text-zinc-600">Uses: Brain</span>}
