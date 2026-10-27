@@ -36,6 +36,7 @@ import {
   type JobStatus,
   type ScanStatus,
   type SearchInput,
+  type Site,
 } from "../api";
 import { Dialog } from "../components/Dialog";
 import { JsonView } from "../components/JsonView";
@@ -51,6 +52,7 @@ const FILTERS: [Filter, string][] = [
   ["dismissed", "Dismissed"],
   ["all", "All"],
 ];
+const SITE_LABELS: Record<Site, string> = { linkedin: "LinkedIn", indeed: "Indeed" };
 const POSTED_SHORT = { day: "24 h", week: "week", month: "month" } as const;
 
 export function JobsPage() {
@@ -221,7 +223,7 @@ export function JobsPage() {
     <>
       <PageHeader
         title="Jobs"
-        description="LinkedIn jobs matching your preferences."
+        description="LinkedIn and Indeed jobs matching your preferences."
         actions={
           searches?.length && !editing ? (
             <Button variant="primary" icon={Plus} onClick={() => setEditing("new")}>
@@ -253,7 +255,7 @@ export function JobsPage() {
                 </Button>
               }
             >
-              Add the titles, keywords, location and work mode you want LinkedIn to check on a schedule.
+              Add the titles, keywords, location and work mode you want LinkedIn and Indeed checked on a schedule.
             </EmptyState>
           ) : (
             <>
@@ -383,7 +385,7 @@ function ScanBar({ scan, onChange, onError }: { scan: ScanStatus; onChange: (s: 
         <div className="min-w-0 text-sm">
           <p className="font-medium">
             {scan.running
-              ? "Scanning LinkedIn…"
+              ? "Scanning LinkedIn and Indeed…"
               : last
                 ? `Last scan ${relativeTime(last.started_at)} · ${plural(last.new_matches, "new match", "new matches")}`
                 : "No scans yet"}
@@ -611,6 +613,7 @@ function JobRow({
               {job.location}
             </span>
             {job.posted_on && <span>Posted {postedLabel(job.posted_on)}</span>}
+            <span className="rounded-md bg-zinc-100 px-1.5 py-0.5 font-medium text-zinc-600">{SITE_LABELS[job.source]}</span>
             <span
               className={`rounded-md px-1.5 py-0.5 font-medium ${job.work_mode ? "bg-sky-50 text-sky-700" : "bg-zinc-100 text-zinc-500"}`}
               title={job.work_mode ? "Read from the posting text" : "The posting doesn't say"}
@@ -666,7 +669,7 @@ function JobRow({
         </button>
         <a href={job.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-zinc-500 hover:text-zinc-900">
           <ExternalLink className="size-3.5" />
-          LinkedIn
+          {SITE_LABELS[job.source]}
         </a>
         {job.company_website && (
           <a href={job.company_website} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-zinc-500 hover:text-zinc-900">
@@ -713,7 +716,7 @@ function JobRow({
       )}
       {devMode && showJson && (
         <div className="border-t border-zinc-100">
-          <JsonView value={job} fileName={`job-${job.linkedin_id}.json`} note="Stored job record" />
+          <JsonView value={job} fileName={`job-${job.source_id}.json`} note="Stored job record" />
         </div>
       )}
     </Card>

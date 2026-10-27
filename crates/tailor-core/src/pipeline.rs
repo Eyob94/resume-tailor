@@ -8,7 +8,7 @@ use crate::{
     parse_stage::{ParseMessage, ParseStage},
     resume_stage::{ResumeMessage, ResumeStage},
     score_stage::{ScoreMessage, ScoreStage},
-    scrape_stage::{LinkedInClient, ScrapeMessage, ScrapeStage},
+    scrape_stage::{IndeedClient, LinkedInClient, ScrapeMessage, ScrapeStage},
 };
 
 pub struct PipelineConfig {
@@ -38,6 +38,7 @@ impl Pipeline {
         config: PipelineConfig,
     ) -> Result<(Self, PipelineSenders), reqwest::Error> {
         let client = LinkedInClient::new()?;
+        let indeed = IndeedClient::new()?;
         let (match_tx, match_rx) = tokio::sync::mpsc::unbounded_channel::<MatchMessage>();
         let (scrape_tx, scrape_rx) = tokio::sync::mpsc::unbounded_channel::<ScrapeMessage>();
         let (parse_tx, parse_rx) = tokio::sync::mpsc::unbounded_channel::<ParseMessage>();
@@ -49,6 +50,7 @@ impl Pipeline {
         let scrape_stage = ScrapeStage::new(
             db.clone(),
             client,
+            indeed,
             config.scan_cooldown_seconds,
             scrape_rx,
             match_tx,
