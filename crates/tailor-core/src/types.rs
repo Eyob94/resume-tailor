@@ -146,6 +146,56 @@ impl Site {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiStep {
+    ReadResume,
+    ScoreJobs,
+}
+
+impl AiStep {
+    pub const ALL: [Self; 2] = [Self::ReadResume, Self::ScoreJobs];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadResume => "read_resume",
+            Self::ScoreJobs => "score_jobs",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "read_resume" => Some(Self::ReadResume),
+            "score_jobs" => Some(Self::ScoreJobs),
+            _ => None,
+        }
+    }
+
+    pub fn model_key(self) -> &'static str {
+        match self {
+            Self::ReadResume => "ai.read_resume.model",
+            Self::ScoreJobs => "ai.score_jobs.model",
+        }
+    }
+
+    pub fn prompt_key(self) -> &'static str {
+        match self {
+            Self::ReadResume => "ai.read_resume.prompt",
+            Self::ScoreJobs => "ai.score_jobs.prompt",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AiStepConfig {
+    pub step: AiStep,
+    pub model: String,
+    pub prompt: String,
+    pub default_prompt: String,
+    pub prompt_is_default: bool,
+    pub input_template: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PostedWithin {

@@ -13,8 +13,11 @@ use tokio::{
 use crate::{
     db::Db,
     errors::{AiError, ScoreError},
-    parse_stage::{configured_ollama_url, JsonModel, Ollama, DEFAULT_MODEL, MODEL_KEY},
-    types::{Importance, JobStatus, JobToScore, ProfileRecord, Requirement, ResumeProfile, Verdict},
+    parse_stage::{ai_step_config, configured_ollama_url, JsonModel, Ollama},
+    types::{
+        AiStep, Importance, JobStatus, JobToScore, ProfileRecord, Requirement, ResumeProfile,
+        Verdict,
+    },
 };
 
 pub enum ScoreMessage {
@@ -34,7 +37,11 @@ pub struct ScoreStage {
 }
 
 impl ScoreStage {
-    pub fn new(db: Arc<Db>, default_ollama_url: String, rx: UnboundedReceiver<ScoreMessage>) -> Self {
+    pub fn new(
+        db: Arc<Db>,
+        default_ollama_url: String,
+        rx: UnboundedReceiver<ScoreMessage>,
+    ) -> Self {
         let handle = tokio::spawn(run(db, default_ollama_url, rx));
         Self { handle }
     }
@@ -88,7 +95,12 @@ async fn run(db: Arc<Db>, default_ollama_url: String, mut rx: UnboundedReceiver<
 }
 
 fn next_job(db: &Db) -> Result<Option<(i64, ResumeProfile, JobToScore)>, ScoreError> {
-    let Some(ProfileRecord { id, profile: Some(profile), .. }) = db.current_confirmed_profile()? else {
+    let Some(ProfileRecord {
+        id,
+        profile: Some(profile),
+        ..
+    }) = db.current_confirmed_profile()?
+    else {
         return Ok(None);
     };
     Ok(db.next_job_to_score(id)?.map(|job| (id, profile, job)))
@@ -130,17 +142,25 @@ fn spawn_scoring(
     done: UnboundedSender<()>,
 ) {
     tokio::spawn(async move {
-        let model_name = db
-            .get_setting(MODEL_KEY)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| DEFAULT_MODEL.into());
-        let model = Ollama::new(&ollama_url, &model_name);
+        let config = match ai_step_config(&db, AiStep::ScoreJobs) {
+            Ok(config) => config,
+            Err(e) => {
+                tracing::error!(job_id = job.job_id, "couldn't load scoring settings: {e}");
+                let _ = done.send(());
+                return;
+            }
+        };
+        let model = Ollama::new(&ollama_url, &config.model);
         let outcome = match db.start_score(job.job_id, profile_id, &model.label()) {
             Ok(()) => {
                 tracing::info!(job_id = job.job_id, model = %model.label(), "scoring job");
-                match score_job(&model, &profile, &job).await {
-                    Ok(scored) => db.finish_score(job.job_id, scored.score, &scored.summary, &scored.requirements),
+                match score_job(&model, &config.prompt, &profile, &job).await {
+                    Ok(scored) => db.finish_score(
+                        job.job_id,
+                        scored.score,
+                        &scored.summary,
+                        &scored.requirements,
+                    ),
                     Err(e) => {
                         tracing::warn!(job_id = job.job_id, "scoring failed: {e}");
                         db.fail_score(job.job_id, &e.to_string())
@@ -156,7 +176,7 @@ fn spawn_scoring(
     });
 }
 
-const SYSTEM_PROMPT: &str = "You check how well a candidate's resume fits a job. \
+pub const DEFAULT_PROMPT: &str = "You check how well a candidate's resume fits a job. \
 Step 1: read only the JOB DESCRIPTION and list every requirement it asks for: skills, technologies, years of experience, education, languages and other qualifications. \
 Include every item from its requirements, qualifications and nice-to-have lists. \
 requirement: a short phrase taken from the job description, for example \"Kafka or other event streaming\". Never put resume text in requirement. \
@@ -206,7 +226,12 @@ struct RawRequirement {
 
 impl From<RawRequirement> for Requirement {
     fn from(raw: RawRequirement) -> Self {
-        Self { text: raw.requirement, importance: raw.importance, verdict: raw.verdict, evidence: raw.evidence }
+        Self {
+            text: raw.requirement,
+            importance: raw.importance,
+            verdict: raw.verdict,
+            evidence: raw.evidence,
+        }
     }
 }
 
@@ -222,7 +247,11 @@ pub fn resume_text(profile: &ResumeProfile) -> String {
     lines.extend(profile.headline.clone());
     lines.extend(profile.summary.clone());
     for job in &profile.experience {
-        let dates = [job.start.as_deref(), job.end.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(" - ");
+        let dates = [job.start.as_deref(), job.end.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" - ");
         lines.push(format!("{} at {} ({dates})", job.title, job.company));
         lines.extend(job.bullets.iter().map(|b| format!("- {}", b.text)));
     }
@@ -232,7 +261,11 @@ pub fn resume_text(profile: &ResumeProfile) -> String {
         lines.extend(project.bullets.iter().map(|b| format!("- {}", b.text)));
     }
     for school in &profile.education {
-        let degree = [school.degree.as_deref(), school.field.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(", ");
+        let degree = [school.degree.as_deref(), school.field.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(", ");
         lines.push(format!("Education: {degree} at {}", school.school));
     }
     if !profile.skills.is_empty() {
@@ -261,7 +294,10 @@ pub fn resume_text(profile: &ResumeProfile) -> String {
 }
 
 fn normalize(s: &str) -> String {
-    s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn words(s: &str) -> Vec<String> {
@@ -281,13 +317,20 @@ pub fn grounded_in(requirement: &str, job_description: &str) -> bool {
     found * 2 >= wanted.len()
 }
 
-pub fn tidy_requirements(raw: Vec<Requirement>, resume: &str, job_description: &str) -> Vec<Requirement> {
+pub fn tidy_requirements(
+    raw: Vec<Requirement>,
+    resume: &str,
+    job_description: &str,
+) -> Vec<Requirement> {
     let resume = normalize(resume);
     let mut seen = HashSet::new();
     raw.into_iter()
         .filter_map(|mut req| {
             req.text = req.text.split_whitespace().collect::<Vec<_>>().join(" ");
-            if req.text.is_empty() || !seen.insert(req.text.to_lowercase()) || !grounded_in(&req.text, job_description) {
+            if req.text.is_empty()
+                || !seen.insert(req.text.to_lowercase())
+                || !grounded_in(&req.text, job_description)
+            {
                 return None;
             }
             req.evidence = req
@@ -325,7 +368,12 @@ pub fn score(requirements: &[Requirement]) -> u8 {
     (earned / total * 100.0).round() as u8
 }
 
-pub async fn score_job<M: JsonModel>(model: &M, profile: &ResumeProfile, job: &JobToScore) -> Result<ScoredJob, AiError> {
+pub async fn score_job<M: JsonModel>(
+    model: &M,
+    prompt: &str,
+    profile: &ResumeProfile,
+    job: &JobToScore,
+) -> Result<ScoredJob, AiError> {
     let resume = resume_text(profile);
     let user = format!(
         "Job: {} at {}\n\nJob description:\n<<<\n{}\n>>>\n\nResume:\n<<<\n{resume}\n>>>",
@@ -334,7 +382,7 @@ pub async fn score_job<M: JsonModel>(model: &M, profile: &ResumeProfile, job: &J
     let schema = schema();
     let mut last_error = None;
     for _ in 0..2 {
-        let value = match model.generate_json(SYSTEM_PROMPT, &user, &schema).await {
+        let value = match model.generate_json(prompt, &user, &schema).await {
             Ok(value) => value,
             Err(AiError::BadOutput(e)) => {
                 last_error = Some(AiError::BadOutput(e));
@@ -344,7 +392,11 @@ pub async fn score_job<M: JsonModel>(model: &M, profile: &ResumeProfile, job: &J
         };
         match serde_json::from_value::<RawScore>(value) {
             Ok(raw) => {
-                let raw_requirements = raw.requirements.into_iter().map(Requirement::from).collect();
+                let raw_requirements = raw
+                    .requirements
+                    .into_iter()
+                    .map(Requirement::from)
+                    .collect();
                 let requirements = tidy_requirements(raw_requirements, &resume, &job.description);
                 if requirements.is_empty() {
                     last_error = Some(AiError::BadOutput("no requirements found".into()));
@@ -385,35 +437,64 @@ mod tests {
 
     fn profile() -> ResumeProfile {
         ResumeProfile {
-            contact: Contact { name: "Jordan Rivera".into(), ..Default::default() },
+            contact: Contact {
+                name: "Jordan Rivera".into(),
+                ..Default::default()
+            },
             experience: vec![Experience {
                 id: "e1".into(),
                 company: "Acme".into(),
                 title: "Senior Engineer".into(),
                 start: Some("2021".into()),
                 end: Some("Present".into()),
-                bullets: vec![Bullet { id: "e1.b1".into(), text: "Led migration of billing services to Rust".into() }],
+                bullets: vec![Bullet {
+                    id: "e1.b1".into(),
+                    text: "Led migration of billing services to Rust".into(),
+                }],
                 ..Default::default()
             }],
-            skills: vec![Skill { name: "Rust".into(), years: Some(5.0), used_at: vec![] }],
+            skills: vec![Skill {
+                name: "Rust".into(),
+                years: Some(5.0),
+                used_at: vec![],
+            }],
             ..Default::default()
         }
     }
 
     fn job() -> JobToScore {
-        JobToScore { job_id: 1, title: "Rust Engineer".into(), company: "Globex".into(), description: "Rust, Kafka".into() }
+        JobToScore {
+            job_id: 1,
+            title: "Rust Engineer".into(),
+            company: "Globex".into(),
+            description: "Rust, Kafka".into(),
+        }
     }
 
     #[test]
     fn requirements_must_come_from_the_job_description() {
-        let description = "5+ years of backend experience. Kafka or other event streaming platforms. C++ and C#.";
+        let description =
+            "5+ years of backend experience. Kafka or other event streaming platforms. C++ and C#.";
         assert!(grounded_in("Kafka or event streaming", description));
         assert!(grounded_in("C++", description));
-        assert!(!grounded_in("Led migration of billing services to Rust", description));
+        assert!(!grounded_in(
+            "Led migration of billing services to Rust",
+            description
+        ));
     }
 
-    fn req(text: &str, importance: Importance, verdict: Verdict, evidence: Option<&str>) -> Requirement {
-        Requirement { text: text.into(), importance, verdict, evidence: evidence.map(str::to_string) }
+    fn req(
+        text: &str,
+        importance: Importance,
+        verdict: Verdict,
+        evidence: Option<&str>,
+    ) -> Requirement {
+        Requirement {
+            text: text.into(),
+            importance,
+            verdict,
+            evidence: evidence.map(str::to_string),
+        }
     }
 
     #[test]
@@ -433,12 +514,27 @@ mod tests {
         let description = "Rust, Kubernetes, Kafka and rust";
         let tidied = tidy_requirements(
             vec![
-                req("Rust", Importance::Must, Verdict::Met, Some("Led migration of billing services\nto Rust")),
-                req("Kubernetes", Importance::Must, Verdict::Met, Some("Ran Kubernetes clusters")),
+                req(
+                    "Rust",
+                    Importance::Must,
+                    Verdict::Met,
+                    Some("Led migration of billing services\nto Rust"),
+                ),
+                req(
+                    "Kubernetes",
+                    Importance::Must,
+                    Verdict::Met,
+                    Some("Ran Kubernetes clusters"),
+                ),
                 req("rust", Importance::Nice, Verdict::Met, None),
                 req("Kafka", Importance::Must, Verdict::Missing, Some("Rust")),
                 req("  ", Importance::Must, Verdict::Met, None),
-                req("Led migration of billing services", Importance::Must, Verdict::Met, None),
+                req(
+                    "Led migration of billing services",
+                    Importance::Must,
+                    Verdict::Met,
+                    None,
+                ),
             ],
             &resume,
             description,
@@ -446,7 +542,12 @@ mod tests {
         assert_eq!(
             tidied,
             vec![
-                req("Rust", Importance::Must, Verdict::Met, Some("Led migration of billing services to Rust")),
+                req(
+                    "Rust",
+                    Importance::Must,
+                    Verdict::Met,
+                    Some("Led migration of billing services to Rust")
+                ),
                 req("Kubernetes", Importance::Must, Verdict::Partial, None),
                 req("Kafka", Importance::Must, Verdict::Missing, None),
             ]
@@ -470,8 +571,12 @@ mod tests {
                 { "requirement": "Kafka", "importance": "must", "verdict": "missing", "evidence": null }
             ]
         });
-        let model = FakeModel { answers: Mutex::new(vec![Err(AiError::BadOutput("cut off".into())), Ok(answer)]) };
-        let scored = score_job(&model, &profile(), &job()).await.unwrap();
+        let model = FakeModel {
+            answers: Mutex::new(vec![Err(AiError::BadOutput("cut off".into())), Ok(answer)]),
+        };
+        let scored = score_job(&model, DEFAULT_PROMPT, &profile(), &job())
+            .await
+            .unwrap();
         assert_eq!(scored.score, 50);
         assert_eq!(scored.summary, "Strong Rust background. Missing Kafka.");
         assert_eq!(scored.requirements.len(), 2);
@@ -480,7 +585,12 @@ mod tests {
     #[tokio::test]
     async fn empty_requirements_fail() {
         let empty = json!({ "summary": "x", "requirements": [] });
-        let model = FakeModel { answers: Mutex::new(vec![Ok(empty.clone()), Ok(empty)]) };
-        assert!(matches!(score_job(&model, &profile(), &job()).await, Err(AiError::BadOutput(_))));
+        let model = FakeModel {
+            answers: Mutex::new(vec![Ok(empty.clone()), Ok(empty)]),
+        };
+        assert!(matches!(
+            score_job(&model, DEFAULT_PROMPT, &profile(), &job()).await,
+            Err(AiError::BadOutput(_))
+        ));
     }
 }

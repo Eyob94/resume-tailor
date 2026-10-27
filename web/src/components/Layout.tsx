@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
-import { FileText, Search, Settings, type LucideIcon } from "lucide-react";
+import { FileText, Search, Settings, Workflow, type LucideIcon } from "lucide-react";
 import { api } from "../api";
 
 const nav: { to: string; label: string; shortLabel: string; icon: LucideIcon; end?: boolean }[] = [
   { to: "/jobs", label: "Jobs", shortLabel: "Jobs", icon: Search },
   { to: "/resume", label: "Master resume", shortLabel: "Resume", icon: FileText },
+  { to: "/workflow", label: "Workflow", shortLabel: "Workflow", icon: Workflow },
   { to: "/settings", label: "Settings", shortLabel: "Settings", icon: Settings },
 ];
 
@@ -38,7 +39,7 @@ export function Layout() {
           <button onClick={signOut} className="text-xs text-zinc-500 hover:text-zinc-900">Sign out</button>
         </div>
       </header>
-      <nav className="fixed inset-x-0 bottom-0 z-10 grid grid-cols-3 border-t border-zinc-200 bg-white/95 pb-[env(safe-area-inset-bottom)] backdrop-blur md:hidden">
+      <nav className="fixed inset-x-0 bottom-0 z-10 grid grid-cols-4 border-t border-zinc-200 bg-white/95 pb-[env(safe-area-inset-bottom)] backdrop-blur md:hidden">
         {nav.map(({ to, shortLabel, icon: Icon, end }) => (
           <NavLink
             key={to}

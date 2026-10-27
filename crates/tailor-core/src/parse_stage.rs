@@ -11,8 +11,8 @@ use crate::{
     db::Db,
     errors::{AiError, DbError, ProfileError},
     types::{
-        Bullet, Contact, Education, Experience, MasterResume, OllamaStatus, ProfileRecord, Project,
-        ResumeProfile, Skill, Warning,
+        AiStep, AiStepConfig, Bullet, Contact, Education, Experience, MasterResume, OllamaStatus,
+        ProfileRecord, Project, ResumeProfile, Skill, Warning,
     },
 };
 
@@ -113,6 +113,31 @@ pub fn configured_ollama_url(db: &Db, default_url: &str) -> String {
         .unwrap_or_else(|| default_url.to_string())
 }
 
+pub fn ai_step_config(db: &Db, step: AiStep) -> Result<AiStepConfig, DbError> {
+    let default_prompt = match step {
+        AiStep::ReadResume => DEFAULT_PROMPT,
+        AiStep::ScoreJobs => crate::score_stage::DEFAULT_PROMPT,
+    };
+    let model = db
+        .get_setting(step.model_key())?
+        .or(db.get_setting(MODEL_KEY)?)
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let prompt = db
+        .get_setting(step.prompt_key())?
+        .unwrap_or_else(|| default_prompt.to_string());
+    Ok(AiStepConfig {
+        step,
+        model,
+        prompt_is_default: prompt == default_prompt,
+        prompt,
+        default_prompt: default_prompt.to_string(),
+        input_template: match step {
+            AiStep::ReadResume => "Resume text:\n<<<\n{resume text}\n>>>".to_string(),
+            AiStep::ScoreJobs => "Job: {title} at {company}\n\nJob description:\n<<<\n{description}\n>>>\n\nResume:\n<<<\n{resume}\n>>>".to_string(),
+        },
+    })
+}
+
 async fn start_reading(
     db: Arc<Db>,
     ollama_url: String,
@@ -121,27 +146,25 @@ async fn start_reading(
     let uploaded_at = resume.uploaded_at.clone();
     let db_for_start = db.clone();
     let url_for_start = ollama_url.clone();
-    let (id, label, model_name) = tokio::task::spawn_blocking(move || {
+    let (id, label, config) = tokio::task::spawn_blocking(move || {
         if let Some(latest) = db_for_start.latest_profile(&uploaded_at)? {
             if latest.status == "reading" {
                 return Err(ProfileError::AlreadyReading);
             }
         }
-        let model_name = db_for_start
-            .get_setting(MODEL_KEY)?
-            .unwrap_or_else(|| DEFAULT_MODEL.into());
-        let model = Ollama::new(&url_for_start, &model_name);
+        let config = ai_step_config(&db_for_start, AiStep::ReadResume)?;
+        let model = Ollama::new(&url_for_start, &config.model);
         let label = JsonModel::label(&model);
         let id = db_for_start.start_profile(&uploaded_at, &label)?;
-        Ok((id, label, model_name))
+        Ok((id, label, config))
     })
     .await
     .map_err(|e| ProfileError::Db(DbError::Io(std::io::Error::other(e.to_string()))))??;
-    let model = Ollama::new(&ollama_url, &model_name);
+    let model = Ollama::new(&ollama_url, &config.model);
     tokio::spawn(async move {
         tracing::info!(model = %label, "reading resume");
         let started = std::time::Instant::now();
-        let outcome = match read_resume(&model, &resume.extracted_text).await {
+        let outcome = match read_resume(&model, &config.prompt, &resume.extracted_text).await {
             Ok((profile, warnings)) => {
                 let db = db.clone();
                 tokio::task::spawn_blocking(move || db.finish_profile(id, &profile, &warnings))
@@ -356,7 +379,7 @@ impl Ollama {
     }
 }
 
-const SYSTEM_PROMPT: &str = "You extract structured data from a resume. \
+pub const DEFAULT_PROMPT: &str = "You extract structured data from a resume. \
 Fill the JSON structure using only information found in the resume text. \
 Copy names, job titles, company names and bullet points exactly as written: do not reword, shorten, merge or invent anything. \
 Each bullet point is one list item; do not include the bullet symbol. \
@@ -670,13 +693,14 @@ fn normalize(s: &str) -> String {
 
 pub async fn read_resume<M: JsonModel>(
     model: &M,
+    prompt: &str,
     resume_text: &str,
 ) -> Result<(ResumeProfile, Vec<Warning>), AiError> {
     let user = format!("Resume text:\n<<<\n{resume_text}\n>>>");
     let schema = schema();
     let mut last_error = None;
     for _ in 0..2 {
-        let value = match model.generate_json(SYSTEM_PROMPT, &user, &schema).await {
+        let value = match model.generate_json(prompt, &user, &schema).await {
             Ok(value) => value,
             Err(AiError::BadOutput(e)) => {
                 last_error = Some(AiError::BadOutput(e));
@@ -704,11 +728,63 @@ pub async fn read_resume<M: JsonModel>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{fs::remove_dir_all, sync::Mutex};
 
     use super::*;
 
     const RESUME_TEXT: &str = "Jordan Rivera\njordan@example.com | Seattle, WA\n\nEXPERIENCE\nSenior Software Engineer, Acme Corp (2021 - Present)\n- Led migration of billing services to Rust, cutting p99 latency by 40%\n- Mentored 4 engineers\n\nSKILLS\nRust, TypeScript";
+
+    fn temp_db() -> (Db, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("workflow-ai-config-{}", rand::random::<u64>()));
+        let db = Db::open(&dir).unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn ai_step_config_uses_defaults_when_nothing_is_saved() {
+        let (db, dir) = temp_db();
+        let config = ai_step_config(&db, AiStep::ReadResume).unwrap();
+        assert_eq!(config.model, DEFAULT_MODEL);
+        assert_eq!(config.prompt, DEFAULT_PROMPT);
+        assert!(config.prompt_is_default);
+        remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ai_step_config_falls_back_to_legacy_model() {
+        let (db, dir) = temp_db();
+        db.set_setting(MODEL_KEY, "legacy-model").unwrap();
+        assert_eq!(
+            ai_step_config(&db, AiStep::ScoreJobs).unwrap().model,
+            "legacy-model"
+        );
+        remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ai_step_config_prefers_step_model_over_legacy_model() {
+        let (db, dir) = temp_db();
+        db.set_setting(MODEL_KEY, "legacy-model").unwrap();
+        db.set_setting(AiStep::ScoreJobs.model_key(), "score-model")
+            .unwrap();
+        assert_eq!(
+            ai_step_config(&db, AiStep::ScoreJobs).unwrap().model,
+            "score-model"
+        );
+        remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ai_step_config_returns_saved_prompt() {
+        let (db, dir) = temp_db();
+        db.set_setting(AiStep::ReadResume.prompt_key(), "custom prompt")
+            .unwrap();
+        let config = ai_step_config(&db, AiStep::ReadResume).unwrap();
+        assert_eq!(config.prompt, "custom prompt");
+        assert!(!config.prompt_is_default);
+        remove_dir_all(dir).unwrap();
+    }
 
     struct FakeModel {
         answers: Mutex<Vec<Result<Value, AiError>>>,
@@ -754,7 +830,9 @@ mod tests {
         let model = FakeModel {
             answers: Mutex::new(vec![Ok(answer())]),
         };
-        let (profile, warnings) = read_resume(&model, RESUME_TEXT).await.unwrap();
+        let (profile, warnings) = read_resume(&model, DEFAULT_PROMPT, RESUME_TEXT)
+            .await
+            .unwrap();
 
         assert_eq!(profile.contact.name, "Jordan Rivera");
         let job = &profile.experience[0];
@@ -785,7 +863,9 @@ mod tests {
                 Ok(answer()),
             ]),
         };
-        assert!(read_resume(&model, RESUME_TEXT).await.is_ok());
+        assert!(read_resume(&model, DEFAULT_PROMPT, RESUME_TEXT)
+            .await
+            .is_ok());
 
         let model = FakeModel {
             answers: Mutex::new(vec![
@@ -794,7 +874,7 @@ mod tests {
             ]),
         };
         assert!(matches!(
-            read_resume(&model, RESUME_TEXT).await,
+            read_resume(&model, DEFAULT_PROMPT, RESUME_TEXT).await,
             Err(AiError::BadOutput(_))
         ));
     }
@@ -805,7 +885,7 @@ mod tests {
             answers: Mutex::new(vec![Err(AiError::Unreachable("x".into()))]),
         };
         assert!(matches!(
-            read_resume(&model, RESUME_TEXT).await,
+            read_resume(&model, DEFAULT_PROMPT, RESUME_TEXT).await,
             Err(AiError::Unreachable(_))
         ));
     }

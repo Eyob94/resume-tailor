@@ -146,6 +146,17 @@ export interface Settings {
   indeed_scan_interval_minutes: number;
 }
 
+export type AiStep = "read_resume" | "score_jobs";
+
+export interface AiStepConfig {
+  step: AiStep;
+  model: string;
+  prompt: string;
+  default_prompt: string;
+  prompt_is_default: boolean;
+  input_template: string;
+}
+
 const json = (body: unknown): RequestInit => ({
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify(body),
@@ -167,6 +178,14 @@ export const jobsApi = {
   runScan: (site: Site) => request<void>(`/scan/${site}/run`, { method: "POST" }),
   getSettings: () => request<Settings>("/settings"),
   updateSettings: (settings: Settings) => request<Settings>("/settings", { method: "PUT", ...json(settings) }),
+};
+
+export const workflowApi = {
+  aiSteps: () => request<AiStepConfig[]>("/workflow/ai-steps"),
+  updateAiStep: (step: AiStep, update: { model?: string; prompt?: string }) =>
+    request<AiStepConfig>(`/workflow/ai-steps/${step}`, { method: "PUT", ...json(update) }),
+  resetPrompt: (step: AiStep) =>
+    request<AiStepConfig>(`/workflow/ai-steps/${step}/prompt`, { method: "DELETE" }),
 };
 
 export interface Bullet {

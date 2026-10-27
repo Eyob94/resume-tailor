@@ -3,6 +3,7 @@ import { errorMessage, jobsApi, profileApi, type AiStatus, type Settings } from 
 import { ServerStatus } from "../components/Layout";
 import { Alert, Button, Card, PageHeader } from "../components/ui";
 import { useDevMode } from "../devMode";
+import { Link } from "react-router-dom";
 
 function Row({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
   return (
@@ -60,14 +61,6 @@ export function SettingsPage() {
 
   const [savingUrl, setSavingUrl] = useState(false);
 
-  async function changeReaderModel(model: string) {
-    try {
-      setAi(await profileApi.updateAiSettings({ resume_reader_model: model }));
-    } catch (e) {
-      setError(errorMessage(e));
-    }
-  }
-
   async function saveOllamaUrl(e: FormEvent) {
     e.preventDefault();
     setSavingUrl(true);
@@ -81,8 +74,6 @@ export function SettingsPage() {
       setSavingUrl(false);
     }
   }
-
-  const models = ai ? Array.from(new Set([ai.resume_reader_model, ...ai.ollama.models])) : [];
 
   async function changeInterval(key: keyof Settings, minutes: number) {
     if (!intervals) return;
@@ -122,30 +113,18 @@ export function SettingsPage() {
             </select>
           </Row>
         ))}
-        <Row label="Resume reader" hint="Reads your uploaded resume. Runs locally in Ollama, for free.">
+        <Row label="Ollama" hint="AI steps run locally, for free.">
           {ai === null ? (
             "Checking…"
           ) : (
-            <span className="flex flex-wrap items-center gap-3">
-              <span className="inline-flex items-center gap-1.5 text-xs">
-                <span className={`size-2 rounded-full ${ai.ollama.reachable ? "bg-emerald-500" : "bg-red-500"}`} />
-                {ai.ollama.reachable ? "Ollama running" : "Ollama not running"}
-              </span>
-              <select
-                aria-label="Resume reader model"
-                value={ai.resume_reader_model}
-                onChange={(e) => changeReaderModel(e.target.value)}
-                className="rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-sm text-zinc-900 shadow-sm"
-              >
-                {models.map((m) => (
-                  <option key={m} value={m}>
-                    {m}
-                    {ai.ollama.reachable && !ai.ollama.models.includes(m) ? " (not installed)" : ""}
-                  </option>
-                ))}
-              </select>
+            <span className="inline-flex items-center gap-1.5 text-xs">
+              <span className={`size-2 rounded-full ${ai.ollama.reachable ? "bg-emerald-500" : "bg-red-500"}`} />
+              {ai.ollama.reachable ? "Ollama running" : "Ollama not running"}
             </span>
           )}
+        </Row>
+        <Row label="AI models and prompts">
+          <Link to="/workflow" className="text-zinc-900 underline underline-offset-2">Models and prompts are on the Workflow tab.</Link>
         </Row>
         <Row label="Ollama URL" hint="Where the Ollama server runs. Change it if Ollama is on another machine.">
           <form onSubmit={saveOllamaUrl} className="flex w-full items-center gap-2 sm:w-auto">

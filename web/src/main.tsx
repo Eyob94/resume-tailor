@@ -6,6 +6,7 @@ import { Layout } from "./components/Layout";
 import { JobsPage } from "./pages/JobsPage";
 import { ResumePage } from "./pages/ResumePage";
 import { SettingsPage } from "./pages/SettingsPage";
+import { WorkflowPage } from "./pages/WorkflowPage";
 import { LoginPage } from "./pages/LoginPage";
 import { api } from "./api";
 import { useEffect, useState } from "react";
@@ -29,6 +30,7 @@ createRoot(document.getElementById("root")!).render(
             <Route index element={<Navigate to="/jobs" replace />} />
             <Route path="jobs" element={<JobsPage />} />
             <Route path="resume" element={<ResumePage />} />
+            <Route path="workflow" element={<WorkflowPage />} />
             <Route path="settings" element={<SettingsPage />} />
           </Route>
         </Route>
