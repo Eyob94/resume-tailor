@@ -48,6 +48,7 @@ const FILTERS: [Filter, string][] = [
   ["new", "New"],
   ["saved", "Saved"],
   ["dismissed", "Dismissed"],
+  ["applied", "Applied"],
   ["all", "All"],
 ];
 const POSTED_SHORT = { day: "24 h", week: "week", month: "month" } as const;
@@ -632,9 +633,18 @@ function JobRow({
             <Button icon={BookmarkCheck} onClick={() => onStatus("new")}>
               Saved
             </Button>
+          ) : job.status === "applied" ? (
+            <Button icon={RotateCcw} onClick={() => onStatus("new")}>
+              Undo applied
+            </Button>
           ) : (
             <Button icon={Bookmark} onClick={() => onStatus("saved")}>
               Save
+            </Button>
+          )}
+          {job.status !== "applied" && (
+            <Button icon={Check} onClick={() => onStatus("applied")}>
+              <span className="hidden sm:inline">Mark applied</span>
             </Button>
           )}
           {job.status === "dismissed" ? (

@@ -292,6 +292,7 @@ pub enum JobStatus {
     New,
     Saved,
     Dismissed,
+    Applied,
 }
 
 impl JobStatus {
@@ -300,6 +301,7 @@ impl JobStatus {
             Self::New => "new",
             Self::Saved => "saved",
             Self::Dismissed => "dismissed",
+            Self::Applied => "applied",
         }
     }
 
@@ -307,6 +309,7 @@ impl JobStatus {
         match s {
             "saved" => Self::Saved,
             "dismissed" => Self::Dismissed,
+            "applied" => Self::Applied,
             _ => Self::New,
         }
     }
