@@ -12,7 +12,7 @@ use crate::{
     errors::DbError,
     types::{
         JobCard, JobDetail, JobListing, JobScore, JobSearch, JobStatus, JobToScore, MasterResume,
-        PdfInfo, PostedWithin, ProfileRecord, Requirement, ResumeProfile, ScanRun, SearchCriteria,
+        PdfInfo, PostedWithin, ProfileRecord, Requirement, ResumeProfile, ScanRun, SearchCriteria, Site,
         Warning, WorkMode,
     },
 };
@@ -114,6 +114,8 @@ const MIGRATIONS: &[&str] = &[
         website    TEXT,
         fetched_at TEXT NOT NULL
     );",
+    "ALTER TABLE jobs RENAME COLUMN linkedin_id TO source_id;
+     ALTER TABLE jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'linkedin';",
 ];
 
 #[cfg(test)]
@@ -386,12 +388,12 @@ impl Db {
         }
     }
 
-    pub(crate) fn known_job(&self, linkedin_id: &str) -> Result<Option<KnownJob>, DbError> {
+    pub(crate) fn known_job(&self, source_id: &str) -> Result<Option<KnownJob>, DbError> {
         let conn = self.conn.lock().unwrap();
         let job = conn
             .query_row(
-                "SELECT id, description FROM jobs WHERE linkedin_id = ?1",
-                params![linkedin_id],
+                "SELECT id, description FROM jobs WHERE source_id = ?1",
+                params![source_id],
                 |row| {
                     Ok(KnownJob {
                         id: row.get(0)?,
@@ -411,10 +413,10 @@ impl Db {
     ) -> Result<i64, DbError> {
         let conn = self.conn.lock().unwrap();
         let id = conn.query_row(
-        "INSERT INTO jobs (linkedin_id, title, company, company_url, location, posted_on, url, description,
+        "INSERT INTO jobs (source, source_id, title, company, company_url, location, posted_on, url, description,
                            seniority, employment_type, industries, work_mode, first_seen_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
-         ON CONFLICT(linkedin_id) DO UPDATE SET
+         VALUES (?14, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
+         ON CONFLICT(source_id) DO UPDATE SET
             title = excluded.title,
             company = excluded.company,
             company_url = excluded.company_url,
@@ -429,7 +431,7 @@ impl Db {
             updated_at = excluded.updated_at
          RETURNING id",
         params![
-            card.linkedin_id,
+            card.source_id,
             card.title,
             card.company,
             card.company_url,
@@ -442,6 +444,7 @@ impl Db {
             detail.and_then(|d| d.industries.as_ref()),
             work_mode.map(WorkMode::as_str),
             now(),
+            card.source.as_str(),
         ],
         |row| row.get(0),
     )?;
@@ -494,7 +497,7 @@ impl Db {
             "SELECT j.company_url
              FROM jobs j JOIN search_matches m ON m.job_id = j.id
              LEFT JOIN companies c ON c.url = j.company_url
-             WHERE j.company_url IS NOT NULL AND c.url IS NULL
+             WHERE j.source = 'linkedin' AND j.company_url IS NOT NULL AND c.url IS NULL
              GROUP BY j.company_url
              ORDER BY MAX(j.status = 'saved') DESC, MAX(j.first_seen_at) DESC
              LIMIT ?1",
@@ -638,11 +641,11 @@ impl Db {
     pub fn list_jobs(&self, status: Option<JobStatus>) -> Result<Vec<JobListing>, DbError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-        "SELECT j.id, j.linkedin_id, j.title, j.company, j.company_url, j.location, j.posted_on, j.url,
+        "SELECT j.id, j.source_id, j.title, j.company, j.company_url, j.location, j.posted_on, j.url,
                 j.description, j.seniority, j.employment_type, j.industries, j.work_mode, j.status,
                 j.first_seen_at, m.search_id, m.matched_keywords, j.tailored_at,
                 s.status, s.score, s.summary, s.requirements, s.model, s.error, s.profile_id, s.updated_at,
-                c.website
+                c.website, j.source
          FROM jobs j JOIN search_matches m ON m.job_id = j.id
          LEFT JOIN job_scores s ON s.job_id = j.id
          LEFT JOIN companies c ON c.url = j.company_url
@@ -652,7 +655,8 @@ impl Db {
         let rows = stmt.query_map(params![status.map(JobStatus::as_str)], |row| {
             let listing = JobListing {
                 id: row.get(0)?,
-                linkedin_id: row.get(1)?,
+                source: Site::parse(&row.get::<_, String>(27)?),
+                source_id: row.get(1)?,
                 title: row.get(2)?,
                 company: row.get(3)?,
                 company_url: row.get(4)?,
@@ -1007,7 +1011,8 @@ mod tests {
 
     fn card(id: &str) -> JobCard {
         JobCard {
-            linkedin_id: id.into(),
+            source: Site::LinkedIn,
+            source_id: id.into(),
             title: "Backend Engineer".into(),
             company: "Acme".into(),
             company_url: None,

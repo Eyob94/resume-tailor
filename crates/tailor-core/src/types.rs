@@ -124,6 +124,30 @@ impl WorkMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+pub enum Site {
+    #[default]
+    LinkedIn,
+    Indeed,
+}
+
+impl Site {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LinkedIn => "linkedin",
+            Self::Indeed => "indeed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "indeed" => Self::Indeed,
+            _ => Self::LinkedIn,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PostedWithin {
     Day,
     #[default]
@@ -315,7 +339,8 @@ impl JobStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct JobListing {
     pub id: i64,
-    pub linkedin_id: String,
+    pub source: Site,
+    pub source_id: String,
     pub title: String,
     pub company: String,
     pub company_url: Option<String>,
@@ -391,7 +416,8 @@ pub struct ScanRun {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct JobCard {
-    pub linkedin_id: String,
+    pub source: Site,
+    pub source_id: String,
     pub title: String,
     pub company: String,
     pub company_url: Option<String>,
