@@ -59,7 +59,7 @@ const POSTED_SHORT = { day: "24 h", week: "week", month: "month" } as const;
 export function JobsPage() {
   const [searches, setSearches] = useState<JobSearch[] | null>(null);
   const [jobs, setJobs] = useState<JobListing[] | null>(null);
-  const [scan, setScan] = useState<ScanStatus | null>(null);
+  const [scans, setScans] = useState<ScanStatus[] | null>(null);
   const [editing, setEditing] = useState<JobSearch | "new" | null>(null);
   const [pendingEdit, setPendingEdit] = useState<{ search: JobSearch; input: SearchInput; newJobIds: number[] } | null>(null);
   const [applyingEdit, setApplyingEdit] = useState<"save" | "discard" | null>(null);
@@ -83,19 +83,19 @@ export function JobsPage() {
         setSearches(all);
       }),
       loadJobs(),
-      jobsApi.scanStatus().then(setScan),
+      jobsApi.scanStatus().then(setScans),
     ]).catch((e) =>
       setError(errorMessage(e)),
     );
   }, [loadJobs]);
 
-  const lastFinished = useRef<string | null | undefined>(undefined);
+  const lastFinished = useRef<string | undefined>(undefined);
   useEffect(() => {
     const id = setInterval(async () => {
       try {
-        const status = await jobsApi.scanStatus();
-        setScan(status);
-        const finished = status.last_run?.finished_at ?? null;
+        const statuses = await jobsApi.scanStatus();
+        setScans(statuses);
+        const finished = statuses.map((s) => s.last_run?.finished_at ?? "").join("|");
         if (lastFinished.current !== undefined && finished !== lastFinished.current) await loadJobs();
         lastFinished.current = finished;
       } catch {
@@ -143,7 +143,7 @@ export function JobsPage() {
     const created = await jobsApi.createSearch(input);
     setSearches((all) => [...(all ?? []), created]);
     setEditing(null);
-    setScan(await jobsApi.scanStatus());
+    setScans(await jobsApi.scanStatus());
   }
 
   async function applyEdit(search: JobSearch, input: SearchInput) {
@@ -151,7 +151,7 @@ export function JobsPage() {
     setSearches((all) => all?.map((s) => (s.id === updated.id ? updated : s)) ?? null);
     await loadJobs();
     setEditing(null);
-    setScan(await jobsApi.scanStatus());
+    setScans(await jobsApi.scanStatus());
   }
 
   async function finishPendingEdit(saveJobs: boolean) {
@@ -260,7 +260,13 @@ export function JobsPage() {
             </EmptyState>
           ) : (
             <>
-              {scan && searches.length > 0 && <ScanBar scan={scan} onChange={setScan} onError={setError} />}
+              {scans && searches.length > 0 && (
+                <div className="grid gap-3 lg:grid-cols-2">
+                  {scans.map((scan) => (
+                    <ScanBar key={scan.site} scan={scan} onChange={setScans} onError={setError} />
+                  ))}
+                </div>
+              )}
               <div className="grid gap-3 sm:grid-cols-2">
                 {searches.map((search) => (
                   <SearchCard
@@ -356,7 +362,7 @@ export function JobsPage() {
   );
 }
 
-function ScanBar({ scan, onChange, onError }: { scan: ScanStatus; onChange: (s: ScanStatus) => void; onError: (e: string) => void }) {
+function ScanBar({ scan, onChange, onError }: { scan: ScanStatus; onChange: (s: ScanStatus[]) => void; onError: (e: string) => void }) {
   const [requesting, setRequesting] = useState(false);
   const last = scan.last_run;
   const problem = last && (last.status === "partial" || last.status === "failed");
@@ -364,7 +370,7 @@ function ScanBar({ scan, onChange, onError }: { scan: ScanStatus; onChange: (s: 
   async function runNow() {
     setRequesting(true);
     try {
-      await jobsApi.runScan();
+      await jobsApi.runScan(scan.site);
       setTimeout(async () => onChange(await jobsApi.scanStatus()), 700);
     } catch (e) {
       onError(errorMessage(e));
@@ -385,8 +391,10 @@ function ScanBar({ scan, onChange, onError }: { scan: ScanStatus; onChange: (s: 
         )}
         <div className="min-w-0 text-sm">
           <p className="font-medium">
+            {SITE_LABELS[scan.site]}
+            {" · "}
             {scan.running
-              ? "Scanning LinkedIn and Indeed…"
+              ? "Scanning…"
               : last
                 ? `Last scan ${relativeTime(last.started_at)} · ${plural(last.new_matches, "new match", "new matches")}`
                 : "No scans yet"}

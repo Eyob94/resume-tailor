@@ -122,7 +122,7 @@ impl WorkMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Site {
     #[default]
@@ -446,6 +446,7 @@ pub struct OllamaStatus {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanStatus {
+    pub site: Site,
     pub running: bool,
     pub interval_minutes: u32,
     pub next_run_at: Option<String>,

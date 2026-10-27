@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use tokio::{
     sync::{
@@ -18,6 +18,7 @@ use crate::{
 
 pub enum MatchMessage {
     Batch {
+        run_id: i64,
         search: JobSearch,
         jobs: Vec<ScrapedJob>,
     },
@@ -46,35 +47,38 @@ impl MatchStage {
 }
 
 async fn run(db: Arc<Db>, mut rx: UnboundedReceiver<MatchMessage>, scorer: UnboundedSender<ScoreMessage>) {
-    let mut new_matches = 0;
-    let mut match_error = None;
+    let mut new_matches: HashMap<i64, usize> = HashMap::new();
+    let mut match_errors: HashMap<i64, String> = HashMap::new();
     while let Some(message) = rx.recv().await {
         match message {
-            MatchMessage::Batch { search, jobs } => {
+            MatchMessage::Batch {
+                run_id,
+                search,
+                jobs,
+            } => {
                 let db = db.clone();
                 match tokio::task::spawn_blocking(move || apply_batch(&db, &search, jobs)).await {
                     Ok(Ok(count)) => {
-                        new_matches += count;
+                        *new_matches.entry(run_id).or_default() += count;
                         let _ = scorer.send(ScoreMessage::Kick);
                     }
                     Ok(Err(error)) => {
                         tracing::error!("couldn't match scanned jobs: {error}");
-                        match_error = Some(error.to_string());
+                        match_errors.insert(run_id, error.to_string());
                     }
                     Err(error) => {
                         let error = DbError::Io(std::io::Error::other(error.to_string()));
                         tracing::error!("couldn't match scanned jobs: {error}");
-                        match_error = Some(error.to_string());
+                        match_errors.insert(run_id, error.to_string());
                     }
                 }
             }
             MatchMessage::RunFinished { run_id, mut report } => {
-                report.new_matches = new_matches;
-                if let Some(error) = match_error.take() {
+                report.new_matches = new_matches.remove(&run_id).unwrap_or_default();
+                if let Some(error) = match_errors.remove(&run_id) {
                     report.error = Some(error);
                 }
                 finish_run(&db, run_id, &report).await;
-                new_matches = 0;
             }
             MatchMessage::Flush { reply } => {
                 let _ = reply.send(());
@@ -123,7 +127,6 @@ pub(crate) fn apply_batch(
 
 async fn finish_run(db: &Arc<Db>, run_id: i64, report: &ScanReport) {
     let status = match (&report.error, report.requests) {
-        (None, _) if report.indeed_error.is_some() => "partial",
         (None, _) => "ok",
         (Some(_), n) if n > 1 => "partial",
         (Some(_), _) => "failed",
@@ -147,10 +150,7 @@ async fn finish_run(db: &Arc<Db>, run_id: i64, report: &ScanReport) {
             report.pending_details
         ));
     }
-    if let Some(error) = &report.indeed_error {
-        notes.push(format!("Indeed: {error}."));
-    }
-    for location in &report.indeed_unknown_locations {
+    for location in &report.skipped_locations {
         notes.push(format!(
             "Indeed was skipped for \"{location}\" because the country couldn't be worked out."
         ));

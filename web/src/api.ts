@@ -134,6 +134,7 @@ export interface ScanRun {
 }
 
 export interface ScanStatus {
+  site: Site;
   running: boolean;
   interval_minutes: number;
   next_run_at: string | null;
@@ -142,6 +143,7 @@ export interface ScanStatus {
 
 export interface Settings {
   scan_interval_minutes: number;
+  indeed_scan_interval_minutes: number;
 }
 
 const json = (body: unknown): RequestInit => ({
@@ -161,8 +163,8 @@ export const jobsApi = {
     request<{ updated: number }>("/jobs/status", { method: "POST", ...json({ ids, status }) }),
   rescore: (id: number) => request<void>(`/jobs/${id}/score`, { method: "POST" }),
   skipScore: (id: number) => request<void>(`/jobs/${id}/score`, { method: "DELETE" }),
-  scanStatus: () => request<ScanStatus>("/scan"),
-  runScan: () => request<void>("/scan/run", { method: "POST" }),
+  scanStatus: () => request<ScanStatus[]>("/scan"),
+  runScan: (site: Site) => request<void>(`/scan/${site}/run`, { method: "POST" }),
   getSettings: () => request<Settings>("/settings"),
   updateSettings: (settings: Settings) => request<Settings>("/settings", { method: "PUT", ...json(settings) }),
 };

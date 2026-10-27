@@ -116,6 +116,7 @@ const MIGRATIONS: &[&str] = &[
     );",
     "ALTER TABLE jobs RENAME COLUMN linkedin_id TO source_id;
      ALTER TABLE jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'linkedin';",
+    "ALTER TABLE scan_runs ADD COLUMN site TEXT NOT NULL DEFAULT 'linkedin';",
 ];
 
 #[cfg(test)]
@@ -783,11 +784,11 @@ impl Db {
         Ok(())
     }
 
-    pub fn start_scan_run(&self) -> Result<i64, DbError> {
+    pub fn start_scan_run(&self, site: Site) -> Result<i64, DbError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO scan_runs (started_at, status) VALUES (?1, 'running')",
-            params![now()],
+            "INSERT INTO scan_runs (started_at, status, site) VALUES (?1, 'running', ?2)",
+            params![now(), site.as_str()],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -807,13 +808,13 @@ impl Db {
         Ok(())
     }
 
-    pub fn last_scan_run(&self) -> Result<Option<ScanRun>, DbError> {
+    pub fn last_scan_run(&self, site: Site) -> Result<Option<ScanRun>, DbError> {
         let conn = self.conn.lock().unwrap();
         let run = conn
             .query_row(
                 "SELECT id, started_at, finished_at, status, new_matches, message
-             FROM scan_runs ORDER BY id DESC LIMIT 1",
-                [],
+             FROM scan_runs WHERE site = ?1 ORDER BY id DESC LIMIT 1",
+                params![site.as_str()],
                 |row| {
                     Ok(ScanRun {
                         id: row.get(0)?,
@@ -1214,15 +1215,19 @@ mod tests {
         store.set_setting("k", "45").unwrap();
         assert_eq!(store.get_setting("k").unwrap().as_deref(), Some("45"));
 
-        let run = store.start_scan_run().unwrap();
+        let run = store.start_scan_run(Site::LinkedIn).unwrap();
         store.mark_interrupted_scan_runs().unwrap();
         assert_eq!(
-            store.last_scan_run().unwrap().unwrap().status,
+            store.last_scan_run(Site::LinkedIn).unwrap().unwrap().status,
             "interrupted"
         );
         store.finish_scan_run(run, "ok", 3, None).unwrap();
-        let last = store.last_scan_run().unwrap().unwrap();
+        let last = store.last_scan_run(Site::LinkedIn).unwrap().unwrap();
         assert_eq!((last.status.as_str(), last.new_matches), ("ok", 3));
+        assert!(store.last_scan_run(Site::Indeed).unwrap().is_none());
+        let indeed = store.start_scan_run(Site::Indeed).unwrap();
+        assert_eq!(store.last_scan_run(Site::Indeed).unwrap().unwrap().id, indeed);
+        assert_eq!(store.last_scan_run(Site::LinkedIn).unwrap().unwrap().id, run);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
