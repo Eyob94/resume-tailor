@@ -2,8 +2,10 @@ use axum::{extract::Extension, routing::get, Json, Router};
 use serde::{Deserialize, Serialize};
 use tailor_core::{
     parse_stage::{ollama_status, DEFAULT_MODEL, MODEL_KEY, OLLAMA_URL_KEY},
-    scrape_stage::{interval_minutes, ScrapeMessage, MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES},
-    types::OllamaStatus,
+    scrape_stage::{
+        interval_key, interval_minutes, ScrapeMessage, MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES,
+    },
+    types::{OllamaStatus, Site},
 };
 
 use super::{errors::AppError, AppState, UserServices};
@@ -78,11 +80,13 @@ async fn update_ai_settings(
 #[derive(Serialize, Deserialize)]
 struct Settings {
     scan_interval_minutes: u32,
+    indeed_scan_interval_minutes: u32,
 }
 
 async fn get_settings(Extension(user): Extension<std::sync::Arc<UserServices>>) -> Json<Settings> {
     Json(Settings {
-        scan_interval_minutes: interval_minutes(&user.store),
+        scan_interval_minutes: interval_minutes(&user.store, Site::LinkedIn),
+        indeed_scan_interval_minutes: interval_minutes(&user.store, Site::Indeed),
     })
 }
 
@@ -90,15 +94,23 @@ async fn update_settings(
     Extension(state): Extension<std::sync::Arc<UserServices>>,
     Json(settings): Json<Settings>,
 ) -> Result<Json<Settings>, AppError> {
-    let minutes = settings.scan_interval_minutes;
-    if !(MIN_INTERVAL_MINUTES..=MAX_INTERVAL_MINUTES).contains(&minutes) {
+    let intervals = [
+        (Site::LinkedIn, settings.scan_interval_minutes),
+        (Site::Indeed, settings.indeed_scan_interval_minutes),
+    ];
+    if intervals
+        .iter()
+        .any(|(_, minutes)| !(MIN_INTERVAL_MINUTES..=MAX_INTERVAL_MINUTES).contains(minutes))
+    {
         return Err(AppError::bad_request(format!(
             "Scan interval must be between {MIN_INTERVAL_MINUTES} and {MAX_INTERVAL_MINUTES} minutes."
         )));
     }
-    state
-        .store
-        .set_setting("scan_interval_minutes", &minutes.to_string())?;
+    for (site, minutes) in intervals {
+        state
+            .store
+            .set_setting(interval_key(site), &minutes.to_string())?;
+    }
     let _ = state.senders.scrape.send(ScrapeMessage::Reschedule);
     Ok(Json(settings))
 }

@@ -58,8 +58,7 @@ pub struct ScanReport {
     pub details_paused: bool,
     pub search_blocked: bool,
     pub error: Option<String>,
-    pub indeed_error: Option<String>,
-    pub indeed_unknown_locations: Vec<String>,
+    pub skipped_locations: Vec<String>,
 }
 
 struct Budget {
@@ -109,9 +108,10 @@ impl JobSource for LinkedInClient {
 
 pub enum ScrapeMessage {
     Status {
-        reply: oneshot::Sender<Result<ScanStatus, DbError>>,
+        reply: oneshot::Sender<Result<Vec<ScanStatus>, DbError>>,
     },
     RunNow {
+        site: Site,
         reply: oneshot::Sender<Result<(), String>>,
     },
     Reschedule,
@@ -146,6 +146,15 @@ impl ScrapeStage {
     }
 }
 
+pub const SITES: [Site; 2] = [Site::LinkedIn, Site::Indeed];
+
+#[derive(Default)]
+struct Schedule {
+    running: bool,
+    run_requested: bool,
+    next_run_at: Option<DateTime<Utc>>,
+}
+
 async fn run(
     db: Arc<Db>,
     client: Arc<LinkedInClient>,
@@ -161,70 +170,104 @@ async fn run(
         Err(e) => tracing::error!("couldn't tidy previous scan runs: {e}"),
     }
 
-    let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let mut running = false;
-    let mut run_requested = false;
-    let mut next_run_at: Option<DateTime<Utc>> = None;
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<Site>();
+    let mut schedules: HashMap<Site, Schedule> =
+        SITES.iter().map(|site| (*site, Schedule::default())).collect();
     loop {
-        if !running {
-            next_run_at = compute_next_run(&db);
-            let due = next_run_at.is_some_and(|time| time <= Utc::now());
-            if (run_requested || due) && has_searches(&db) {
-                run_requested = false;
-                running = true;
-                next_run_at = None;
-                let (db, client, indeed, matcher, done_tx) = (
-                    db.clone(),
-                    client.clone(),
-                    indeed.clone(),
-                    matcher.clone(),
-                    done_tx.clone(),
-                );
-                tokio::spawn(async move {
-                    scrape_run(db, client, indeed, matcher).await;
-                    let _ = done_tx.send(());
-                });
+        for site in SITES {
+            let schedule = schedules.get_mut(&site).expect("every site has a schedule");
+            if schedule.running {
                 continue;
             }
-            run_requested = false;
+            schedule.next_run_at = compute_next_run(&db, site);
+            let due = schedule.next_run_at.is_some_and(|time| time <= Utc::now());
+            if (schedule.run_requested || due) && has_searches(&db) {
+                schedule.running = true;
+                schedule.next_run_at = None;
+                let (db, matcher, done_tx) = (db.clone(), matcher.clone(), done_tx.clone());
+                match site {
+                    Site::LinkedIn => {
+                        let client = client.clone();
+                        tokio::spawn(async move {
+                            linkedin_run(db, client, matcher).await;
+                            let _ = done_tx.send(site);
+                        });
+                    }
+                    Site::Indeed => {
+                        let indeed = indeed.clone();
+                        tokio::spawn(async move {
+                            indeed_run(db, indeed, matcher).await;
+                            let _ = done_tx.send(site);
+                        });
+                    }
+                }
+            }
+            schedule.run_requested = false;
         }
-        let wait = next_run_at.map(|time| (time - Utc::now()).to_std().unwrap_or_default());
+        let wait = schedules
+            .values()
+            .filter(|schedule| !schedule.running)
+            .filter_map(|schedule| schedule.next_run_at)
+            .min()
+            .map(|time| (time - Utc::now()).to_std().unwrap_or_default());
         tokio::select! {
             message = rx.recv() => match message {
                 None => break,
                 Some(ScrapeMessage::Status { reply }) => {
-                    let _ = reply.send(status(&db, running, next_run_at));
+                    let statuses = SITES
+                        .iter()
+                        .map(|site| {
+                            let schedule = &schedules[site];
+                            status(&db, *site, schedule.running, schedule.next_run_at)
+                        })
+                        .collect();
+                    let _ = reply.send(statuses);
                 }
-                Some(ScrapeMessage::RunNow { reply }) => {
-                    let result = check_run_now(&db, running, cooldown);
+                Some(ScrapeMessage::RunNow { site, reply }) => {
+                    let schedule = schedules.get_mut(&site).expect("every site has a schedule");
+                    let result = check_run_now(&db, site, schedule.running, cooldown);
                     if result.is_ok() {
-                        run_requested = true;
+                        schedule.run_requested = true;
                     }
                     let _ = reply.send(result);
                 }
                 Some(ScrapeMessage::Reschedule) => {}
             },
-            _ = done_rx.recv(), if running => {
-                running = false;
+            Some(site) = done_rx.recv() => {
+                if let Some(schedule) = schedules.get_mut(&site) {
+                    schedule.running = false;
+                }
             }
-            _ = tokio::time::sleep(wait.unwrap_or_default()), if !running && wait.is_some() => {}
+            _ = tokio::time::sleep(wait.unwrap_or_default()), if wait.is_some() => {}
         }
     }
 }
 
 pub const MIN_INTERVAL_MINUTES: u32 = 1;
 pub const MAX_INTERVAL_MINUTES: u32 = 60;
-pub const DEFAULT_INTERVAL_MINUTES: u32 = 60;
-pub const INTERVAL_KEY: &str = "scan_interval_minutes";
 pub const DEFAULT_COOLDOWN_SECONDS: i64 = MIN_INTERVAL_MINUTES as i64 * 60;
 
-pub fn interval_minutes(db: &Db) -> u32 {
-    db.get_setting(INTERVAL_KEY)
+pub fn interval_key(site: Site) -> &'static str {
+    match site {
+        Site::LinkedIn => "scan_interval_minutes",
+        Site::Indeed => "indeed_scan_interval_minutes",
+    }
+}
+
+fn default_interval_minutes(site: Site) -> u32 {
+    match site {
+        Site::LinkedIn => 60,
+        Site::Indeed => 15,
+    }
+}
+
+pub fn interval_minutes(db: &Db, site: Site) -> u32 {
+    db.get_setting(interval_key(site))
         .ok()
         .flatten()
         .and_then(|value| value.parse().ok())
         .map(|minutes: u32| minutes.clamp(MIN_INTERVAL_MINUTES, MAX_INTERVAL_MINUTES))
-        .unwrap_or(DEFAULT_INTERVAL_MINUTES)
+        .unwrap_or_else(|| default_interval_minutes(site))
 }
 
 fn has_searches(db: &Db) -> bool {
@@ -233,19 +276,21 @@ fn has_searches(db: &Db) -> bool {
         .unwrap_or(false)
 }
 
-fn compute_next_run(db: &Db) -> Option<DateTime<Utc>> {
-    if !has_searches(db) {
-        return None;
-    }
-    let interval = ChronoDuration::minutes(interval_minutes(db).into());
-    let last_started = db
-        .last_scan_run()
+fn last_started(db: &Db, site: Site) -> Option<DateTime<Utc>> {
+    db.last_scan_run(site)
         .ok()
         .flatten()
         .and_then(|run| DateTime::parse_from_rfc3339(&run.started_at).ok())
-        .map(|time| time.with_timezone(&Utc));
+        .map(|time| time.with_timezone(&Utc))
+}
+
+fn compute_next_run(db: &Db, site: Site) -> Option<DateTime<Utc>> {
+    if !has_searches(db) {
+        return None;
+    }
+    let interval = ChronoDuration::minutes(interval_minutes(db, site).into());
     Some(
-        last_started
+        last_started(db, site)
             .map(|time| time + interval)
             .unwrap_or_else(Utc::now),
     )
@@ -253,28 +298,29 @@ fn compute_next_run(db: &Db) -> Option<DateTime<Utc>> {
 
 fn status(
     db: &Db,
+    site: Site,
     running: bool,
     next_run_at: Option<DateTime<Utc>>,
 ) -> Result<ScanStatus, DbError> {
     Ok(ScanStatus {
+        site,
         running,
-        interval_minutes: interval_minutes(db),
+        interval_minutes: interval_minutes(db, site),
         next_run_at: next_run_at.map(|time| time.to_rfc3339()),
-        last_run: db.last_scan_run()?,
+        last_run: db.last_scan_run(site)?,
     })
 }
 
-fn check_run_now(db: &Db, running: bool, cooldown: ChronoDuration) -> Result<(), String> {
+fn check_run_now(
+    db: &Db,
+    site: Site,
+    running: bool,
+    cooldown: ChronoDuration,
+) -> Result<(), String> {
     if running {
         return Err("A scan is already running.".into());
     }
-    let last_started = db
-        .last_scan_run()
-        .ok()
-        .flatten()
-        .and_then(|run| DateTime::parse_from_rfc3339(&run.started_at).ok())
-        .map(|time| time.with_timezone(&Utc));
-    if let Some(last) = last_started {
+    if let Some(last) = last_started(db, site) {
         let ready_at = last + cooldown;
         if Utc::now() < ready_at {
             let wait = (ready_at - Utc::now()).num_seconds() + 1;
@@ -289,44 +335,76 @@ fn check_run_now(db: &Db, running: bool, cooldown: ChronoDuration) -> Result<(),
     Ok(())
 }
 
-async fn scrape_run<S: JobSource + Send + Sync + 'static, I: IndeedSource + Send + Sync + 'static>(
-    db: Arc<Db>,
-    source: Arc<S>,
-    indeed: Arc<I>,
-    matcher: UnboundedSender<MatchMessage>,
-) {
-    let db_for_start = db.clone();
-    let run_id = match tokio::task::spawn_blocking(move || db_for_start.start_scan_run()).await {
-        Ok(Ok(id)) => id,
+async fn start_run(db: &Arc<Db>, site: Site) -> Option<i64> {
+    let db = db.clone();
+    match tokio::task::spawn_blocking(move || db.start_scan_run(site)).await {
+        Ok(Ok(id)) => {
+            tracing::info!(site = site.as_str(), "scan started");
+            Some(id)
+        }
         Ok(Err(e)) => {
             tracing::error!("couldn't record scan start: {e}");
-            return;
+            None
         }
         Err(e) => {
             tracing::error!("couldn't record scan start: {e}");
-            return;
+            None
         }
-    };
-    tracing::info!("scan started");
-    let send_batch = |search: &JobSearch, jobs| {
+    }
+}
+
+fn batch_sender(
+    matcher: &UnboundedSender<MatchMessage>,
+    run_id: i64,
+) -> impl FnMut(&JobSearch, Vec<ScrapedJob>) + '_ {
+    move |search, jobs| {
         let _ = matcher.send(MatchMessage::Batch {
+            run_id,
             search: search.clone(),
             jobs,
         });
+    }
+}
+
+async fn linkedin_run<S: JobSource + Send + Sync + 'static>(
+    db: Arc<Db>,
+    source: Arc<S>,
+    matcher: UnboundedSender<MatchMessage>,
+) {
+    let Some(run_id) = start_run(&db, Site::LinkedIn).await else {
+        return;
     };
-    let mut report =
-        scrape_searches(&db, source.as_ref(), &ScanLimits::default(), send_batch).await;
-    let indeed_report =
-        scrape_indeed(&db, indeed.as_ref(), &ScanLimits::default(), send_batch).await;
-    report.requests += indeed_report.requests;
-    report.indeed_error = indeed_report.error;
-    report.indeed_unknown_locations = indeed_report.unknown_locations;
+    let report = scrape_searches(
+        &db,
+        source.as_ref(),
+        &ScanLimits::default(),
+        batch_sender(&matcher, run_id),
+    )
+    .await;
     let _ = matcher.send(MatchMessage::RunFinished { run_id, report });
     let (flushed_tx, flushed_rx) = oneshot::channel();
     if matcher.send(MatchMessage::Flush { reply: flushed_tx }).is_ok() {
         let _ = flushed_rx.await;
     }
     fetch_company_sites(&db, source.as_ref(), &ScanLimits::default()).await;
+}
+
+async fn indeed_run<I: IndeedSource + Send + Sync + 'static>(
+    db: Arc<Db>,
+    indeed: Arc<I>,
+    matcher: UnboundedSender<MatchMessage>,
+) {
+    let Some(run_id) = start_run(&db, Site::Indeed).await else {
+        return;
+    };
+    let report = scrape_indeed(
+        &db,
+        indeed.as_ref(),
+        &ScanLimits::default(),
+        batch_sender(&matcher, run_id),
+    )
+    .await;
+    let _ = matcher.send(MatchMessage::RunFinished { run_id, report });
 }
 
 const MAX_COMPANIES_PER_RUN: usize = 8;
@@ -594,23 +672,16 @@ pub(crate) async fn run_scan_for_test<S: JobSource>(
     report
 }
 
-const MAX_INDEED_REQUESTS_PER_RUN: usize = 12;
-const MAX_INDEED_PAGES_PER_QUERY: usize = 2;
-
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct IndeedReport {
-    pub requests: usize,
-    pub error: Option<String>,
-    pub unknown_locations: Vec<String>,
-}
+const MAX_INDEED_REQUESTS_PER_RUN: usize = 24;
+const MAX_INDEED_PAGES_PER_QUERY: usize = 3;
 
 async fn scrape_indeed<I: IndeedSource>(
     db: &Db,
     source: &I,
     limits: &ScanLimits,
     mut on_batch: impl FnMut(&JobSearch, Vec<ScrapedJob>),
-) -> IndeedReport {
-    let mut report = IndeedReport::default();
+) -> ScanReport {
+    let mut report = ScanReport::default();
     let db_for_searches = db.clone();
     let searches = match tokio::task::spawn_blocking(move || db_for_searches.list_searches()).await
     {
@@ -631,7 +702,7 @@ async fn scrape_indeed<I: IndeedSource>(
         let location = criteria.location.as_deref();
         let Some(country) = indeed_country(location) else {
             report
-                .unknown_locations
+                .skipped_locations
                 .push(location.unwrap_or("no location").to_string());
             continue;
         };
@@ -1516,8 +1587,22 @@ mod tests {
         store.create_search(&criteria).unwrap();
         let indeed = FakeIndeed { calls: Mutex::new(Vec::new()) };
         let report = scrape_indeed(&store, &indeed, &fast(), |_, _| {}).await;
-        assert_eq!(report.unknown_locations, vec!["Atlantis".to_string()]);
+        assert_eq!(report.skipped_locations, vec!["Atlantis".to_string()]);
         assert!(indeed.calls.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn each_site_has_its_own_interval() {
+        let (store, dir) = setup(vec![WorkMode::Remote]);
+        assert_eq!(interval_minutes(&store, Site::LinkedIn), 60);
+        assert_eq!(interval_minutes(&store, Site::Indeed), 15);
+        store.set_setting(interval_key(Site::Indeed), "5").unwrap();
+        assert_eq!(interval_minutes(&store, Site::Indeed), 5);
+        assert_eq!(interval_minutes(&store, Site::LinkedIn), 60);
+        store.start_scan_run(Site::LinkedIn).unwrap();
+        assert!(compute_next_run(&store, Site::LinkedIn).unwrap() > Utc::now());
+        assert!(compute_next_run(&store, Site::Indeed).unwrap() <= Utc::now());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

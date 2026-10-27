@@ -26,7 +26,7 @@ use tailor_core::{
     scrape_stage::{ScrapeMessage, DEFAULT_COOLDOWN_SECONDS},
     types::{
         JobListing, JobSearch, JobStatus, MasterResume, ProfileRecord, ResumeProfile, ScanStatus,
-        SearchInput,
+        SearchInput, Site,
     },
 };
 use tokio::sync::Mutex as AsyncMutex;
@@ -145,7 +145,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/jobs/status", post(update_jobs_status))
         .route("/jobs/{id}/score", post(rescore_job).delete(skip_job_score))
         .route("/scan", get(scan_status))
-        .route("/scan/run", post(run_scan_now))
+        .route("/scan/{site}/run", post(run_scan_now))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES + 64 * 1024))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -474,7 +474,7 @@ fn map_score_error(error: ScoreError) -> AppError {
 
 async fn scan_status(
     Extension(state): Extension<Arc<UserServices>>,
-) -> Result<Json<ScanStatus>, AppError> {
+) -> Result<Json<Vec<ScanStatus>>, AppError> {
     let status = ask(&state.senders.scrape, |reply| ScrapeMessage::Status {
         reply,
     })
@@ -484,10 +484,9 @@ async fn scan_status(
 
 async fn run_scan_now(
     Extension(state): Extension<Arc<UserServices>>,
+    Path(site): Path<Site>,
 ) -> Result<StatusCode, AppError> {
-    ask(&state.senders.scrape, |reply| ScrapeMessage::RunNow {
-        reply,
-    })
+    ask(&state.senders.scrape, |reply| ScrapeMessage::RunNow { site, reply })
     .await?
     .map(|()| StatusCode::ACCEPTED)
     .map_err(|message| AppError {

@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
-import { errorMessage, jobsApi, profileApi, type AiStatus } from "../api";
+import { errorMessage, jobsApi, profileApi, type AiStatus, type Settings } from "../api";
 import { ServerStatus } from "../components/Layout";
 import { Alert, Button, Card, PageHeader } from "../components/ui";
 import { useDevMode } from "../devMode";
@@ -32,16 +32,21 @@ function Switch({ checked, onChange, label }: { checked: boolean; onChange: (on:
   );
 }
 
+const SCAN_INTERVALS: [keyof Settings, string][] = [
+  ["scan_interval_minutes", "LinkedIn"],
+  ["indeed_scan_interval_minutes", "Indeed"],
+];
+
 export function SettingsPage() {
   const [devMode, setDevMode] = useDevMode();
-  const [scanInterval, setScanInterval] = useState<number | null>(null);
+  const [intervals, setIntervals] = useState<Settings | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [ai, setAi] = useState<AiStatus | null>(null);
   const [ollamaUrl, setOllamaUrl] = useState("");
 
   useEffect(() => {
     jobsApi.getSettings().then(
-      (s) => setScanInterval(s.scan_interval_minutes),
+      (s) => setIntervals(s),
       (e) => setError(errorMessage(e)),
     );
     profileApi.aiStatus().then(
@@ -79,13 +84,15 @@ export function SettingsPage() {
 
   const models = ai ? Array.from(new Set([ai.resume_reader_model, ...ai.ollama.models])) : [];
 
-  async function changeInterval(minutes: number) {
-    const previous = scanInterval;
-    setScanInterval(minutes);
+  async function changeInterval(key: keyof Settings, minutes: number) {
+    if (!intervals) return;
+    const previous = intervals;
+    const next = { ...intervals, [key]: minutes };
+    setIntervals(next);
     try {
-      await jobsApi.updateSettings({ scan_interval_minutes: minutes });
+      setIntervals(await jobsApi.updateSettings(next));
     } catch (e) {
-      setScanInterval(previous);
+      setIntervals(previous);
       setError(errorMessage(e));
     }
   }
@@ -98,21 +105,23 @@ export function SettingsPage() {
         <Row label="Server">
           <ServerStatus />
         </Row>
-        <Row label="Job scan interval" hint="How often enabled preferences are checked on LinkedIn.">
-          <select
-            aria-label="Job scan interval"
-            value={scanInterval ?? ""}
-            disabled={scanInterval === null}
-            onChange={(e) => changeInterval(Number(e.target.value))}
-            className="rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-sm text-zinc-900 shadow-sm"
-          >
-            {[1, 5, 10, 15, 20, 30, 45, 60].map((m) => (
-              <option key={m} value={m}>
-                Every {m === 60 ? "hour" : `${m} min`}
-              </option>
-            ))}
-          </select>
-        </Row>
+        {SCAN_INTERVALS.map(([key, site]) => (
+          <Row key={key} label={`${site} scan interval`} hint={`How often enabled preferences are checked on ${site}.`}>
+            <select
+              aria-label={`${site} scan interval`}
+              value={intervals?.[key] ?? ""}
+              disabled={intervals === null}
+              onChange={(e) => changeInterval(key, Number(e.target.value))}
+              className="rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-sm text-zinc-900 shadow-sm"
+            >
+              {[1, 5, 10, 15, 20, 30, 45, 60].map((m) => (
+                <option key={m} value={m}>
+                  Every {m === 60 ? "hour" : `${m} min`}
+                </option>
+              ))}
+            </select>
+          </Row>
+        ))}
         <Row label="Resume reader" hint="Reads your uploaded resume. Runs locally in Ollama, for free.">
           {ai === null ? (
             "Checking…"
