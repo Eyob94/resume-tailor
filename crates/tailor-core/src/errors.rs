@@ -33,6 +33,18 @@ pub enum LinkedInError {
 }
 
 #[derive(Debug, Error)]
+pub enum IndeedError {
+    #[error("Indeed is rate-limiting requests (HTTP {0}); will retry next scan")]
+    Blocked(u16),
+    #[error("Indeed returned HTTP {0}")]
+    Status(u16),
+    #[error("couldn't reach Indeed: {0}")]
+    Network(#[from] reqwest::Error),
+    #[error("Indeed sent an unexpected response: {0}")]
+    BadResponse(String),
+}
+
+#[derive(Debug, Error)]
 pub enum DbError {
     #[error(transparent)]
     Db(#[from] rusqlite::Error),

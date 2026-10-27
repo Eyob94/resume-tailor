@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use tokio::{
-    sync::mpsc::{UnboundedReceiver, UnboundedSender},
+    sync::{
+        mpsc::{UnboundedReceiver, UnboundedSender},
+        oneshot,
+    },
     task::JoinHandle,
 };
 
@@ -21,6 +24,9 @@ pub enum MatchMessage {
     RunFinished {
         run_id: i64,
         report: ScanReport,
+    },
+    Flush {
+        reply: oneshot::Sender<()>,
     },
 }
 
@@ -70,6 +76,9 @@ async fn run(db: Arc<Db>, mut rx: UnboundedReceiver<MatchMessage>, scorer: Unbou
                 finish_run(&db, run_id, &report).await;
                 new_matches = 0;
             }
+            MatchMessage::Flush { reply } => {
+                let _ = reply.send(());
+            }
         }
     }
 }
@@ -85,8 +94,10 @@ pub(crate) fn apply_batch(
             card,
             detail,
             description,
+            work_mode,
         } = job;
-        let work_mode = infer_work_mode(&card.title, &card.location, description.as_deref());
+        let work_mode = work_mode
+            .or_else(|| infer_work_mode(&card.title, &card.location, description.as_deref()));
         let job_id = db.upsert_job(&card, detail.as_ref(), work_mode)?;
         let text = format!(
             "{}\n{}",
@@ -112,6 +123,7 @@ pub(crate) fn apply_batch(
 
 async fn finish_run(db: &Arc<Db>, run_id: i64, report: &ScanReport) {
     let status = match (&report.error, report.requests) {
+        (None, _) if report.indeed_error.is_some() => "partial",
         (None, _) => "ok",
         (Some(_), n) if n > 1 => "partial",
         (Some(_), _) => "failed",
@@ -133,6 +145,14 @@ async fn finish_run(db: &Arc<Db>, run_id: i64, report: &ScanReport) {
         notes.push(format!(
             "{} jobs still need details; continuing next scan.",
             report.pending_details
+        ));
+    }
+    if let Some(error) = &report.indeed_error {
+        notes.push(format!("Indeed: {error}."));
+    }
+    for location in &report.indeed_unknown_locations {
+        notes.push(format!(
+            "Indeed was skipped for \"{location}\" because the country couldn't be worked out."
         ));
     }
     let message = (!notes.is_empty()).then(|| notes.join(" "));

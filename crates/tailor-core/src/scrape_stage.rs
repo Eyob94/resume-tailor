@@ -18,9 +18,9 @@ use tokio::{
 
 use crate::{
     db::Db,
-    errors::{DbError, LinkedInError, ScanError},
+    errors::{DbError, IndeedError, LinkedInError, ScanError},
     match_stage::{title_matches, MatchMessage},
-    types::{JobCard, JobDetail, JobSearch, PostedWithin, ScanStatus, WorkMode},
+    types::{JobCard, JobDetail, JobSearch, PostedWithin, ScanStatus, Site, WorkMode},
 };
 
 #[derive(Debug, Clone)]
@@ -28,6 +28,7 @@ pub struct ScrapedJob {
     pub card: JobCard,
     pub detail: Option<JobDetail>,
     pub description: Option<String>,
+    pub work_mode: Option<WorkMode>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +58,8 @@ pub struct ScanReport {
     pub details_paused: bool,
     pub search_blocked: bool,
     pub error: Option<String>,
+    pub indeed_error: Option<String>,
+    pub indeed_unknown_locations: Vec<String>,
 }
 
 struct Budget {
@@ -71,8 +74,14 @@ pub trait JobSource {
     ) -> impl Future<Output = Result<Vec<JobCard>, LinkedInError>> + Send;
     fn job_detail(
         &self,
-        linkedin_id: &str,
+        source_id: &str,
     ) -> impl Future<Output = Result<Option<JobDetail>, LinkedInError>> + Send;
+    fn company_website(
+        &self,
+        _company_url: &str,
+    ) -> impl Future<Output = Result<Option<String>, LinkedInError>> + Send {
+        async { Ok(None) }
+    }
 }
 
 impl JobSource for LinkedInClient {
@@ -85,9 +94,16 @@ impl JobSource for LinkedInClient {
 
     fn job_detail(
         &self,
-        linkedin_id: &str,
+        source_id: &str,
     ) -> impl Future<Output = Result<Option<JobDetail>, LinkedInError>> + Send {
-        LinkedInClient::job_detail(self, linkedin_id)
+        LinkedInClient::job_detail(self, source_id)
+    }
+
+    fn company_website(
+        &self,
+        company_url: &str,
+    ) -> impl Future<Output = Result<Option<String>, LinkedInError>> + Send {
+        LinkedInClient::company_website(self, company_url)
     }
 }
 
@@ -109,6 +125,7 @@ impl ScrapeStage {
     pub fn new(
         db: Arc<Db>,
         client: LinkedInClient,
+        indeed: IndeedClient,
         cooldown_seconds: i64,
         rx: UnboundedReceiver<ScrapeMessage>,
         matcher: UnboundedSender<MatchMessage>,
@@ -116,6 +133,7 @@ impl ScrapeStage {
         let handle = tokio::spawn(run(
             db,
             Arc::new(client),
+            Arc::new(indeed),
             ChronoDuration::seconds(cooldown_seconds),
             rx,
             matcher,
@@ -131,6 +149,7 @@ impl ScrapeStage {
 async fn run(
     db: Arc<Db>,
     client: Arc<LinkedInClient>,
+    indeed: Arc<IndeedClient>,
     cooldown: ChronoDuration,
     mut rx: UnboundedReceiver<ScrapeMessage>,
     matcher: UnboundedSender<MatchMessage>,
@@ -154,10 +173,15 @@ async fn run(
                 run_requested = false;
                 running = true;
                 next_run_at = None;
-                let (db, client, matcher, done_tx) =
-                    (db.clone(), client.clone(), matcher.clone(), done_tx.clone());
+                let (db, client, indeed, matcher, done_tx) = (
+                    db.clone(),
+                    client.clone(),
+                    indeed.clone(),
+                    matcher.clone(),
+                    done_tx.clone(),
+                );
                 tokio::spawn(async move {
-                    scrape_run(db, client, matcher).await;
+                    scrape_run(db, client, indeed, matcher).await;
                     let _ = done_tx.send(());
                 });
                 continue;
@@ -265,9 +289,10 @@ fn check_run_now(db: &Db, running: bool, cooldown: ChronoDuration) -> Result<(),
     Ok(())
 }
 
-async fn scrape_run<S: JobSource + Send + Sync + 'static>(
+async fn scrape_run<S: JobSource + Send + Sync + 'static, I: IndeedSource + Send + Sync + 'static>(
     db: Arc<Db>,
     source: Arc<S>,
+    indeed: Arc<I>,
     matcher: UnboundedSender<MatchMessage>,
 ) {
     let db_for_start = db.clone();
@@ -283,19 +308,72 @@ async fn scrape_run<S: JobSource + Send + Sync + 'static>(
         }
     };
     tracing::info!("scan started");
-    let report = scrape_searches(
-        &db,
-        source.as_ref(),
-        &ScanLimits::default(),
-        |search, jobs| {
-            let _ = matcher.send(MatchMessage::Batch {
-                search: search.clone(),
-                jobs,
-            });
-        },
-    )
-    .await;
+    let send_batch = |search: &JobSearch, jobs| {
+        let _ = matcher.send(MatchMessage::Batch {
+            search: search.clone(),
+            jobs,
+        });
+    };
+    let mut report =
+        scrape_searches(&db, source.as_ref(), &ScanLimits::default(), send_batch).await;
+    let indeed_report =
+        scrape_indeed(&db, indeed.as_ref(), &ScanLimits::default(), send_batch).await;
+    report.requests += indeed_report.requests;
+    report.indeed_error = indeed_report.error;
+    report.indeed_unknown_locations = indeed_report.unknown_locations;
     let _ = matcher.send(MatchMessage::RunFinished { run_id, report });
+    let (flushed_tx, flushed_rx) = oneshot::channel();
+    if matcher.send(MatchMessage::Flush { reply: flushed_tx }).is_ok() {
+        let _ = flushed_rx.await;
+    }
+    fetch_company_sites(&db, source.as_ref(), &ScanLimits::default()).await;
+}
+
+const MAX_COMPANIES_PER_RUN: usize = 8;
+
+async fn fetch_company_sites<S: JobSource>(db: &Db, source: &S, limits: &ScanLimits) {
+    let db_for_list = db.clone();
+    let urls = match tokio::task::spawn_blocking(move || {
+        db_for_list.companies_missing_site(MAX_COMPANIES_PER_RUN)
+    })
+    .await
+    {
+        Ok(Ok(urls)) => urls,
+        Ok(Err(e)) => {
+            tracing::error!("couldn't list companies: {e}");
+            return;
+        }
+        Err(e) => {
+            tracing::error!("couldn't list companies: {e}");
+            return;
+        }
+    };
+    for url in urls {
+        pause(limits).await;
+        let website = match source.company_website(&url).await {
+            Ok(website) => website,
+            Err(LinkedInError::Blocked(status)) => {
+                tracing::warn!(status, "company pages refused, trying again next scan");
+                return;
+            }
+            Err(LinkedInError::Status(status)) => {
+                tracing::warn!(status, url, "company page unavailable");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(url, "company page failed: {e}");
+                continue;
+            }
+        };
+        let db = db.clone();
+        match tokio::task::spawn_blocking(move || db.save_company_site(&url, website.as_deref()))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!("couldn't save company site: {e}"),
+            Err(e) => tracing::error!("couldn't save company site: {e}"),
+        }
+    }
 }
 
 async fn scrape_searches<S: JobSource>(
@@ -407,7 +485,7 @@ async fn scrape_search<S: JobSource>(
             for card in cards {
                 let wanted =
                     criteria.titles.is_empty() || title_matches(&card.title, &criteria.titles);
-                if wanted && seen.insert(card.linkedin_id.clone()) {
+                if wanted && seen.insert(card.source_id.clone()) {
                     candidates.push(card);
                 }
             }
@@ -416,13 +494,13 @@ async fn scrape_search<S: JobSource>(
 
     let mut jobs = Vec::new();
     for card in candidates {
-        let mut description = if let Some(description) = fetched_descriptions.get(&card.linkedin_id)
+        let mut description = if let Some(description) = fetched_descriptions.get(&card.source_id)
         {
             Some(description.clone())
         } else {
             let db_for_known = db.clone();
-            let linkedin_id = card.linkedin_id.clone();
-            match tokio::task::spawn_blocking(move || db_for_known.known_job(&linkedin_id)).await {
+            let source_id = card.source_id.clone();
+            match tokio::task::spawn_blocking(move || db_for_known.known_job(&source_id)).await {
                 Ok(Ok(known)) => known
                     .map(|job| {
                         let _id = job.id;
@@ -446,13 +524,13 @@ async fn scrape_search<S: JobSource>(
                 budget.details -= 1;
                 pause(limits).await;
                 report.requests += 1;
-                match source.job_detail(&card.linkedin_id).await {
+                match source.job_detail(&card.source_id).await {
                     Ok(fetched) => {
                         detail = fetched;
                         description = detail.as_ref().map(|job| job.description.clone());
                         if let Some(description) = &description {
                             fetched_descriptions
-                                .insert(card.linkedin_id.clone(), description.clone());
+                                .insert(card.source_id.clone(), description.clone());
                         }
                     }
                     Err(LinkedInError::Blocked(_)) => {
@@ -468,6 +546,7 @@ async fn scrape_search<S: JobSource>(
             card,
             detail,
             description,
+            work_mode: None,
         });
     }
     (jobs, Ok(()))
@@ -513,6 +592,425 @@ pub(crate) async fn run_scan_for_test<S: JobSource>(
         report.error = Some(error);
     }
     report
+}
+
+const MAX_INDEED_REQUESTS_PER_RUN: usize = 12;
+const MAX_INDEED_PAGES_PER_QUERY: usize = 2;
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct IndeedReport {
+    pub requests: usize,
+    pub error: Option<String>,
+    pub unknown_locations: Vec<String>,
+}
+
+async fn scrape_indeed<I: IndeedSource>(
+    db: &Db,
+    source: &I,
+    limits: &ScanLimits,
+    mut on_batch: impl FnMut(&JobSearch, Vec<ScrapedJob>),
+) -> IndeedReport {
+    let mut report = IndeedReport::default();
+    let db_for_searches = db.clone();
+    let searches = match tokio::task::spawn_blocking(move || db_for_searches.list_searches()).await
+    {
+        Ok(Ok(searches)) => searches,
+        Ok(Err(e)) => {
+            report.error = Some(e.to_string());
+            return report;
+        }
+        Err(e) => {
+            report.error = Some(e.to_string());
+            return report;
+        }
+    };
+
+    let mut budget = MAX_INDEED_REQUESTS_PER_RUN;
+    for search in searches.iter().filter(|search| search.enabled) {
+        let criteria = &search.criteria;
+        let location = criteria.location.as_deref();
+        let Some(country) = indeed_country(location) else {
+            report
+                .unknown_locations
+                .push(location.unwrap_or("no location").to_string());
+            continue;
+        };
+        let queries = if criteria.titles.is_empty() {
+            vec![criteria.keywords.join(" ")]
+        } else {
+            criteria.titles.clone()
+        };
+        let remote_only = criteria.work_modes == [WorkMode::Remote];
+        let mut seen = HashSet::new();
+        let mut found: Vec<IndeedJob> = Vec::new();
+        let mut blocked = false;
+        'queries: for keywords in &queries {
+            let mut cursor: Option<String> = None;
+            for _ in 0..MAX_INDEED_PAGES_PER_QUERY {
+                if budget == 0 {
+                    break 'queries;
+                }
+                budget -= 1;
+                pause(limits).await;
+                report.requests += 1;
+                let query = IndeedQuery {
+                    keywords,
+                    location,
+                    country,
+                    posted_within: criteria.posted_within,
+                    remote_only,
+                    cursor: cursor.as_deref(),
+                };
+                let page = match source.search(&query).await {
+                    Ok(page) => page,
+                    Err(error) => {
+                        blocked = matches!(error, IndeedError::Blocked(_));
+                        report.error = Some(error.to_string());
+                        break 'queries;
+                    }
+                };
+                for job in page.jobs {
+                    let wanted = criteria.titles.is_empty()
+                        || title_matches(&job.card.title, &criteria.titles);
+                    if wanted && seen.insert(job.card.source_id.clone()) {
+                        found.push(job);
+                    }
+                }
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
+            }
+        }
+
+        let sites: Vec<(String, String)> = found
+            .iter()
+            .filter_map(|job| Some((job.card.company_url.clone()?, job.company_website.clone()?)))
+            .collect();
+        if !sites.is_empty() {
+            let db = db.clone();
+            let saved = tokio::task::spawn_blocking(move || {
+                sites
+                    .iter()
+                    .try_for_each(|(url, website)| db.save_company_site(url, Some(website)))
+            })
+            .await;
+            match saved {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::error!("couldn't save company site: {e}"),
+                Err(e) => tracing::error!("couldn't save company site: {e}"),
+            }
+        }
+
+        let jobs = found
+            .into_iter()
+            .map(|job| ScrapedJob {
+                description: Some(job.detail.description.clone()),
+                detail: Some(job.detail),
+                card: job.card,
+                work_mode: job.work_mode,
+            })
+            .collect();
+        on_batch(search, jobs);
+        if blocked {
+            break;
+        }
+    }
+    report
+}
+
+const INDEED_API_URL: &str = "https://apis.indeed.com/graphql";
+const INDEED_API_KEY: &str = "161092c2017b5bbab13edb12461a62d5a833871e7cad6d9d475304573de67ac8";
+const INDEED_USER_AGENT: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Indeed App 193.1";
+const INDEED_APP_INFO: &str = "appv=193.1; appid=com.indeed.jobsearch; osv=16.6.1; os=ios; dtype=phone";
+const INDEED_PAGE_SIZE: usize = 100;
+const INDEED_REMOTE_KEY: &str = "DSQF7";
+const INDEED_HYBRID_KEY: &str = "PAXZC";
+const INDEED_JOB_TYPE_KEYS: &[&str] = &[
+    "CF3CP", "75GKK", "NJXCK", "T9BXE", "T65DZ", "VDTG7", "4HKF7", "CJWTS", "5QWDV",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndeedCountry {
+    pub code: &'static str,
+    pub host: &'static str,
+}
+
+const INDEED_COUNTRIES: &[(&str, &str, &str)] = &[
+    ("AE", "ae.indeed.com", "united arab emirates|uae|dubai|abu dhabi|sharjah|ajman|ras al khaimah|fujairah|al ain"),
+    ("SA", "sa.indeed.com", "saudi arabia|ksa|riyadh|jeddah|dammam|khobar"),
+    ("QA", "qa.indeed.com", "qatar|doha"),
+    ("BH", "bh.indeed.com", "bahrain|manama"),
+    ("KW", "kw.indeed.com", "kuwait"),
+    ("OM", "om.indeed.com", "oman|muscat"),
+    ("EG", "eg.indeed.com", "egypt|cairo|alexandria"),
+    ("US", "www.indeed.com", "united states|united states of america|usa|us|new york|san francisco|seattle|austin|boston|chicago|los angeles|new york city|nyc|california|texas|washington"),
+    ("GB", "uk.indeed.com", "united kingdom|uk|great britain|england|scotland|wales|london|manchester|edinburgh|birmingham|bristol|cambridge|oxford"),
+    ("IE", "ie.indeed.com", "ireland|dublin|cork"),
+    ("CA", "ca.indeed.com", "canada|toronto|vancouver|montreal|ottawa|calgary"),
+    ("DE", "de.indeed.com", "germany|deutschland|berlin|munich|münchen|hamburg|frankfurt|cologne|köln"),
+    ("FR", "fr.indeed.com", "france|paris|lyon"),
+    ("NL", "nl.indeed.com", "netherlands|the netherlands|amsterdam|rotterdam|utrecht|eindhoven"),
+    ("ES", "es.indeed.com", "spain|madrid|barcelona"),
+    ("PT", "pt.indeed.com", "portugal|lisbon|lisboa|porto"),
+    ("IT", "it.indeed.com", "italy|milan|rome"),
+    ("CH", "ch.indeed.com", "switzerland|zurich|zürich|geneva"),
+    ("SE", "se.indeed.com", "sweden|stockholm"),
+    ("PL", "pl.indeed.com", "poland|warsaw|krakow|kraków"),
+    ("IN", "in.indeed.com", "india|bangalore|bengaluru|mumbai|delhi|new delhi|hyderabad|pune|chennai|gurgaon|gurugram|noida"),
+    ("PK", "pk.indeed.com", "pakistan|karachi|lahore|islamabad"),
+    ("SG", "sg.indeed.com", "singapore"),
+    ("MY", "malaysia.indeed.com", "malaysia|kuala lumpur"),
+    ("AU", "au.indeed.com", "australia|sydney|melbourne|brisbane|perth"),
+    ("NZ", "nz.indeed.com", "new zealand|auckland|wellington"),
+    ("ZA", "za.indeed.com", "south africa|cape town|johannesburg"),
+    ("NG", "ng.indeed.com", "nigeria|lagos"),
+    ("JP", "jp.indeed.com", "japan|tokyo"),
+];
+
+pub fn indeed_country(location: Option<&str>) -> Option<IndeedCountry> {
+    let location = location?.to_lowercase();
+    location
+        .rsplit(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .find_map(|part| {
+            INDEED_COUNTRIES
+                .iter()
+                .find(|(_, _, names)| names.split('|').any(|name| name == part))
+        })
+        .map(|(code, host, _)| IndeedCountry { code, host })
+}
+
+pub struct IndeedQuery<'a> {
+    pub keywords: &'a str,
+    pub location: Option<&'a str>,
+    pub country: IndeedCountry,
+    pub posted_within: PostedWithin,
+    pub remote_only: bool,
+    pub cursor: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndeedJob {
+    pub card: JobCard,
+    pub detail: JobDetail,
+    pub work_mode: Option<WorkMode>,
+    pub company_website: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndeedPage {
+    pub jobs: Vec<IndeedJob>,
+    pub next_cursor: Option<String>,
+}
+
+pub trait IndeedSource {
+    fn search(
+        &self,
+        query: &IndeedQuery<'_>,
+    ) -> impl Future<Output = Result<IndeedPage, IndeedError>> + Send;
+}
+
+pub struct IndeedClient {
+    http: reqwest::Client,
+}
+
+impl IndeedClient {
+    pub fn new() -> Result<Self, reqwest::Error> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("indeed-api-key", reqwest::header::HeaderValue::from_static(INDEED_API_KEY));
+        headers.insert("indeed-app-info", reqwest::header::HeaderValue::from_static(INDEED_APP_INFO));
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT_LANGUAGE,
+            reqwest::header::HeaderValue::from_static("en-US,en;q=0.9"),
+        );
+        let http = reqwest::Client::builder()
+            .user_agent(INDEED_USER_AGENT)
+            .default_headers(headers)
+            .timeout(Duration::from_secs(30))
+            .build()?;
+        Ok(Self { http })
+    }
+}
+
+impl IndeedSource for IndeedClient {
+    async fn search(&self, query: &IndeedQuery<'_>) -> Result<IndeedPage, IndeedError> {
+        let res = self
+            .http
+            .post(INDEED_API_URL)
+            .header("indeed-co", query.country.code)
+            .json(&serde_json::json!({ "query": indeed_graphql(query) }))
+            .send()
+            .await?;
+        let status = res.status().as_u16();
+        tracing::info!(kind = "indeed", status, "indeed request");
+        match status {
+            200..=299 => {}
+            403 | 429 => return Err(IndeedError::Blocked(status)),
+            _ => return Err(IndeedError::Status(status)),
+        }
+        let body: serde_json::Value = res.json().await?;
+        parse_indeed_page(&body, query.country.host)
+    }
+}
+
+fn indeed_graphql(query: &IndeedQuery<'_>) -> String {
+    let quote = |text: &str| serde_json::Value::from(text).to_string();
+    let hours = match query.posted_within {
+        PostedWithin::Day => 24,
+        PostedWithin::Week => 24 * 7,
+        PostedWithin::Month => 24 * 30,
+    };
+    let mut filters =
+        vec![format!(r#"{{ date: {{ field: "dateOnIndeed", start: "{hours}h" }} }}"#)];
+    if query.remote_only {
+        filters.push(format!(
+            r#"{{ keyword: {{ field: "attributes", keys: ["{INDEED_REMOTE_KEY}"] }} }}"#
+        ));
+    }
+    let location = query
+        .location
+        .map(|place| format!("location: {{ where: {}, radius: 50, radiusUnit: MILES }}", quote(place)))
+        .unwrap_or_default();
+    let cursor = query
+        .cursor
+        .map(|cursor| format!("cursor: {}", quote(cursor)))
+        .unwrap_or_default();
+    format!(
+        r#"query GetJobData {{
+  jobSearch(what: {what} {location} limit: {INDEED_PAGE_SIZE} {cursor} sort: RELEVANCE filters: [{filters}]) {{
+    pageInfo {{ nextCursor }}
+    results {{
+      job {{
+        key
+        title
+        sourceEmployerName
+        dateOnIndeed
+        description {{ html }}
+        location {{ city countryName formatted {{ long }} }}
+        attributes {{ key label }}
+        employer {{
+          name
+          relativeCompanyPageUrl
+          dossier {{ employerDetails {{ industry }} links {{ corporateWebsite }} }}
+        }}
+      }}
+    }}
+  }}
+}}"#,
+        what = quote(query.keywords),
+        filters = filters.join(", "),
+    )
+}
+
+pub fn parse_indeed_page(body: &serde_json::Value, host: &str) -> Result<IndeedPage, IndeedError> {
+    if let Some(message) = body["errors"][0]["message"].as_str() {
+        return Err(IndeedError::BadResponse(message.chars().take(200).collect()));
+    }
+    let search = &body["data"]["jobSearch"];
+    let results = search["results"]
+        .as_array()
+        .ok_or_else(|| IndeedError::BadResponse("no job results".into()))?;
+    let jobs = results
+        .iter()
+        .filter_map(|result| parse_indeed_job(&result["job"], host))
+        .collect();
+    let next_cursor = search["pageInfo"]["nextCursor"]
+        .as_str()
+        .filter(|cursor| !cursor.is_empty())
+        .map(str::to_string);
+    Ok(IndeedPage { jobs, next_cursor })
+}
+
+fn parse_indeed_job(job: &serde_json::Value, host: &str) -> Option<IndeedJob> {
+    let text = |value: &serde_json::Value| {
+        value
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    let key = text(&job["key"]).filter(|key| key.chars().all(|c| c.is_ascii_alphanumeric()))?;
+    let title = text(&job["title"])?;
+    let html = text(&job["description"]["html"])?;
+    let description = block_text(Html::parse_fragment(&html).root_element());
+    if description.is_empty() {
+        return None;
+    }
+
+    let employer = &job["employer"];
+    let company = text(&job["sourceEmployerName"])
+        .or_else(|| text(&employer["name"]))
+        .unwrap_or_default();
+    let company_url = text(&employer["relativeCompanyPageUrl"])
+        .filter(|path| path.starts_with('/'))
+        .map(|path| format!("https://{host}{path}"));
+    let company_website = text(&employer["dossier"]["links"]["corporateWebsite"])
+        .and_then(|site| reqwest::Url::parse(&site).ok())
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .map(|url| url.to_string());
+
+    let place = text(&job["location"]["formatted"]["long"]).or_else(|| text(&job["location"]["city"]));
+    let country = text(&job["location"]["countryName"]);
+    let location = match (place, country) {
+        (Some(place), Some(country)) if !place.contains(&country) => format!("{place}, {country}"),
+        (Some(place), _) => place,
+        (None, Some(country)) => country,
+        (None, None) => String::new(),
+    };
+    let posted_on = job["dateOnIndeed"]
+        .as_i64()
+        .and_then(DateTime::from_timestamp_millis)
+        .map(|time| time.format("%Y-%m-%d").to_string());
+
+    let attributes: Vec<(&str, &str)> = job["attributes"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| Some((item["key"].as_str()?, item["label"].as_str()?)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let has = |wanted: &str| attributes.iter().any(|(key, _)| *key == wanted);
+    let work_mode = if has(INDEED_REMOTE_KEY) {
+        Some(WorkMode::Remote)
+    } else if has(INDEED_HYBRID_KEY) {
+        Some(WorkMode::Hybrid)
+    } else {
+        None
+    };
+    let job_types: Vec<&str> = attributes
+        .iter()
+        .filter(|(key, _)| INDEED_JOB_TYPE_KEYS.contains(key))
+        .map(|(_, label)| *label)
+        .collect();
+
+    Some(IndeedJob {
+        card: JobCard {
+            source: Site::Indeed,
+            url: format!("https://{host}/viewjob?jk={key}"),
+            source_id: key,
+            title,
+            company,
+            company_url,
+            location,
+            posted_on,
+        },
+        detail: JobDetail {
+            description,
+            seniority: None,
+            employment_type: (!job_types.is_empty()).then(|| job_types.join(", ")),
+            industries: text(&employer["dossier"]["employerDetails"]["industry"]),
+        },
+        work_mode,
+        company_website,
+    })
 }
 
 const SEARCH_PAGE_URL: &str = "https://www.linkedin.com/jobs/search";
@@ -590,15 +1088,20 @@ impl LinkedInClient {
         Ok(parse_search_results(&html))
     }
 
-    pub async fn job_detail(&self, linkedin_id: &str) -> Result<Option<JobDetail>, LinkedInError> {
+    pub async fn job_detail(&self, source_id: &str) -> Result<Option<JobDetail>, LinkedInError> {
         match self
-            .get("detail", &format!("{DETAIL_URL}/{linkedin_id}"), &[], None)
+            .get("detail", &format!("{DETAIL_URL}/{source_id}"), &[], None)
             .await
         {
             Ok(html) => Ok(parse_job_detail(&html)),
             Err(LinkedInError::Status(404 | 410)) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    pub async fn company_website(&self, company_url: &str) -> Result<Option<String>, LinkedInError> {
+        let html = self.get("company", company_url, &[], None).await?;
+        Ok(parse_company_website(&html))
     }
 
     async fn get(
@@ -651,7 +1154,7 @@ pub fn parse_search_results(html: &str) -> Vec<JobCard> {
     let mut cards: Vec<JobCard> = Vec::new();
     for card in doc.select(&card_sel) {
         if let Some(parsed) = parse_card(card) {
-            if !cards.iter().any(|c| c.linkedin_id == parsed.linkedin_id) {
+            if !cards.iter().any(|c| c.source_id == parsed.source_id) {
                 cards.push(parsed);
             }
         }
@@ -661,8 +1164,8 @@ pub fn parse_search_results(html: &str) -> Vec<JobCard> {
 
 fn parse_card(card: ElementRef) -> Option<JobCard> {
     let urn = card.value().attr("data-entity-urn")?;
-    let linkedin_id = urn.rsplit(':').next()?.to_string();
-    if linkedin_id.is_empty() || !linkedin_id.chars().all(|c| c.is_ascii_digit()) {
+    let source_id = urn.rsplit(':').next()?.to_string();
+    if source_id.is_empty() || !source_id.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
 
@@ -686,10 +1189,11 @@ fn parse_card(card: ElementRef) -> Option<JobCard> {
         .and_then(|a| a.value().attr("href"))
         .or_else(|| card.value().attr("href"))
         .map(without_query)
-        .unwrap_or_else(|| format!("https://www.linkedin.com/jobs/view/{linkedin_id}"));
+        .unwrap_or_else(|| format!("https://www.linkedin.com/jobs/view/{source_id}"));
 
     Some(JobCard {
-        linkedin_id,
+        source: Site::LinkedIn,
+        source_id,
         title,
         company,
         company_url,
@@ -697,6 +1201,24 @@ fn parse_card(card: ElementRef) -> Option<JobCard> {
         posted_on,
         url,
     })
+}
+
+pub fn parse_company_website(html: &str) -> Option<String> {
+    let doc = Html::parse_document(html);
+    let href = doc
+        .select(&selector(r#"[data-test-id="about-us__website"] a[href]"#))
+        .next()?
+        .value()
+        .attr("href")?;
+    let mut url = reqwest::Url::parse(href.trim()).ok()?;
+    if url.path().starts_with("/redir/redirect") {
+        let target = url
+            .query_pairs()
+            .find(|(key, _)| key == "url")
+            .map(|(_, value)| value.into_owned())?;
+        url = reqwest::Url::parse(target.trim()).ok()?;
+    }
+    matches!(url.scheme(), "http" | "https").then(|| url.to_string())
 }
 
 pub fn parse_job_detail(html: &str) -> Option<JobDetail> {
@@ -842,7 +1364,8 @@ mod tests {
 
     fn card(id: &str, title: &str) -> JobCard {
         JobCard {
-            linkedin_id: id.into(),
+            source: Site::LinkedIn,
+            source_id: id.into(),
             title: title.into(),
             company: "Acme".into(),
             company_url: None,
@@ -850,6 +1373,152 @@ mod tests {
             posted_on: None,
             url: format!("https://www.linkedin.com/jobs/view/{id}"),
         }
+    }
+
+    fn indeed_body(cursor: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "data": { "jobSearch": {
+                "pageInfo": { "nextCursor": cursor },
+                "results": [
+                    { "job": {
+                        "key": "1b7c87ebd61932f5",
+                        "title": "Senior Backend Engineer",
+                        "sourceEmployerName": "Acme",
+                        "dateOnIndeed": 1793076404324_i64,
+                        "description": { "html": "<p>We use <b>Rust</b> and Kafka.</p><ul><li>Remote friendly</li></ul>" },
+                        "location": { "city": "Dubai", "countryName": "UAE", "formatted": { "long": "Dubai" } },
+                        "attributes": [
+                            { "key": "CF3CP", "label": "Full-time" },
+                            { "key": "DSQF7", "label": "Remote" }
+                        ],
+                        "employer": {
+                            "name": "Acme LLC",
+                            "relativeCompanyPageUrl": "/cmp/Acme",
+                            "dossier": { "employerDetails": { "industry": "Software" }, "links": { "corporateWebsite": "https://acme.example/" } }
+                        }
+                    } },
+                    { "job": {
+                        "key": "abc123",
+                        "title": "Painter Helper",
+                        "description": { "html": "<p>Rust removal and painting.</p>" },
+                        "location": { "city": "Dubai" },
+                        "attributes": [],
+                        "employer": null
+                    } },
+                    { "job": { "key": "nodesc", "title": "Backend Engineer", "description": { "html": "" } } }
+                ]
+            } }
+        })
+    }
+
+    #[test]
+    fn indeed_jobs_are_parsed() {
+        let page = parse_indeed_page(&indeed_body(Some("next")), "ae.indeed.com").unwrap();
+        assert_eq!(page.next_cursor.as_deref(), Some("next"));
+        assert_eq!(page.jobs.len(), 2);
+        let job = &page.jobs[0];
+        assert_eq!(job.card.source, Site::Indeed);
+        assert_eq!(job.card.source_id, "1b7c87ebd61932f5");
+        assert_eq!(job.card.company, "Acme");
+        assert_eq!(job.card.company_url.as_deref(), Some("https://ae.indeed.com/cmp/Acme"));
+        assert_eq!(job.card.location, "Dubai, UAE");
+        assert_eq!(job.card.posted_on.as_deref(), Some("2026-10-27"));
+        assert_eq!(job.card.url, "https://ae.indeed.com/viewjob?jk=1b7c87ebd61932f5");
+        assert!(job.detail.description.contains("Rust"));
+        assert!(!job.detail.description.contains('<'));
+        assert_eq!(job.detail.employment_type.as_deref(), Some("Full-time"));
+        assert_eq!(job.detail.industries.as_deref(), Some("Software"));
+        assert_eq!(job.work_mode, Some(WorkMode::Remote));
+        assert_eq!(job.company_website.as_deref(), Some("https://acme.example/"));
+        assert_eq!(page.jobs[1].company_website, None);
+    }
+
+    #[test]
+    fn indeed_errors_are_reported() {
+        let body = serde_json::json!({ "errors": [{ "message": "bad query" }] });
+        assert!(matches!(
+            parse_indeed_page(&body, "ae.indeed.com"),
+            Err(IndeedError::BadResponse(message)) if message == "bad query"
+        ));
+    }
+
+    #[test]
+    fn indeed_country_comes_from_location() {
+        let code = |place: &str| indeed_country(Some(place)).map(|country| country.code);
+        assert_eq!(code("Dubai"), Some("AE"));
+        assert_eq!(code("Dubai, United Arab Emirates"), Some("AE"));
+        assert_eq!(code("London, UK"), Some("GB"));
+        assert_eq!(code("Austin, Texas, United States"), Some("US"));
+        assert_eq!(code("Atlantis"), None);
+        assert_eq!(indeed_country(None), None);
+        assert_eq!(indeed_country(Some("Berlin")).unwrap().host, "de.indeed.com");
+    }
+
+    struct FakeIndeed {
+        calls: Mutex<Vec<(String, Option<String>, &'static str, bool)>>,
+    }
+
+    impl IndeedSource for FakeIndeed {
+        fn search(
+            &self,
+            query: &IndeedQuery<'_>,
+        ) -> impl Future<Output = Result<IndeedPage, IndeedError>> + Send {
+            self.calls.lock().unwrap().push((
+                query.keywords.to_string(),
+                query.cursor.map(str::to_string),
+                query.country.code,
+                query.remote_only,
+            ));
+            let result = parse_indeed_page(&indeed_body(Some("more")), query.country.host);
+            async move { result }
+        }
+    }
+
+    #[tokio::test]
+    async fn indeed_jobs_are_matched_and_stored() {
+        let (store, dir) = setup(vec![WorkMode::Remote]);
+        let indeed = FakeIndeed { calls: Mutex::new(Vec::new()) };
+        let mut new_matches = 0;
+        let report = scrape_indeed(&store, &indeed, &fast(), |search, jobs| {
+            new_matches += crate::match_stage::apply_batch(&store, search, jobs).unwrap();
+        })
+        .await;
+
+        assert_eq!(report.error, None);
+        assert_eq!(report.requests, MAX_INDEED_PAGES_PER_QUERY);
+        let calls = indeed.calls.lock().unwrap().clone();
+        assert_eq!(calls[0], ("Backend Engineer".into(), None, "AE", true));
+        assert_eq!(calls[1].1.as_deref(), Some("more"));
+        assert_eq!(new_matches, 1);
+        let jobs = store.list_jobs(None).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].source, Site::Indeed);
+        assert_eq!(jobs[0].work_mode, Some(WorkMode::Remote));
+        assert_eq!(jobs[0].company_website.as_deref(), Some("https://acme.example/"));
+        assert!(store.companies_missing_site(8).unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn indeed_skips_unknown_countries() {
+        let dir = crate::db::test_dir("tailor-scan-test");
+        let store = Db::open(&dir).unwrap();
+        let criteria = SearchInput {
+            name: None,
+            titles: vec!["Backend Engineer".into()],
+            keywords: vec![],
+            location: Some("Atlantis".into()),
+            work_modes: vec![WorkMode::Onsite],
+            posted_within: PostedWithin::Week,
+        }
+        .validate()
+        .unwrap();
+        store.create_search(&criteria).unwrap();
+        let indeed = FakeIndeed { calls: Mutex::new(Vec::new()) };
+        let report = scrape_indeed(&store, &indeed, &fast(), |_, _| {}).await;
+        assert_eq!(report.unknown_locations, vec!["Atlantis".to_string()]);
+        assert!(indeed.calls.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn fast() -> ScanLimits {
@@ -916,7 +1585,7 @@ mod tests {
         let jobs = store.list_jobs(None).unwrap();
         assert_eq!(
             jobs.iter()
-                .map(|j| j.linkedin_id.as_str())
+                .map(|j| j.source_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["1"]
         );
@@ -1041,7 +1710,7 @@ mod tests {
             .list_jobs(None)
             .unwrap()
             .into_iter()
-            .map(|j| j.linkedin_id)
+            .map(|j| j.source_id)
             .collect();
         assert_eq!(ids, vec!["3"]);
         std::fs::remove_dir_all(dir).unwrap();
@@ -1147,7 +1816,8 @@ mod linkedin_tests {
         assert_eq!(
             cards[0],
             JobCard {
-                linkedin_id: "4362132219".into(),
+                source: Site::LinkedIn,
+                source_id: "4362132219".into(),
                 title: "Senior Software Engineer- Backend".into(),
                 company: "talabat".into(),
                 company_url: Some("https://ae.linkedin.com/company/talabat-com".into()),
@@ -1172,5 +1842,23 @@ mod linkedin_tests {
     #[test]
     fn detail_without_description_is_none() {
         assert!(parse_job_detail("<html><body>Sign in</body></html>").is_none());
+    }
+
+    #[test]
+    fn company_website_is_unwrapped_from_redirect() {
+        let html = r#"<dl><div data-test-id="about-us__website"><dt>Website</dt><dd>
+            <a class="link-no-visited-state" href="https://www.linkedin.com/redir/redirect?url=https%3A%2F%2Fcmhs%2Euaeu%2Eac%2Eae%2Fen%2Fdepartments%2Ffmd%2F&amp;urlhash=3-Nx&amp;trk=about_website">cmhs.uaeu.ac.ae</a>
+        </dd></div></dl>"#;
+        assert_eq!(
+            parse_company_website(html).as_deref(),
+            Some("https://cmhs.uaeu.ac.ae/en/departments/fmd/")
+        );
+    }
+
+    #[test]
+    fn company_website_rejects_missing_or_unsafe_links() {
+        assert!(parse_company_website("<html><body>Sign in</body></html>").is_none());
+        let html = r#"<div data-test-id="about-us__website"><a href="javascript:alert(1)">x</a></div>"#;
+        assert!(parse_company_website(html).is_none());
     }
 }
