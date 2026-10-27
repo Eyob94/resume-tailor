@@ -58,7 +58,7 @@ export const api = {
 export type WorkMode = "onsite" | "hybrid" | "remote";
 export type PostedWithin = "day" | "week" | "month";
 export type Site = "linkedin" | "indeed";
-export type JobStatus = "new" | "saved" | "dismissed";
+export type JobStatus = "new" | "saved" | "dismissed" | "applied";
 
 export interface SearchInput {
   name?: string;
