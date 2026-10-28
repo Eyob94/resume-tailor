@@ -34,12 +34,6 @@ export function Layout() {
 
   return (
     <div className="flex min-h-screen flex-col md:flex-row">
-      <header className="sticky top-0 z-10 border-b border-zinc-200 bg-white/90 px-4 py-3 backdrop-blur md:hidden">
-        <div className="flex items-center justify-between">
-          <Brand />
-          <button onClick={signOut} className="text-xs text-zinc-500 hover:text-zinc-900">Sign out</button>
-        </div>
-      </header>
       <FanNav items={nav} />
 
       <aside className="sticky top-0 hidden h-screen w-60 shrink-0 flex-col border-r border-zinc-200 bg-white md:flex">
@@ -70,7 +64,7 @@ export function Layout() {
           <ServerStatus />
         </div>
       </aside>
-      <main className="min-w-0 flex-1 px-4 pt-6 pb-28 sm:px-8 md:py-8 md:pb-0 lg:px-12">
+      <main className="min-w-0 flex-1 px-4 pt-[calc(env(safe-area-inset-top)+1.5rem)] pb-28 sm:px-8 md:py-8 md:pb-0 lg:px-12">
         <div className="mx-auto max-w-5xl">
           <Outlet />
         </div>

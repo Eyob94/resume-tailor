@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
+  ArrowUpDown,
   Bookmark,
   BookmarkCheck,
   BookmarkPlus,
@@ -16,6 +17,8 @@ import {
   ExternalLink,
   EyeOff,
   Globe,
+  Inbox,
+  Layers,
   Loader2,
   MoreHorizontal,
   Play,
@@ -23,6 +26,7 @@ import {
   RotateCcw,
   RotateCw,
   Search,
+  Send,
   Trash2,
   XCircle,
 } from "lucide-react";
@@ -46,12 +50,12 @@ import { useDevMode } from "../devMode";
 import { plural, postedLabel, relativeTime } from "../format";
 
 type Filter = JobStatus | "all";
-const FILTERS: [Filter, string][] = [
-  ["new", "New"],
-  ["saved", "Saved"],
-  ["dismissed", "Dismissed"],
-  ["applied", "Applied"],
-  ["all", "All"],
+const FILTERS: [Filter, string, typeof Inbox][] = [
+  ["new", "New", Inbox],
+  ["saved", "Saved", Bookmark],
+  ["applied", "Applied", Send],
+  ["dismissed", "Dismissed", EyeOff],
+  ["all", "All", Layers],
 ];
 const SITE_LABELS: Record<Site, string> = { linkedin: "LinkedIn", indeed: "Indeed" };
 
@@ -64,6 +68,7 @@ export function JobsPage() {
   const [applyingEdit, setApplyingEdit] = useState<"save" | "discard" | null>(null);
   const [filter, setFilter] = useState<Filter>("new");
   const [sort, setSort] = useState<"newest" | "match">("newest");
+  const [openJobId, setOpenJobId] = useState<number | null>(null);
   const [filtersOpen, setFiltersOpen] = useState(() => {
     try {
       return localStorage.getItem("jobs.filtersOpen") === "true";
@@ -207,6 +212,7 @@ export function JobsPage() {
   }
 
   async function runScan(site: Site) {
+    setScans((all) => all?.map((scan) => scan.site === site ? { ...scan, running: true } : scan) ?? null);
     try {
       await jobsApi.runScan(site);
       window.setTimeout(() => {
@@ -214,6 +220,7 @@ export function JobsPage() {
       }, 700);
     } catch (e) {
       setError(errorMessage(e));
+      void jobsApi.scanStatus().then(setScans).catch(() => undefined);
     }
   }
 
@@ -258,13 +265,22 @@ export function JobsPage() {
   const matchScore = (j: JobListing) => (j.score?.status === "ready" ? (j.score.score ?? -1) : -1);
   const visible = sort === "match" ? [...filtered].sort((a, b) => matchScore(b) - matchScore(a)) : filtered;
 
+  useEffect(() => {
+    if (openJobId === null) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpenJobId(null);
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [openJobId]);
+
   return (
     <>
       <PageHeader
         title="Jobs"
         actions={
           searches?.length && !editing ? (
-            <Button variant="primary" icon={Plus} aria-label="New preference" onClick={() => setEditing("new")} className="size-10 p-0 sm:size-auto sm:px-3.5 sm:py-2">
+            <Button variant="primary" icon={Plus} aria-label="New preference" onClick={() => setEditing("new")} className="size-9 !rounded-full p-0 sm:size-auto sm:!rounded-lg sm:px-3.5 sm:py-2">
               <span className="hidden sm:inline">New preference</span>
             </Button>
           ) : null
@@ -359,40 +375,42 @@ export function JobsPage() {
 
       {searches && searches.length > 0 && (
         <section>
-          <div className="mb-4 border-b border-zinc-200">
-            <div className="flex items-end gap-3">
-              <div className="flex min-w-0 flex-1 gap-px overflow-x-auto sm:gap-1" role="tablist">
-                {FILTERS.map(([id, label]) => (
-                  <button
-                    key={id}
-                    role="tab"
-                    aria-selected={filter === id}
-                    onClick={() => setFilter(id)}
-                    className={`-mb-px flex shrink-0 items-center gap-1 whitespace-nowrap border-b-2 px-1 pb-2.5 text-sm font-medium transition-colors sm:gap-2 sm:px-3 ${
-                      filter === id ? "border-zinc-900 text-zinc-900" : "border-transparent text-zinc-500 hover:text-zinc-900"
-                    }`}
-                  >
-                    {label}
-                    <span className="text-xs font-normal text-zinc-400">{counts[id]}</span>
-                  </button>
-                ))}
-              </div>
-              <select
-                aria-label="Sort jobs"
-                value={sort}
-                onChange={(e) => setSort(e.target.value as "newest" | "match")}
-                className="mb-2 hidden shrink-0 border-0 bg-transparent px-2 py-1.5 text-sm text-zinc-600 shadow-none sm:block"
-              >
-                <option value="newest">Newest</option>
-                <option value="match">Best match</option>
-              </select>
+          <div className="flex items-center justify-between gap-2 py-3 sm:gap-3 sm:border-b sm:border-zinc-200 sm:pb-3 sm:pt-0">
+            <div className="hide-scrollbar inline-flex min-w-0 max-w-full items-center gap-1 overflow-x-auto rounded-full bg-zinc-100 p-1" role="tablist">
+              {FILTERS.map(([id, label, Icon]) => (
+                <button
+                  key={id}
+                  role="tab"
+                  aria-selected={filter === id}
+                  aria-label={`${label}, ${counts[id]} jobs`}
+                  onClick={() => setFilter(id)}
+                  className={`inline-flex h-9 shrink-0 items-center rounded-full px-2.5 text-sm font-medium transition-all duration-300 ease-out motion-reduce:transition-none sm:px-3.5 ${
+                    filter === id ? "bg-white px-3.5 text-zinc-900 shadow-sm" : "text-zinc-500 hover:text-zinc-900"
+                  }`}
+                >
+                  <Icon className="size-4 shrink-0" />
+                  <span className={`overflow-hidden whitespace-nowrap transition-all duration-300 ease-out motion-reduce:transition-none ${filter === id ? "ml-1.5 max-w-28 opacity-100" : "ml-0 max-w-0 opacity-0"} sm:ml-1.5 sm:max-w-28 sm:opacity-100`}>{label}</span>
+                  <span className={`ml-1 overflow-hidden text-xs font-normal text-zinc-400 transition-all duration-300 ease-out motion-reduce:transition-none ${filter === id ? "max-w-12 opacity-100" : "max-w-0 opacity-0"} sm:max-w-none sm:opacity-100`}>{counts[id]}</span>
+                </button>
+              ))}
+            </div>
+            <div className="flex shrink-0 items-center gap-1 sm:hidden">
+              <Menu
+                label="Sort jobs"
+                heading="Sort by"
+                trigger={<span className="rounded-lg p-2 text-zinc-500 hover:bg-zinc-100"><ArrowUpDown className="size-4" /></span>}
+                items={[
+                  { label: "Newest", icon: sort === "newest" ? Check : null, onSelect: () => setSort("newest") },
+                  { label: "Best match", icon: sort === "match" ? Check : null, onSelect: () => setSort("match") },
+                ]}
+              />
               {filter === "new" && visible.length > 0 && (
-                <button type="button" title={`Save all ${visible.length} jobs`} onClick={() => saveAll(visible.map((j) => j.id))} className="mb-2 hidden shrink-0 items-center gap-1 text-sm font-medium text-zinc-700 hover:text-zinc-900 sm:inline-flex">
-                  <BookmarkPlus className="size-4" /> Save all
+                <button type="button" aria-label={`Save all ${visible.length}`} title={`Save all ${visible.length}`} onClick={() => saveAll(visible.map((job) => job.id))} className="rounded-lg p-2 text-zinc-500 hover:bg-zinc-100">
+                  <BookmarkPlus className="size-4" />
                 </button>
               )}
             </div>
-            <div className="flex items-center justify-end gap-1 py-1 sm:hidden">
+            <div className="hidden shrink-0 items-center gap-2 sm:flex">
               <select
                 aria-label="Sort jobs"
                 value={sort}
@@ -403,11 +421,9 @@ export function JobsPage() {
                 <option value="match">Best match</option>
               </select>
               {filter === "new" && visible.length > 0 && (
-                <Menu
-                  label="More job list actions"
-                  trigger={<span className="rounded-lg p-2 text-zinc-500 hover:bg-zinc-100"><MoreHorizontal className="size-5" /></span>}
-                  items={[{ label: `Save all ${visible.length}`, icon: BookmarkPlus, onSelect: () => void saveAll(visible.map((job) => job.id)) }]}
-                />
+                <button type="button" title={`Save all ${visible.length} jobs`} onClick={() => saveAll(visible.map((j) => j.id))} className="inline-flex shrink-0 items-center gap-1 text-sm font-medium text-zinc-700 hover:text-zinc-900">
+                  <BookmarkPlus className="size-4" /> Save all
+                </button>
               )}
             </div>
           </div>
@@ -419,14 +435,24 @@ export function JobsPage() {
               {filter === "new" ? "No new jobs. New matches show up here after each scan." : "Nothing here."}
             </p>
           ) : (
-            <div className="divide-y divide-zinc-200 border-y border-zinc-200">
+            <div className="divide-y divide-zinc-200 border-b border-zinc-200">
               {visible.map((job) => (
-                <JobRow key={job.id} job={job} resumeConfirmed={resumeConfirmed} onStatus={(s) => setStatus(job, s)} onRescore={() => rescore(job)} onSkip={() => skipScore(job)} />
+                <JobRow
+                  key={job.id}
+                  job={job}
+                  resumeConfirmed={resumeConfirmed}
+                  open={openJobId === job.id}
+                  onToggle={() => setOpenJobId((current) => current === job.id ? null : job.id)}
+                  onStatus={(s) => { void setStatus(job, s); setOpenJobId(null); }}
+                  onRescore={() => rescore(job)}
+                  onSkip={() => skipScore(job)}
+                />
               ))}
             </div>
           )}
         </section>
       )}
+      {openJobId !== null && <div className="fixed inset-0 z-30 bg-zinc-50/50 backdrop-blur-[2px] transition-opacity" onClick={() => setOpenJobId(null)} />}
       {pendingEdit && (
         <Dialog
           title="Start a new search?"
@@ -456,35 +482,35 @@ export function JobsPage() {
 }
 
 function ScanLine({ scans, onRun }: { scans: ScanStatus[]; onRun: (site: Site) => void }) {
-  const details = (scan: ScanStatus) => {
-    const last = scan.last_run;
-    return [
-      last?.message,
-      last && `${last.new_matches} new ${last.new_matches === 1 ? "match" : "matches"}`,
-      scan.next_run_at && `Next scan ${relativeTime(scan.next_run_at)}`,
-      `Every ${scan.interval_minutes} min`,
-    ].filter(Boolean).join(" · ");
-  };
-
   return (
-    <div className="mt-3 flex flex-nowrap items-center gap-x-2 overflow-x-auto text-sm text-zinc-500 sm:flex-wrap">
-      {scans.map((scan, index) => {
+    <div className="mt-3 divide-y divide-zinc-100 rounded-xl bg-white ring-1 ring-zinc-200">
+      {scans.map((scan) => {
         const last = scan.last_run;
         const problem = last && (last.status === "partial" || last.status === "failed");
-        return <span key={scan.site} className="contents">
-          {index > 0 && <span className="text-zinc-300">·</span>}
-          <span title={details(scan)} className="inline-flex items-center gap-1">
-            {scan.running ? <><Loader2 className="size-3.5 animate-spin" />{SITE_LABELS[scan.site]} scanning…</> : problem ? <><AlertTriangle className="size-3.5 text-amber-500" />{SITE_LABELS[scan.site]} {relativeTime(last.started_at)}</> : <>{SITE_LABELS[scan.site]} {last ? relativeTime(last.started_at) : "not scanned yet"}</>}
-          </span>
-        </span>;
+        return (
+          <div key={scan.site} className="flex items-center gap-3 px-3 py-2.5 text-sm">
+            <span className={`size-2 shrink-0 rounded-full ${scan.site === "linkedin" ? "bg-sky-500" : "bg-violet-500"}`} />
+            <span className="w-16 shrink-0 font-medium text-zinc-800">{SITE_LABELS[scan.site]}</span>
+            <div className="min-w-0 flex-1">
+              <div className="flex min-w-0 items-center gap-1 text-zinc-500">
+                {problem && <AlertTriangle className="size-3.5 shrink-0 text-amber-500" />}
+                <span className="truncate">{scan.running ? "Scanning…" : last ? relativeTime(last.started_at) : "Not scanned yet"}</span>
+              </div>
+              {problem && last.message && <p className="truncate text-xs text-amber-700">{last.message}</p>}
+            </div>
+            <button
+              type="button"
+              aria-label={`Run ${SITE_LABELS[scan.site]} scan`}
+              onClick={() => onRun(scan.site)}
+              disabled={scan.running}
+              className="inline-flex shrink-0 items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium text-zinc-700 ring-1 ring-zinc-200 hover:bg-zinc-50 disabled:pointer-events-none disabled:opacity-50"
+            >
+              {scan.running ? <Loader2 className="size-3 animate-spin" /> : <Play className="size-3" />}
+              Run
+            </button>
+          </div>
+        );
       })}
-      {scans.length > 0 && <span className="text-zinc-300">·</span>}
-      <Menu
-        label="Run a scan now"
-        align="left"
-        trigger={<span className="inline-flex items-center gap-1 font-medium text-zinc-700 hover:text-zinc-900"><Play className="size-3.5" />Run now<ChevronDown className="size-3.5" /></span>}
-        items={scans.map((scan) => ({ label: SITE_LABELS[scan.site], onSelect: () => onRun(scan.site), disabled: scan.running }))}
-      />
     </div>
   );
 }
@@ -556,21 +582,29 @@ function MatchDetails({ score }: { score: JobScore }) {
 function JobRow({
   job,
   resumeConfirmed,
+  open,
+  onToggle,
   onStatus,
   onRescore,
   onSkip,
 }: {
   job: JobListing;
   resumeConfirmed: boolean;
+  open: boolean;
+  onToggle: () => void;
   onStatus: (s: JobStatus) => void;
   onRescore: () => void;
   onSkip: () => void;
 }) {
-  const [open, setOpen] = useState(false);
+  const rowRef = useRef<HTMLDivElement>(null);
   const [fullDescription, setFullDescription] = useState(false);
   const [showJson, setShowJson] = useState(false);
   const [copied, setCopied] = useState(false);
   const [devMode] = useDevMode();
+
+  useEffect(() => {
+    if (open) rowRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [open]);
   const statusButtonBase = "inline-flex items-center justify-center rounded-lg p-2 transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:pointer-events-none disabled:opacity-50 sm:gap-2 sm:border sm:border-zinc-200 sm:bg-white sm:px-3.5 sm:py-2 sm:shadow-sm";
   const statusButtonMuted = `${statusButtonBase} text-zinc-500 hover:bg-zinc-100 sm:text-zinc-700 sm:hover:bg-zinc-50 sm:hover:text-zinc-900`;
   const statusButtonActive = `${statusButtonBase} text-zinc-900 hover:bg-zinc-100 sm:text-zinc-700 sm:hover:bg-zinc-50 sm:hover:text-zinc-900`;
@@ -598,20 +632,23 @@ function JobRow({
     { key: "source", value: SITE_LABELS[job.source] },
     { key: "keywords", value: keywordLabel },
   ].filter((part): part is { key: string; value: string } => Boolean(part.value));
-  const expandedMetaParts = desktopMetaParts.filter((part) => part.key !== "company" && part.key !== "posted");
+  const expandedMetaParts = desktopMetaParts.filter((part) => part.key === "city" || part.key === "work-mode" || part.key === "source" || part.key === "keywords");
 
   return (
-    <div className={`py-3 sm:py-3.5 ${job.status === "dismissed" ? "opacity-60" : ""}`}>
-      <div className="flex items-start gap-3 pr-14 sm:pr-0">
+    <div
+      ref={rowRef}
+      className={`py-3 transition-all duration-200 sm:py-3.5 ${job.status === "dismissed" ? "opacity-60" : ""} ${open ? "relative z-40 -mx-3 rounded-2xl bg-white px-3 shadow-xl ring-1 ring-zinc-200" : ""}`}
+    >
+      <div className="flex items-start gap-3">
         <div
           role="button"
           tabIndex={0}
           aria-expanded={open}
-          onClick={() => setOpen((value) => !value)}
+          onClick={onToggle}
           onKeyDown={(event) => {
             if (event.key === "Enter" || event.key === " ") {
               event.preventDefault();
-              setOpen((value) => !value);
+              onToggle();
             }
           }}
           className="min-w-0 flex-1 cursor-pointer"
@@ -652,12 +689,11 @@ function JobRow({
       </div>
 
       {open && (
-        <div className="mt-3 rounded-lg bg-zinc-50 p-4">
-          <div className="mb-3 flex flex-wrap items-center gap-x-1.5 text-sm text-zinc-500">
-            {expandedMetaParts.map((part, index) => (
-              <span key={part.key} className="inline-flex shrink-0 items-center gap-x-1.5 whitespace-nowrap">
-                {part.key === "source" ? sourceBadge : <span className={part.key === "keywords" ? "text-emerald-700" : ""}>{part.value}</span>}
-                {index < expandedMetaParts.length - 1 && <span className="text-zinc-300">·</span>}
+        <div className="mt-3 pb-3">
+          <div className="mb-3 flex flex-wrap items-center text-xs text-zinc-500">
+            {expandedMetaParts.map((part) => (
+              <span key={part.key} className="after:mx-1.5 after:text-zinc-300 after:content-['·'] last:after:content-none">
+                {part.value}
               </span>
             ))}
           </div>
@@ -693,14 +729,14 @@ function JobRow({
             <p className={`whitespace-pre-wrap text-sm leading-relaxed text-zinc-700 ${fullDescription ? "" : "line-clamp-4"}`}>{job.description}</p>
             {job.description.length > 400 && <button type="button" onClick={() => setFullDescription((value) => !value)} className="mt-1 text-sm font-medium text-zinc-700 hover:text-zinc-900">{fullDescription ? "Show less" : "Show full description"}</button>}
           </> : <p className="text-sm leading-relaxed text-zinc-700">Description not fetched yet.</p>}
-          <div className="mt-3 flex flex-wrap items-center gap-4 text-sm text-zinc-500">
-            <button onClick={copyDescription} disabled={!job.description} className="inline-flex items-center gap-1 hover:text-zinc-900 disabled:cursor-not-allowed disabled:opacity-50" aria-label={`Copy ${job.title} description`}>
-              {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}{copied ? "Copied" : "Copy description"}
+          <div className="hide-scrollbar -mx-3 mt-4 flex gap-2 overflow-x-auto px-3">
+            <button onClick={copyDescription} disabled={!job.description} className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-zinc-100 px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-200 disabled:cursor-not-allowed disabled:opacity-50" aria-label={`Copy ${job.title} description`}>
+              {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}{copied ? "Copied" : "Copy"}
             </button>
-            <a href={job.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:text-zinc-900"><ExternalLink className="size-3.5" />{SITE_LABELS[job.source]}</a>
-            {job.company_url && <a href={job.company_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:text-zinc-900"><Building2 className="size-3.5" />Company page</a>}
-            {job.company_website && <a href={job.company_website} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:text-zinc-900"><Globe className="size-3.5" />Company site</a>}
-            {devMode && <button onClick={() => setShowJson((value) => !value)} className="inline-flex items-center gap-1 hover:text-zinc-900"><Braces className="size-3.5" />JSON</button>}
+            <a href={job.url} target="_blank" rel="noreferrer" className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-zinc-100 px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-200"><ExternalLink className="size-3.5" />{SITE_LABELS[job.source]}</a>
+            {job.company_url && <a href={job.company_url} target="_blank" rel="noreferrer" className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-zinc-100 px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-200"><Building2 className="size-3.5" />Company page</a>}
+            {job.company_website && <a href={job.company_website} target="_blank" rel="noreferrer" className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-zinc-100 px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-200"><Globe className="size-3.5" />Company site</a>}
+            {devMode && <button onClick={() => setShowJson((value) => !value)} className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-zinc-100 px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-200"><Braces className="size-3.5" />JSON</button>}
           </div>
           {devMode && showJson && <div className="mt-3"><JsonView value={job} fileName={`job-${job.source_id}.json`} note="Stored job record" /></div>}
         </div>
