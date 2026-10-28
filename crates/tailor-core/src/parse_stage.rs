@@ -149,7 +149,10 @@ async fn start_reading(
     let config = ai_step_config(&db, AiStep::ReadResume).await?;
     let model = Ollama::new(&ollama_url, &config.model);
     let label = JsonModel::label(&model);
-    let id = db.start_profile(&uploaded_at, &label).await?;
+    let id = db
+        .start_profile(&uploaded_at, &label)
+        .await?
+        .ok_or(ProfileError::NoResume)?;
     let model = Ollama::new(&ollama_url, &config.model);
     tokio::spawn(async move {
         tracing::info!(model = %label, "reading resume");

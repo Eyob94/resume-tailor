@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use chrono::Utc;
-use sqlx::{PgPool, Row};
+use sqlx::{postgres::PgRow, PgPool, Row};
 
 use crate::{
     errors::DbError,
@@ -67,9 +67,9 @@ impl Db {
         Ok(resume)
     }
 
-    pub async fn resume_pdf(&self) -> Result<Option<Vec<u8>>, DbError> {
+    pub async fn resume_pdf(&self) -> Result<Option<(String, Vec<u8>)>, DbError> {
         Ok(
-            sqlx::query_scalar("SELECT pdf FROM master_resume WHERE user_id = $1")
+            sqlx::query_as("SELECT file_name, pdf FROM master_resume WHERE user_id = $1")
                 .bind(self.user_id)
                 .fetch_optional(&self.pool)
                 .await?,
@@ -211,13 +211,9 @@ impl Db {
         job_id: i64,
         keywords: &[String],
     ) -> Result<bool, DbError> {
-        let mut tx = self.pool.begin().await?;
-        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM search_matches m JOIN jobs j ON j.id=m.job_id JOIN job_searches q ON q.id=m.search_id WHERE m.search_id=$1 AND m.job_id=$2 AND j.user_id=$3 AND q.user_id=$3)")
-            .bind(search_id).bind(job_id).bind(self.user_id).fetch_one(&mut *tx).await?;
-        let inserted = sqlx::query("INSERT INTO search_matches (search_id, job_id, matched_keywords, matched_at) SELECT $1,$2,$3,$4 WHERE EXISTS (SELECT 1 FROM jobs WHERE id=$2 AND user_id=$5) AND EXISTS (SELECT 1 FROM job_searches WHERE id=$1 AND user_id=$5) ON CONFLICT (search_id, job_id) DO UPDATE SET matched_keywords=EXCLUDED.matched_keywords")
-            .bind(search_id).bind(job_id).bind(serde_json::to_string(keywords)?).bind(now()).bind(self.user_id).execute(&mut *tx).await?.rows_affected();
-        tx.commit().await?;
-        Ok(!exists && inserted > 0)
+        let inserted = sqlx::query_scalar::<_, bool>("INSERT INTO search_matches (search_id, job_id, matched_keywords, matched_at) SELECT $1, $2, $3, $4 WHERE EXISTS (SELECT 1 FROM jobs WHERE id = $2 AND user_id = $5) AND EXISTS (SELECT 1 FROM job_searches WHERE id = $1 AND user_id = $5) ON CONFLICT (search_id, job_id) DO UPDATE SET matched_keywords = EXCLUDED.matched_keywords RETURNING (xmax = 0) AS inserted")
+            .bind(search_id).bind(job_id).bind(serde_json::to_string(keywords)?).bind(now()).bind(self.user_id).fetch_optional(&self.pool).await?;
+        Ok(inserted.unwrap_or(false))
     }
 
     pub async fn remove_match(&self, search_id: i64, job_id: i64) -> Result<bool, DbError> {
@@ -411,7 +407,7 @@ impl Db {
 
     pub async fn set_jobs_status(&self, ids: &[i64], status: JobStatus) -> Result<usize, DbError> {
         Ok(
-            sqlx::query("UPDATE jobs SET status=$3,updated_at=$4 WHERE id=ANY($1) AND user_id=$2")
+            sqlx::query("UPDATE jobs SET status=$3,updated_at=$4 WHERE id=ANY($1) AND user_id=$2 AND status<>$3")
                 .bind(ids)
                 .bind(self.user_id)
                 .bind(status.as_str())
@@ -485,8 +481,8 @@ impl Db {
         &self,
         resume_uploaded_at: &str,
         model: &str,
-    ) -> Result<i64, DbError> {
-        Ok(sqlx::query_scalar("INSERT INTO resume_profiles (user_id,resume_uploaded_at,status,model,created_at,updated_at) SELECT $1,$2,'reading',$3,$4,$4 WHERE EXISTS(SELECT 1 FROM master_resume WHERE user_id=$1) RETURNING id").bind(self.user_id).bind(resume_uploaded_at).bind(model).bind(now()).fetch_one(&self.pool).await?)
+    ) -> Result<Option<i64>, DbError> {
+        Ok(sqlx::query_scalar("INSERT INTO resume_profiles (user_id,resume_uploaded_at,status,model,created_at,updated_at) SELECT $1,$2,'reading',$3,$4,$4 WHERE EXISTS(SELECT 1 FROM master_resume WHERE user_id=$1) RETURNING id").bind(self.user_id).bind(resume_uploaded_at).bind(model).bind(now()).fetch_optional(&self.pool).await?)
     }
 
     pub async fn finish_profile(
@@ -504,6 +500,23 @@ impl Db {
         Ok(())
     }
 
+    fn profile_from_row(row: &PgRow) -> Result<ProfileRecord, DbError> {
+        let data: Option<String> = row.try_get("data")?;
+        let warnings: String = row.try_get("warnings")?;
+        Ok(ProfileRecord {
+            id: row.try_get("id")?,
+            resume_uploaded_at: row.try_get("resume_uploaded_at")?,
+            status: row.try_get("status")?,
+            model: row.try_get("model")?,
+            profile: data.map(|value| serde_json::from_str(&value)).transpose()?,
+            warnings: serde_json::from_str(&warnings)?,
+            error: row.try_get("error")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+            confirmed_at: row.try_get("confirmed_at")?,
+        })
+    }
+
     async fn profile_by_query(
         &self,
         query: &str,
@@ -514,23 +527,7 @@ impl Db {
             .bind(self.user_id)
             .fetch_optional(&self.pool)
             .await?;
-        row.map(|row| {
-            let data: Option<String> = row.try_get("data")?;
-            let warnings: String = row.try_get("warnings")?;
-            Ok(ProfileRecord {
-                id: row.try_get("id")?,
-                resume_uploaded_at: row.try_get("resume_uploaded_at")?,
-                status: row.try_get("status")?,
-                model: row.try_get("model")?,
-                profile: data.map(|value| serde_json::from_str(&value)).transpose()?,
-                warnings: serde_json::from_str(&warnings)?,
-                error: row.try_get("error")?,
-                created_at: row.try_get("created_at")?,
-                updated_at: row.try_get("updated_at")?,
-                confirmed_at: row.try_get("confirmed_at")?,
-            })
-        })
-        .transpose()
+        row.as_ref().map(Self::profile_from_row).transpose()
     }
 
     pub async fn latest_profile(
@@ -548,23 +545,7 @@ impl Db {
         .bind(self.user_id)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|row| {
-            let data: Option<String> = row.try_get("data")?;
-            let warnings: String = row.try_get("warnings")?;
-            Ok(ProfileRecord {
-                id: row.try_get("id")?,
-                resume_uploaded_at: row.try_get("resume_uploaded_at")?,
-                status: row.try_get("status")?,
-                model: row.try_get("model")?,
-                profile: data.map(|value| serde_json::from_str(&value)).transpose()?,
-                warnings: serde_json::from_str(&warnings)?,
-                error: row.try_get("error")?,
-                created_at: row.try_get("created_at")?,
-                updated_at: row.try_get("updated_at")?,
-                confirmed_at: row.try_get("confirmed_at")?,
-            })
-        })
-        .transpose()
+        row.as_ref().map(Self::profile_from_row).transpose()
     }
 
     pub async fn save_profile_edits(
@@ -589,6 +570,7 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{Contact, Importance, SearchInput, Verdict};
     use sqlx::PgPool;
 
     async fn user_id(pool: &PgPool) -> i64 {
@@ -598,6 +580,32 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    fn criteria(title: &str) -> SearchCriteria {
+        SearchInput {
+            name: None,
+            titles: vec![title.into()],
+            keywords: vec!["Rust".into()],
+            location: Some("Dubai".into()),
+            work_modes: vec![WorkMode::Hybrid],
+            posted_within: PostedWithin::Week,
+        }
+        .validate()
+        .unwrap()
+    }
+
+    fn card(id: &str) -> JobCard {
+        JobCard {
+            source: Site::LinkedIn,
+            source_id: id.into(),
+            title: "Backend Engineer".into(),
+            company: "Acme".into(),
+            company_url: None,
+            location: "Dubai".into(),
+            posted_on: Some("2026-10-19".into()),
+            url: format!("https://www.linkedin.com/jobs/view/{id}"),
+        }
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -641,6 +649,35 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn save_replace_and_delete(pool: PgPool) {
+        let store = Db::for_user(pool.clone(), user_id(&pool).await);
+        assert!(store.get_resume().await.unwrap().is_none());
+
+        let info = PdfInfo {
+            page_count: 1,
+            text: "first".into(),
+        };
+        store.save_resume("a.pdf", b"%PDF-1", &info).await.unwrap();
+        let info = PdfInfo {
+            page_count: 2,
+            text: "second".into(),
+        };
+        store.save_resume("b.pdf", b"%PDF-22", &info).await.unwrap();
+
+        let resume = store.get_resume().await.unwrap().unwrap();
+        assert_eq!(resume.file_name, "b.pdf");
+        assert_eq!(resume.page_count, 2);
+        assert_eq!(
+            store.resume_pdf().await.unwrap(),
+            Some(("b.pdf".to_string(), b"%PDF-22".to_vec()))
+        );
+
+        assert!(store.delete_resume().await.unwrap());
+        assert!(store.get_resume().await.unwrap().is_none());
+        assert_eq!(store.resume_pdf().await.unwrap(), None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn resume_pdf_is_stored_and_deleted_with_its_record(pool: PgPool) {
         let store = Db::for_user(pool.clone(), user_id(&pool).await);
         let info = PdfInfo {
@@ -652,10 +689,487 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.resume_pdf().await.unwrap().as_deref(),
-            Some(&b"%PDF-content"[..])
+            store.resume_pdf().await.unwrap(),
+            Some(("resume.pdf".to_string(), b"%PDF-content".to_vec()))
         );
         assert!(store.delete_resume().await.unwrap());
         assert_eq!(store.resume_pdf().await.unwrap(), None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn search_crud(pool: PgPool) {
+        let store = Db::for_user(pool.clone(), user_id(&pool).await);
+        let search = store
+            .create_search(&criteria("Backend Engineer"))
+            .await
+            .unwrap();
+        assert_eq!(search.criteria.titles, vec!["Backend Engineer"]);
+
+        let updated = store
+            .update_search(search.id, &criteria("Platform Engineer"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.criteria.titles, vec!["Platform Engineer"]);
+        assert!(store
+            .update_search(999, &criteria("x"))
+            .await
+            .unwrap()
+            .is_none());
+
+        assert!(store.delete_search(search.id).await.unwrap());
+        assert!(store.list_searches().await.unwrap().is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn scoring_queue_picks_saved_jobs_for_the_confirmed_profile(pool: PgPool) {
+        let store = Db::for_user(pool.clone(), user_id(&pool).await);
+        assert!(store.current_confirmed_profile().await.unwrap().is_none());
+
+        let resume = store
+            .save_resume(
+                "cv.pdf",
+                b"%PDF-1",
+                &PdfInfo {
+                    page_count: 1,
+                    text: "cv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let profile_id = store
+            .start_profile(&resume.uploaded_at, "fake")
+            .await
+            .unwrap()
+            .unwrap();
+        let profile = ResumeProfile::default();
+        store
+            .finish_profile(profile_id, &profile, &[])
+            .await
+            .unwrap();
+        assert!(store.current_confirmed_profile().await.unwrap().is_none());
+        store.confirm_profile(profile_id).await.unwrap();
+        assert_eq!(
+            store.current_confirmed_profile().await.unwrap().unwrap().id,
+            profile_id
+        );
+
+        let detail = JobDetail {
+            description: "Rust".into(),
+            seniority: None,
+            employment_type: None,
+            industries: None,
+        };
+        let job = store
+            .upsert_job(&card("1"), Some(&detail), None)
+            .await
+            .unwrap();
+        let undescribed = store.upsert_job(&card("2"), None, None).await.unwrap();
+        store
+            .set_jobs_status(&[job, undescribed], JobStatus::Saved)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .next_job_to_score(profile_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .job_id,
+            job
+        );
+
+        store.start_score(job, profile_id, "fake").await.unwrap();
+        assert!(store.next_job_to_score(profile_id).await.unwrap().is_none());
+        assert!(store
+            .next_job_to_score(profile_id + 1)
+            .await
+            .unwrap()
+            .is_none());
+
+        let reqs = vec![Requirement {
+            text: "Rust".into(),
+            importance: Importance::Must,
+            verdict: Verdict::Met,
+            evidence: None,
+        }];
+        store
+            .finish_score(job, 80, "Good fit.", &reqs)
+            .await
+            .unwrap();
+        assert!(store.next_job_to_score(profile_id).await.unwrap().is_none());
+        assert_eq!(
+            store
+                .next_job_to_score(profile_id + 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .job_id,
+            job
+        );
+
+        let search = store
+            .create_search(&criteria("Backend Engineer"))
+            .await
+            .unwrap();
+        store.add_match(search.id, job, &[]).await.unwrap();
+        let listed = store.list_jobs(None).await.unwrap();
+        let score = listed[0].score.as_ref().unwrap();
+        assert_eq!(
+            (score.status.as_str(), score.score, score.requirements.len()),
+            ("ready", Some(80), 1)
+        );
+
+        store.clear_score(job).await.unwrap();
+        assert_eq!(
+            store
+                .next_job_to_score(profile_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .job_id,
+            job
+        );
+        store.set_job_status(job, JobStatus::New).await.unwrap();
+        assert!(store.next_job_to_score(profile_id).await.unwrap().is_none());
+
+        store.set_job_status(job, JobStatus::Saved).await.unwrap();
+        store.start_score(job, profile_id, "fake").await.unwrap();
+        assert!(store.next_job_to_score(profile_id).await.unwrap().is_none());
+        store.skip_score(job, profile_id).await.unwrap();
+        store
+            .finish_score(job, 90, "late result", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.score_status(job).await.unwrap().as_deref(),
+            Some("skipped")
+        );
+        assert!(store.next_job_to_score(profile_id).await.unwrap().is_none());
+        assert!(store
+            .next_job_to_score(profile_id + 1)
+            .await
+            .unwrap()
+            .is_none());
+        store.clear_score(job).await.unwrap();
+        store.start_score(job, profile_id, "fake").await.unwrap();
+        store.requeue_interrupted_scores().await.unwrap();
+        assert_eq!(store.score_status(job).await.unwrap(), None);
+        assert_eq!(
+            store
+                .next_job_to_score(profile_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .job_id,
+            job
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn scoring_queue_puts_enabled_preferences_first(pool: PgPool) {
+        let store = Db::for_user(pool.clone(), user_id(&pool).await);
+        let detail = JobDetail {
+            description: "Rust".into(),
+            seniority: None,
+            employment_type: None,
+            industries: None,
+        };
+        let paused_job = store
+            .upsert_job(&card("1"), Some(&detail), None)
+            .await
+            .unwrap();
+        let enabled_job = store
+            .upsert_job(&card("2"), Some(&detail), None)
+            .await
+            .unwrap();
+        store
+            .set_jobs_status(&[enabled_job], JobStatus::Saved)
+            .await
+            .unwrap();
+        store
+            .set_jobs_status(&[paused_job], JobStatus::Saved)
+            .await
+            .unwrap();
+
+        let paused = store
+            .create_search(&criteria("Backend Engineer"))
+            .await
+            .unwrap();
+        let enabled = store
+            .create_search(&criteria("Platform Engineer"))
+            .await
+            .unwrap();
+        store.set_search_enabled(paused.id, false).await.unwrap();
+        store.add_match(paused.id, paused_job, &[]).await.unwrap();
+        store.add_match(enabled.id, enabled_job, &[]).await.unwrap();
+
+        assert_eq!(
+            store.next_job_to_score(1).await.unwrap().unwrap().job_id,
+            enabled_job
+        );
+        store.set_search_enabled(enabled.id, false).await.unwrap();
+        assert_eq!(
+            store.next_job_to_score(1).await.unwrap().unwrap().job_id,
+            paused_job
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn upsert_keeps_description_and_matches_fold(pool: PgPool) {
+        let store = Db::for_user(pool.clone(), user_id(&pool).await);
+        let a = store
+            .create_search(&criteria("Backend Engineer"))
+            .await
+            .unwrap();
+        let b = store.create_search(&criteria("Engineer")).await.unwrap();
+
+        let detail = JobDetail {
+            description: "Rust and Kafka".into(),
+            seniority: Some("Mid-Senior level".into()),
+            employment_type: None,
+            industries: None,
+        };
+        let id = store
+            .upsert_job(&card("1"), Some(&detail), Some(WorkMode::Hybrid))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .upsert_job(&card("1"), None, Some(WorkMode::Hybrid))
+                .await
+                .unwrap(),
+            id
+        );
+        assert_eq!(
+            store
+                .known_job("1")
+                .await
+                .unwrap()
+                .unwrap()
+                .description
+                .as_deref(),
+            Some("Rust and Kafka")
+        );
+
+        assert!(store.add_match(a.id, id, &["Rust".into()]).await.unwrap());
+        assert!(!store.add_match(a.id, id, &["Rust".into()]).await.unwrap());
+        assert!(store.add_match(b.id, id, &["Kafka".into()]).await.unwrap());
+
+        let jobs = store.list_jobs(None).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].search_ids, vec![a.id, b.id]);
+        assert_eq!(jobs[0].matched_keywords, vec!["Rust", "Kafka"]);
+        assert_eq!(jobs[0].work_mode, Some(WorkMode::Hybrid));
+
+        assert_eq!(jobs[0].tailored_at, None);
+        assert_eq!(
+            store
+                .set_jobs_status(&[id, 999], JobStatus::Saved)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .set_jobs_status(&[id], JobStatus::Saved)
+                .await
+                .unwrap(),
+            0,
+            "already saved"
+        );
+        assert!(store
+            .set_job_status(id, JobStatus::Dismissed)
+            .await
+            .unwrap());
+        assert!(store
+            .list_jobs(Some(JobStatus::New))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .list_jobs(Some(JobStatus::Dismissed))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        store
+            .update_search(a.id, &criteria("Backend Engineer"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.list_jobs(None).await.unwrap()[0].search_ids,
+            vec![a.id, b.id]
+        );
+
+        store.set_job_status(id, JobStatus::New).await.unwrap();
+        store
+            .update_search(a.id, &criteria("Backend Engineer"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.list_jobs(None).await.unwrap()[0].search_ids,
+            vec![b.id]
+        );
+        store.delete_search(b.id).await.unwrap();
+        assert!(store.list_jobs(None).await.unwrap().is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn settings_and_scan_runs(pool: PgPool) {
+        let store = Db::for_user(pool.clone(), user_id(&pool).await);
+        assert_eq!(store.get_setting("k").await.unwrap(), None);
+        store.set_setting("k", "30").await.unwrap();
+        store.set_setting("k", "45").await.unwrap();
+        assert_eq!(store.get_setting("k").await.unwrap().as_deref(), Some("45"));
+
+        let run = store.start_scan_run(Site::LinkedIn).await.unwrap();
+        store.mark_interrupted_scan_runs().await.unwrap();
+        assert_eq!(
+            store
+                .last_scan_run(Site::LinkedIn)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "interrupted"
+        );
+        store.finish_scan_run(run, "ok", 3, None).await.unwrap();
+        let last = store.last_scan_run(Site::LinkedIn).await.unwrap().unwrap();
+        assert_eq!((last.status.as_str(), last.new_matches), ("ok", 3));
+        assert!(store.last_scan_run(Site::Indeed).await.unwrap().is_none());
+        let indeed = store.start_scan_run(Site::Indeed).await.unwrap();
+        assert_eq!(
+            store.last_scan_run(Site::Indeed).await.unwrap().unwrap().id,
+            indeed
+        );
+        assert_eq!(
+            store
+                .last_scan_run(Site::LinkedIn)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            run
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn delete_setting_removes_saved_value(pool: PgPool) {
+        let store = Db::for_user(pool.clone(), user_id(&pool).await);
+        store.set_setting("k", "value").await.unwrap();
+        store.delete_setting("k").await.unwrap();
+        assert_eq!(store.get_setting("k").await.unwrap(), None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn reading_lifecycle(pool: PgPool) {
+        let store = Db::for_user(pool.clone(), user_id(&pool).await);
+        let resume = store
+            .save_resume(
+                "cv.pdf",
+                b"%PDF-1",
+                &PdfInfo {
+                    page_count: 1,
+                    text: "cv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let uploaded_at = resume.uploaded_at.clone();
+
+        let id = store
+            .start_profile(&uploaded_at, "fake")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .latest_profile(&uploaded_at)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "reading"
+        );
+        assert!(store.latest_profile("t2").await.unwrap().is_none());
+        assert!(!store.confirm_profile(id).await.unwrap());
+
+        let profile = ResumeProfile {
+            contact: Contact {
+                name: "Jordan".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let warnings = vec![Warning {
+            item_id: "e1.b1".into(),
+            message: "x".into(),
+        }];
+        store.finish_profile(id, &profile, &warnings).await.unwrap();
+        let record = store.latest_profile(&uploaded_at).await.unwrap().unwrap();
+        assert_eq!(
+            (record.status.as_str(), record.warnings.len()),
+            ("ready", 1)
+        );
+        assert_eq!(record.profile.unwrap().contact.name, "Jordan");
+
+        assert!(store.confirm_profile(id).await.unwrap());
+        assert!(store
+            .get_profile(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .confirmed_at
+            .is_some());
+
+        assert!(store.save_profile_edits(id, &profile, &[]).await.unwrap());
+        let record = store.get_profile(id).await.unwrap().unwrap();
+        assert_eq!(
+            (record.status.as_str(), record.confirmed_at),
+            ("ready", None)
+        );
+
+        let other = store
+            .start_profile(&uploaded_at, "fake")
+            .await
+            .unwrap()
+            .unwrap();
+        store.mark_interrupted_profiles().await.unwrap();
+        let record = store.latest_profile(&uploaded_at).await.unwrap().unwrap();
+        assert_eq!((record.id, record.status.as_str()), (other, "failed"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn company_sites_are_fetched_once_and_listed(pool: PgPool) {
+        let store = Db::for_user(pool.clone(), user_id(&pool).await);
+        let company = "https://ae.linkedin.com/company/acme";
+        let mut with_company = card("1");
+        with_company.company_url = Some(company.into());
+        let job = store.upsert_job(&with_company, None, None).await.unwrap();
+        store.upsert_job(&card("2"), None, None).await.unwrap();
+        let search = store
+            .create_search(&criteria("Backend Engineer"))
+            .await
+            .unwrap();
+        store.add_match(search.id, job, &[]).await.unwrap();
+
+        assert_eq!(
+            store.companies_missing_site(8).await.unwrap(),
+            vec![company.to_string()]
+        );
+        store
+            .save_company_site(company, Some("https://acme.com/"))
+            .await
+            .unwrap();
+        assert!(store.companies_missing_site(8).await.unwrap().is_empty());
+        let listed = store.list_jobs(None).await.unwrap();
+        assert_eq!(
+            listed[0].company_website.as_deref(),
+            Some("https://acme.com/")
+        );
     }
 }

@@ -133,7 +133,7 @@ jobs:
           ssh -4 resume-tailor-vps "rm -rf '$setup_dir' && mkdir -p '$setup_dir'"
           scp -4 -r deploy Caddyfile "resume-tailor-vps:$setup_dir/"
           ssh -4 resume-tailor-vps "if [ \"\$(id -u)\" -eq 0 ]; then bash '$setup_dir/deploy/bootstrap.sh' root; else sudo -n bash '$setup_dir/deploy/bootstrap.sh' \"\$USER\"; fi && rm -rf '$setup_dir'"
-          printf '%s\n' "$DATABASE_URL" | ssh -4 resume-tailor-vps 'read -r value && sed -i "/^DATABASE_URL=/d" /etc/resume-tailor.env && printf "DATABASE_URL=%s\n" "$value" >> /etc/resume-tailor.env'
+          printf '%s\n' "$DATABASE_URL" | ssh -4 resume-tailor-vps 'run() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo -n "$@"; fi; }; read -r value && run sed -i "/^DATABASE_URL=/d" /etc/resume-tailor.env && printf "DATABASE_URL=%s\n" "$value" | run tee -a /etc/resume-tailor.env >/dev/null'
 
       - name: Copy release to VPS
         run: scp -4 resume-tailor-release.tar.gz resume-tailor-vps:/tmp/resume-tailor-${GITHUB_SHA}.tar.gz

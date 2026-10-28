@@ -162,11 +162,13 @@ struct Settings {
     indeed_scan_interval_minutes: u32,
 }
 
-async fn get_settings(Extension(user): Extension<std::sync::Arc<UserServices>>) -> Json<Settings> {
-    Json(Settings {
-        scan_interval_minutes: interval_minutes(&user.store, Site::LinkedIn).await,
-        indeed_scan_interval_minutes: interval_minutes(&user.store, Site::Indeed).await,
-    })
+async fn get_settings(
+    Extension(user): Extension<std::sync::Arc<UserServices>>,
+) -> Result<Json<Settings>, AppError> {
+    Ok(Json(Settings {
+        scan_interval_minutes: interval_minutes(&user.store, Site::LinkedIn).await?,
+        indeed_scan_interval_minutes: interval_minutes(&user.store, Site::Indeed).await?,
+    }))
 }
 
 async fn update_settings(

@@ -178,9 +178,23 @@ async fn run(
             if schedule.running {
                 continue;
             }
-            schedule.next_run_at = compute_next_run(&db, site).await;
+            schedule.next_run_at = match compute_next_run(&db, site).await {
+                Ok(next_run_at) => next_run_at,
+                Err(e) => {
+                    tracing::warn!(site = site.as_str(), "couldn't plan next scan: {e}");
+                    Some(Utc::now() + DB_RETRY)
+                }
+            };
             let due = schedule.next_run_at.is_some_and(|time| time <= Utc::now());
-            if (schedule.run_requested || due) && has_searches(&db).await {
+            let searchable = match has_searches(&db).await {
+                Ok(searchable) => searchable,
+                Err(e) => {
+                    tracing::warn!(site = site.as_str(), "couldn't check job searches: {e}");
+                    schedule.next_run_at = Some(Utc::now() + DB_RETRY);
+                    continue;
+                }
+            };
+            if (schedule.run_requested || due) && searchable {
                 schedule.running = true;
                 schedule.next_run_at = None;
                 let (db, matcher, done_tx) = (db.clone(), matcher.clone(), done_tx.clone());
@@ -244,6 +258,7 @@ async fn run(
     }
 }
 
+const DB_RETRY: ChronoDuration = ChronoDuration::seconds(30);
 pub const MIN_INTERVAL_MINUTES: u32 = 1;
 pub const MAX_INTERVAL_MINUTES: u32 = 60;
 pub const DEFAULT_COOLDOWN_SECONDS: i64 = MIN_INTERVAL_MINUTES as i64 * 60;
@@ -262,43 +277,42 @@ fn default_interval_minutes(site: Site) -> u32 {
     }
 }
 
-pub async fn interval_minutes(db: &Db, site: Site) -> u32 {
-    db.get_setting(interval_key(site))
-        .await
-        .ok()
-        .flatten()
+pub async fn interval_minutes(db: &Db, site: Site) -> Result<u32, DbError> {
+    Ok(db
+        .get_setting(interval_key(site))
+        .await?
         .and_then(|value| value.parse().ok())
         .map(|minutes: u32| minutes.clamp(MIN_INTERVAL_MINUTES, MAX_INTERVAL_MINUTES))
-        .unwrap_or_else(|| default_interval_minutes(site))
+        .unwrap_or_else(|| default_interval_minutes(site)))
 }
 
-async fn has_searches(db: &Db) -> bool {
-    db.list_searches()
-        .await
-        .map(|searches| searches.iter().any(|search| search.enabled))
-        .unwrap_or(false)
+async fn has_searches(db: &Db) -> Result<bool, DbError> {
+    Ok(db
+        .list_searches()
+        .await?
+        .iter()
+        .any(|search| search.enabled))
 }
 
-async fn last_started(db: &Db, site: Site) -> Option<DateTime<Utc>> {
-    db.last_scan_run(site)
-        .await
-        .ok()
-        .flatten()
+async fn last_started(db: &Db, site: Site) -> Result<Option<DateTime<Utc>>, DbError> {
+    Ok(db
+        .last_scan_run(site)
+        .await?
         .and_then(|run| DateTime::parse_from_rfc3339(&run.started_at).ok())
-        .map(|time| time.with_timezone(&Utc))
+        .map(|time| time.with_timezone(&Utc)))
 }
 
-async fn compute_next_run(db: &Db, site: Site) -> Option<DateTime<Utc>> {
-    if !has_searches(db).await {
-        return None;
+async fn compute_next_run(db: &Db, site: Site) -> Result<Option<DateTime<Utc>>, DbError> {
+    if !has_searches(db).await? {
+        return Ok(None);
     }
-    let interval = ChronoDuration::minutes(interval_minutes(db, site).await.into());
-    Some(
+    let interval = ChronoDuration::minutes(interval_minutes(db, site).await?.into());
+    Ok(Some(
         last_started(db, site)
-            .await
+            .await?
             .map(|time| time + interval)
             .unwrap_or_else(Utc::now),
-    )
+    ))
 }
 
 async fn status(
@@ -310,7 +324,7 @@ async fn status(
     Ok(ScanStatus {
         site,
         running,
-        interval_minutes: interval_minutes(db, site).await,
+        interval_minutes: interval_minutes(db, site).await?,
         next_run_at: next_run_at.map(|time| time.to_rfc3339()),
         last_run: db.last_scan_run(site).await?,
     })
@@ -325,7 +339,7 @@ async fn check_run_now(
     if running {
         return Err("A scan is already running.".into());
     }
-    if let Some(last) = last_started(db, site).await {
+    if let Some(last) = last_started(db, site).await.map_err(|e| e.to_string())? {
         let ready_at = last + cooldown;
         if Utc::now() < ready_at {
             let wait = (ready_at - Utc::now()).num_seconds() + 1;
@@ -1337,24 +1351,34 @@ fn block_text(root: ElementRef) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
     use crate::{match_stage::apply_batch, types::SearchInput};
     use sqlx::PgPool;
 
-    async fn store_with_search(pool: PgPool) -> Db {
+    async fn empty_store(pool: PgPool) -> Db {
         let user_id: i64 = sqlx::query_scalar(
             "INSERT INTO users (created_at) VALUES ('2026-01-01T00:00:00Z') RETURNING id",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        let store = Db::for_user(pool, user_id);
+        Db::for_user(pool, user_id)
+    }
+
+    async fn setup(pool: PgPool, modes: Vec<WorkMode>) -> Db {
+        setup_with(pool, vec!["Backend Engineer".into()], modes).await
+    }
+
+    async fn setup_with(pool: PgPool, titles: Vec<String>, modes: Vec<WorkMode>) -> Db {
+        let store = empty_store(pool).await;
         let criteria = SearchInput {
             name: None,
-            titles: vec!["Backend Engineer".into()],
+            titles,
             keywords: vec!["Rust".into()],
             location: Some("Dubai".into()),
-            work_modes: vec![WorkMode::Remote],
+            work_modes: modes,
             posted_within: PostedWithin::Week,
         }
         .validate()
@@ -1370,6 +1394,122 @@ mod tests {
             min_delay: Duration::ZERO,
             max_delay: Duration::ZERO,
         }
+    }
+
+    fn card(id: &str, title: &str) -> JobCard {
+        JobCard {
+            source: Site::LinkedIn,
+            source_id: id.into(),
+            title: title.into(),
+            company: "Acme".into(),
+            company_url: None,
+            location: "Dubai".into(),
+            posted_on: None,
+            url: format!("https://www.linkedin.com/jobs/view/{id}"),
+        }
+    }
+
+    async fn scan_linkedin<S: JobSource>(
+        store: &Db,
+        source: &S,
+        limits: &ScanLimits,
+    ) -> ScanReport {
+        let mut batches = Vec::new();
+        let mut report = scrape_searches(store, source, limits, |search, jobs| {
+            batches.push((search.clone(), jobs))
+        })
+        .await;
+        let mut new_matches = 0;
+        for (search, jobs) in batches {
+            new_matches += apply_batch(store, &search, jobs).await.unwrap();
+        }
+        report.new_matches = new_matches;
+        report
+    }
+
+    async fn scan_indeed<I: IndeedSource>(
+        store: &Db,
+        source: &I,
+        limits: &ScanLimits,
+    ) -> ScanReport {
+        let mut batches = Vec::new();
+        let mut report = scrape_indeed(store, source, limits, |search, jobs| {
+            batches.push((search.clone(), jobs))
+        })
+        .await;
+        let mut new_matches = 0;
+        for (search, jobs) in batches {
+            new_matches += apply_batch(store, &search, jobs).await.unwrap();
+        }
+        report.new_matches = new_matches;
+        report
+    }
+
+    #[derive(Default)]
+    struct FakeSource {
+        pages: HashMap<String, Vec<Vec<JobCard>>>,
+        details: HashMap<String, String>,
+        block_details: bool,
+        block_after_first_page: bool,
+        blocked_queries: Vec<String>,
+        detail_calls: Mutex<usize>,
+    }
+
+    impl JobSource for FakeSource {
+        fn search(
+            &self,
+            query: &SearchQuery<'_>,
+        ) -> impl Future<Output = Result<Vec<JobCard>, LinkedInError>> + Send {
+            let pages = self.pages.get(query.keywords).cloned().unwrap_or_default();
+            let blocked = self.blocked_queries.iter().any(|q| q == query.keywords);
+            let result = if blocked || (self.block_after_first_page && query.start > 0) {
+                Err(LinkedInError::Blocked(429))
+            } else {
+                Ok(pages.get(query.start / 2).cloned().unwrap_or_default())
+            };
+            async move { result }
+        }
+
+        fn job_detail(
+            &self,
+            id: &str,
+        ) -> impl Future<Output = Result<Option<JobDetail>, LinkedInError>> + Send {
+            *self.detail_calls.lock().unwrap() += 1;
+            let result = if self.block_details {
+                Err(LinkedInError::Blocked(999))
+            } else {
+                Ok(self.details.get(id).map(|d| JobDetail {
+                    description: d.clone(),
+                    seniority: None,
+                    employment_type: None,
+                    industries: None,
+                }))
+            };
+            async move { result }
+        }
+    }
+
+    fn source() -> FakeSource {
+        let mut source = FakeSource::default();
+        source.pages.insert(
+            "Backend Engineer".into(),
+            vec![
+                vec![
+                    card("1", "Senior Backend Engineer"),
+                    card("2", "iOS Developer"),
+                ],
+                vec![
+                    card("3", "Backend Engineer (Remote)"),
+                    card("4", "Backend Engineer, Payments"),
+                ],
+            ],
+        );
+        source
+            .details
+            .insert("1".into(), "Hybrid role. We use Rust.".into());
+        source.details.insert("3".into(), "Rust everywhere.".into());
+        source.details.insert("4".into(), "Java shop.".into());
+        source
     }
 
     fn indeed_body(cursor: Option<&str>) -> serde_json::Value {
@@ -1504,7 +1644,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn linkedin_scan_stores_a_matched_job(pool: PgPool) {
-        let store = store_with_search(pool).await;
+        let store = setup(pool, vec![WorkMode::Remote]).await;
         let mut batches = Vec::new();
         let report = scrape_searches(&store, &FakeLinkedIn, &test_limits(), |search, jobs| {
             batches.push((search.clone(), jobs))
@@ -1520,35 +1660,294 @@ mod tests {
         assert_eq!(jobs[0].matched_keywords, vec!["Rust"]);
     }
 
-    struct FakeIndeed;
+    struct FakeIndeed {
+        calls: Mutex<Vec<(String, Option<String>, &'static str, bool)>>,
+    }
 
     impl IndeedSource for FakeIndeed {
         fn search(
             &self,
             query: &IndeedQuery<'_>,
         ) -> impl Future<Output = Result<IndeedPage, IndeedError>> + Send {
-            let page = parse_indeed_page(&indeed_body(None), query.country.host);
-            async move { page }
+            self.calls.lock().unwrap().push((
+                query.keywords.to_string(),
+                query.cursor.map(str::to_string),
+                query.country.code,
+                query.remote_only,
+            ));
+            let result = parse_indeed_page(&indeed_body(Some("more")), query.country.host);
+            async move { result }
         }
     }
 
     #[sqlx::test(migrations = "./migrations")]
     async fn indeed_scan_stores_a_matched_job(pool: PgPool) {
-        let store = store_with_search(pool).await;
-        let mut batches = Vec::new();
-        let report = scrape_indeed(&store, &FakeIndeed, &test_limits(), |search, jobs| {
-            batches.push((search.clone(), jobs))
-        })
-        .await;
+        let store = setup(pool, vec![WorkMode::Remote]).await;
+        let indeed = FakeIndeed {
+            calls: Mutex::new(Vec::new()),
+        };
+        let report = scan_indeed(&store, &indeed, &test_limits()).await;
         assert_eq!(report.error, None);
-        for (search, jobs) in batches {
-            apply_batch(&store, &search, jobs).await.unwrap();
-        }
         let jobs = store.list_jobs(None).await.unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].source, Site::Indeed);
         assert_eq!(jobs[0].work_mode, Some(WorkMode::Remote));
         assert!(store.companies_missing_site(8).await.unwrap().is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn indeed_jobs_are_matched_and_stored(pool: PgPool) {
+        let store = setup(pool, vec![WorkMode::Remote]).await;
+        let indeed = FakeIndeed {
+            calls: Mutex::new(Vec::new()),
+        };
+        let report = scan_indeed(&store, &indeed, &test_limits()).await;
+
+        assert_eq!(report.error, None);
+        assert_eq!(report.requests, MAX_INDEED_PAGES_PER_QUERY);
+        let calls = indeed.calls.lock().unwrap().clone();
+        assert_eq!(calls[0], ("Backend Engineer".into(), None, "AE", true));
+        assert_eq!(calls[1].1.as_deref(), Some("more"));
+        assert_eq!(report.new_matches, 1);
+        let jobs = store.list_jobs(None).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].source, Site::Indeed);
+        assert_eq!(jobs[0].work_mode, Some(WorkMode::Remote));
+        assert_eq!(
+            jobs[0].company_website.as_deref(),
+            Some("https://acme.example/")
+        );
+        assert!(store.companies_missing_site(8).await.unwrap().is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn indeed_skips_unknown_countries(pool: PgPool) {
+        let store = empty_store(pool).await;
+        let criteria = SearchInput {
+            name: None,
+            titles: vec!["Backend Engineer".into()],
+            keywords: vec![],
+            location: Some("Atlantis".into()),
+            work_modes: vec![WorkMode::Onsite],
+            posted_within: PostedWithin::Week,
+        }
+        .validate()
+        .unwrap();
+        store.create_search(&criteria).await.unwrap();
+        let indeed = FakeIndeed {
+            calls: Mutex::new(Vec::new()),
+        };
+        let report = scan_indeed(&store, &indeed, &test_limits()).await;
+        assert_eq!(report.skipped_locations, vec!["Atlantis".to_string()]);
+        assert!(indeed.calls.lock().unwrap().is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn each_site_has_its_own_interval(pool: PgPool) {
+        let store = setup(pool, vec![WorkMode::Remote]).await;
+        assert_eq!(interval_minutes(&store, Site::LinkedIn).await.unwrap(), 60);
+        assert_eq!(interval_minutes(&store, Site::Indeed).await.unwrap(), 15);
+        store
+            .set_setting(interval_key(Site::Indeed), "5")
+            .await
+            .unwrap();
+        assert_eq!(interval_minutes(&store, Site::Indeed).await.unwrap(), 5);
+        assert_eq!(interval_minutes(&store, Site::LinkedIn).await.unwrap(), 60);
+        store.start_scan_run(Site::LinkedIn).await.unwrap();
+        assert!(
+            compute_next_run(&store, Site::LinkedIn)
+                .await
+                .unwrap()
+                .unwrap()
+                > Utc::now()
+        );
+        assert!(
+            compute_next_run(&store, Site::Indeed)
+                .await
+                .unwrap()
+                .unwrap()
+                <= Utc::now()
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn no_searches_means_no_next_run(pool: PgPool) {
+        let store = empty_store(pool).await;
+        assert_eq!(
+            compute_next_run(&store, Site::LinkedIn).await.unwrap(),
+            None
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn filters_by_title_keywords_and_work_mode(pool: PgPool) {
+        let store = setup(pool, vec![WorkMode::Hybrid, WorkMode::Onsite]).await;
+        let src = source();
+        let report = scan_linkedin(&store, &src, &test_limits()).await;
+
+        assert_eq!(report.error, None);
+        assert_eq!(*src.detail_calls.lock().unwrap(), 3);
+        let jobs = store.list_jobs(None).await.unwrap();
+        assert_eq!(
+            jobs.iter()
+                .map(|j| j.source_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1"]
+        );
+        assert_eq!(jobs[0].matched_keywords, vec!["Rust"]);
+        assert_eq!(jobs[0].work_mode, Some(WorkMode::Hybrid));
+        assert_eq!(report.new_matches, 1);
+
+        let again = scan_linkedin(&store, &src, &test_limits()).await;
+        assert_eq!(*src.detail_calls.lock().unwrap(), 3);
+        assert_eq!(again.new_matches, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn detail_budget_defers_to_next_scan(pool: PgPool) {
+        let store = setup(pool, vec![WorkMode::Remote, WorkMode::Hybrid]).await;
+        let src = source();
+        let limits = ScanLimits {
+            max_details_per_run: 1,
+            ..test_limits()
+        };
+
+        let first = scan_linkedin(&store, &src, &limits).await;
+        assert_eq!((first.new_matches, first.pending_details), (1, 2));
+        let second = scan_linkedin(&store, &src, &limits).await;
+        assert_eq!((second.new_matches, second.pending_details), (1, 1));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn paging_cap_keeps_first_page(pool: PgPool) {
+        let store = setup(pool, vec![WorkMode::Hybrid, WorkMode::Onsite]).await;
+        let src = FakeSource {
+            block_after_first_page: true,
+            ..source()
+        };
+        let report = scan_linkedin(&store, &src, &test_limits()).await;
+        assert_eq!(report.error, None);
+        assert_eq!(report.new_matches, 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn blocked_results_page_keeps_collected_jobs(pool: PgPool) {
+        let titles = vec!["Backend Engineer".into(), "Platform Engineer".into()];
+        let store = setup_with(pool, titles, vec![WorkMode::Hybrid, WorkMode::Onsite]).await;
+        let src = FakeSource {
+            blocked_queries: vec!["Platform Engineer".into()],
+            ..source()
+        };
+        let report = scan_linkedin(&store, &src, &test_limits()).await;
+        assert!(report.search_blocked);
+        assert!(report.error.unwrap().contains("rate-limiting"));
+        assert_eq!(report.new_matches, 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn load_more_budget_is_shared_across_titles(pool: PgPool) {
+        let titles = vec!["Backend Engineer".into(), "Engineer".into()];
+        let store = setup_with(pool, titles, vec![WorkMode::Hybrid]).await;
+        let mut src = source();
+        let pages = src.pages["Backend Engineer"].clone();
+        src.pages.insert("Engineer".into(), pages);
+        let limits = ScanLimits {
+            max_load_more_per_run: 1,
+            ..test_limits()
+        };
+        let report = scan_linkedin(&store, &src, &limits).await;
+        let searches = report.requests - *src.detail_calls.lock().unwrap();
+        assert_eq!(searches, 3);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn without_keywords_jobs_list_before_descriptions(pool: PgPool) {
+        let store = setup(pool, vec![WorkMode::Hybrid, WorkMode::Onsite]).await;
+        let mut search = store.list_searches().await.unwrap().remove(0);
+        search.criteria.keywords.clear();
+        store
+            .update_search(search.id, &search.criteria)
+            .await
+            .unwrap();
+        let src = source();
+        let limits = ScanLimits {
+            max_details_per_run: 0,
+            ..test_limits()
+        };
+        let report = scan_linkedin(&store, &src, &limits).await;
+        assert_eq!(report.new_matches, 2);
+        assert_eq!(*src.detail_calls.lock().unwrap(), 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn later_description_can_remove_a_match(pool: PgPool) {
+        let store = setup(pool, vec![WorkMode::Remote]).await;
+        let mut search = store.list_searches().await.unwrap().remove(0);
+        search.criteria.keywords.clear();
+        store
+            .update_search(search.id, &search.criteria)
+            .await
+            .unwrap();
+
+        let mut src = source();
+        src.details
+            .insert("4".into(), "Fully on-site in Dubai.".into());
+        scan_linkedin(
+            &store,
+            &src,
+            &ScanLimits {
+                max_details_per_run: 0,
+                ..test_limits()
+            },
+        )
+        .await;
+        assert_eq!(store.list_jobs(None).await.unwrap().len(), 3);
+        scan_linkedin(&store, &src, &test_limits()).await;
+        let ids: Vec<String> = store
+            .list_jobs(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|j| j.source_id)
+            .collect();
+        assert_eq!(ids, vec!["3"]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn blocked_job_pages_pause_softly(pool: PgPool) {
+        let store = setup(pool, vec![WorkMode::Hybrid]).await;
+        let src = FakeSource {
+            block_details: true,
+            ..source()
+        };
+        let report = scan_linkedin(&store, &src, &test_limits()).await;
+        assert_eq!(report.error, None);
+        assert!(report.details_paused);
+        assert_eq!(*src.detail_calls.lock().unwrap(), 1);
+        assert_eq!(report.pending_details, 3);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn blocked_search_stops_the_scan(pool: PgPool) {
+        let store = setup(pool, vec![WorkMode::Hybrid]).await;
+
+        struct AlwaysBlocked;
+        impl JobSource for AlwaysBlocked {
+            fn search(
+                &self,
+                _: &SearchQuery<'_>,
+            ) -> impl Future<Output = Result<Vec<JobCard>, LinkedInError>> + Send {
+                async { Err(LinkedInError::Blocked(429)) }
+            }
+            fn job_detail(
+                &self,
+                _: &str,
+            ) -> impl Future<Output = Result<Option<JobDetail>, LinkedInError>> + Send {
+                async { Ok(None) }
+            }
+        }
+        let report = scan_linkedin(&store, &AlwaysBlocked, &test_limits()).await;
+        assert!(report.error.unwrap().contains("rate-limiting"));
     }
 }
 

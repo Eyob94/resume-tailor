@@ -57,6 +57,14 @@ struct UserServices {
 
 impl AppState {
     async fn user_services(&self, user_id: i64) -> Result<Arc<UserServices>, String> {
+        if let Some(user) = self.users.lock().await.get(&user_id) {
+            return Ok(user.clone());
+        }
+        let username = self
+            .auth
+            .username(user_id)
+            .await
+            .map_err(|error| format!("couldn't load user: {error:?}"))?;
         let mut users = self.users.lock().await;
         if let Some(user) = users.get(&user_id) {
             return Ok(user.clone());
@@ -70,11 +78,6 @@ impl AppState {
             },
         )
         .map_err(|error| error.to_string())?;
-        let username = self
-            .auth
-            .username(user_id)
-            .await
-            .map_err(|error| format!("couldn't load user: {error:?}"))?;
         let user = Arc::new(UserServices {
             store,
             senders,
@@ -253,16 +256,10 @@ async fn delete_resume(
 }
 
 async fn resume_file(Extension(user): Extension<Arc<UserServices>>) -> Result<Response, AppError> {
-    let Some(resume) = user.store.get_resume().await? else {
+    let Some((file_name, bytes)) = user.store.resume_pdf().await? else {
         return Err(AppError::not_found());
     };
-    let bytes = user
-        .store
-        .resume_pdf()
-        .await?
-        .ok_or_else(AppError::not_found)?;
-    let header_name: String = resume
-        .file_name
+    let header_name: String = file_name
         .chars()
         .map(|c| {
             if c.is_ascii_graphic() && c != '"' || c == ' ' {
