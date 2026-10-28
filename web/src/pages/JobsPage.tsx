@@ -7,17 +7,17 @@ import {
   Braces,
   CheckCircle2,
   ChevronDown,
+  Circle,
   CircleDot,
   CircleSlash,
   Check,
   Copy,
-  Clock,
+  Building2,
   ExternalLink,
   EyeOff,
   Globe,
   Loader2,
-  MapPin,
-  Pencil,
+  MoreHorizontal,
   Play,
   Plus,
   RotateCcw,
@@ -41,7 +41,7 @@ import {
 import { Dialog } from "../components/Dialog";
 import { JsonView } from "../components/JsonView";
 import { SearchForm, WORK_MODE_LABELS } from "../components/SearchForm";
-import { Alert, Button, Card, EmptyState, PageHeader, Skeleton } from "../components/ui";
+import { Alert, Button, Card, EmptyState, Menu, PageHeader, Skeleton } from "../components/ui";
 import { useDevMode } from "../devMode";
 import { plural, postedLabel, relativeTime } from "../format";
 
@@ -54,7 +54,6 @@ const FILTERS: [Filter, string][] = [
   ["all", "All"],
 ];
 const SITE_LABELS: Record<Site, string> = { linkedin: "LinkedIn", indeed: "Indeed" };
-const POSTED_SHORT = { day: "24 h", week: "week", month: "month" } as const;
 
 export function JobsPage() {
   const [searches, setSearches] = useState<JobSearch[] | null>(null);
@@ -66,6 +65,8 @@ export function JobsPage() {
   const [filter, setFilter] = useState<Filter>("new");
   const [sort, setSort] = useState<"newest" | "match">("newest");
   const [resumeConfirmed, setResumeConfirmed] = useState(false);
+  const [devMode] = useDevMode();
+  const [copiedUrl, setCopiedUrl] = useState(false);
 
   useEffect(() => {
     profileApi.get().then(
@@ -169,11 +170,34 @@ export function JobsPage() {
   }
 
   async function removeSearch(search: JobSearch) {
-    if (!confirm(`Delete the preference "${search.name}"? Jobs matched only by it will disappear from the list.`)) return;
+    if (!confirm(`Delete the preference "${search.name}"? Jobs matched only by it will disappear from the list.`)) return false;
     try {
       await jobsApi.deleteSearch(search.id);
       setSearches((all) => all?.filter((s) => s.id !== search.id) ?? null);
       await loadJobs();
+      return true;
+    } catch (e) {
+      setError(errorMessage(e));
+      return false;
+    }
+  }
+
+  async function copyLinkedinUrl(search: JobSearch) {
+    try {
+      await navigator.clipboard.writeText(linkedinSearchUrl(search));
+      setCopiedUrl(true);
+      window.setTimeout(() => setCopiedUrl(false), 2000);
+    } catch {
+      setCopiedUrl(false);
+    }
+  }
+
+  async function runScan(site: Site) {
+    try {
+      await jobsApi.runScan(site);
+      window.setTimeout(() => {
+        void jobsApi.scanStatus().then(setScans).catch((e) => setError(errorMessage(e)));
+      }, 700);
     } catch (e) {
       setError(errorMessage(e));
     }
@@ -224,7 +248,6 @@ export function JobsPage() {
     <>
       <PageHeader
         title="Jobs"
-        description="LinkedIn and Indeed jobs matching your preferences."
         actions={
           searches?.length && !editing ? (
             <Button variant="primary" icon={Plus} onClick={() => setEditing("new")}>
@@ -241,7 +264,20 @@ export function JobsPage() {
         <section className="mb-10 space-y-4">
           {editing && (
             <Card>
-              <h2 className="border-b border-zinc-100 px-5 py-4 font-semibold">{editing === "new" ? "New preference" : `Edit “${editing.name}”`}</h2>
+              <div className="flex items-center justify-between gap-3 border-b border-zinc-100 px-5 py-4">
+                <h2 className="font-semibold">{editing === "new" ? "New preference" : `Edit “${editing.name}”`}</h2>
+                {editing !== "new" && <div className="flex shrink-0 items-center gap-2">
+                  {devMode && <>
+                    <a href={linkedinSearchUrl(editing)} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-2 text-sm font-medium text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900">
+                      <ExternalLink className="size-4" /> LinkedIn
+                    </a>
+                    <button type="button" onClick={() => copyLinkedinUrl(editing)} className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-2 text-sm font-medium text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900">
+                      {copiedUrl ? <Check className="size-4" /> : <Copy className="size-4" />}{copiedUrl ? "Copied" : "Copy URL"}
+                    </button>
+                  </>}
+                  <Button variant="danger" icon={Trash2} onClick={async () => { if (await removeSearch(editing)) setEditing(null); }}>Delete</Button>
+                </div>}
+              </div>
               <SearchForm initial={editing === "new" ? undefined : editing} onSubmit={saveSearch} onCancel={() => setEditing(null)} />
             </Card>
           )}
@@ -260,25 +296,24 @@ export function JobsPage() {
             </EmptyState>
           ) : (
             <>
-              {scans && searches.length > 0 && (
-                <div className="grid gap-3 lg:grid-cols-2">
-                  {scans.map((scan) => (
-                    <ScanBar key={scan.site} scan={scan} onChange={setScans} onError={setError} />
-                  ))}
-                </div>
-              )}
-              <div className="grid gap-3 sm:grid-cols-2">
+              <div className="flex flex-wrap gap-2">
                 {searches.map((search) => (
-                  <SearchCard
-                    key={search.id}
-                    search={search}
-                    selected={search.enabled}
-                    onToggle={() => void toggleSearch(search)}
-                    onEdit={() => setEditing(search)}
-                    onDelete={() => removeSearch(search)}
-                  />
+                  <div key={search.id} className={`inline-flex items-center rounded-full border text-sm ${search.enabled ? "border-zinc-300 bg-white text-zinc-900" : "border-zinc-200 bg-zinc-50 text-zinc-400"}`}>
+                    <button type="button" aria-label={`${search.enabled ? "Turn off" : "Turn on"} scans for ${search.name}`} onClick={() => void toggleSearch(search)} className="py-1 pl-2.5 pr-1">
+                      {search.enabled ? <CheckCircle2 className="size-4 text-emerald-600" /> : <Circle className="size-4 text-zinc-300" />}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEditing(search)}
+                      title={`${[...search.titles, ...search.keywords].join(", ")} · ${search.location ?? "Anywhere"} · past ${search.posted_within}`}
+                      className="max-w-56 truncate py-1 pl-1 pr-3 text-left"
+                    >
+                      {search.name}
+                    </button>
+                  </div>
                 ))}
               </div>
+              {scans && searches.length > 0 && <ScanLine scans={scans} onRun={runScan} />}
             </>
           )}
         </section>
@@ -299,7 +334,7 @@ export function JobsPage() {
                   }`}
                 >
                   {label}
-                  <span className="rounded-full bg-zinc-100 px-1.5 py-0.5 text-xs text-zinc-500">{counts[id]}</span>
+                  <span className="text-xs font-normal text-zinc-400">{counts[id]}</span>
                 </button>
               ))}
             </div>
@@ -307,15 +342,15 @@ export function JobsPage() {
               aria-label="Sort jobs"
               value={sort}
               onChange={(e) => setSort(e.target.value as "newest" | "match")}
-              className="mb-2 shrink-0 rounded-lg border border-zinc-200 bg-white px-2 py-1.5 text-sm text-zinc-700 shadow-sm"
+              className="mb-2 shrink-0 border-0 bg-transparent px-2 py-1.5 text-sm text-zinc-600 shadow-none"
             >
               <option value="newest">Newest</option>
               <option value="match">Best match</option>
             </select>
             {filter === "new" && visible.length > 0 && (
-              <Button icon={BookmarkPlus} onClick={() => saveAll(visible.map((j) => j.id))} className="mb-2 shrink-0">
-                Save all <span className="hidden sm:inline">({visible.length})</span>
-              </Button>
+              <button type="button" title={`Save all ${visible.length} jobs`} onClick={() => saveAll(visible.map((j) => j.id))} className="mb-2 inline-flex shrink-0 items-center gap-1 text-sm font-medium text-zinc-700 hover:text-zinc-900">
+                <BookmarkPlus className="size-4" /> Save all
+              </button>
             )}
           </div>
 
@@ -326,7 +361,7 @@ export function JobsPage() {
               {filter === "new" ? "No new jobs. New matches show up here after each scan." : "Nothing here."}
             </p>
           ) : (
-            <div className="space-y-3">
+            <div className="divide-y divide-zinc-200 border-y border-zinc-200">
               {visible.map((job) => (
                 <JobRow key={job.id} job={job} resumeConfirmed={resumeConfirmed} onStatus={(s) => setStatus(job, s)} onRescore={() => rescore(job)} onSkip={() => skipScore(job)} />
               ))}
@@ -362,54 +397,37 @@ export function JobsPage() {
   );
 }
 
-function ScanBar({ scan, onChange, onError }: { scan: ScanStatus; onChange: (s: ScanStatus[]) => void; onError: (e: string) => void }) {
-  const [requesting, setRequesting] = useState(false);
-  const last = scan.last_run;
-  const problem = last && (last.status === "partial" || last.status === "failed");
-
-  async function runNow() {
-    setRequesting(true);
-    try {
-      await jobsApi.runScan(scan.site);
-      setTimeout(async () => onChange(await jobsApi.scanStatus()), 700);
-    } catch (e) {
-      onError(errorMessage(e));
-    } finally {
-      setRequesting(false);
-    }
-  }
+function ScanLine({ scans, onRun }: { scans: ScanStatus[]; onRun: (site: Site) => void }) {
+  const details = (scan: ScanStatus) => {
+    const last = scan.last_run;
+    return [
+      last?.message,
+      last && `${last.new_matches} new ${last.new_matches === 1 ? "match" : "matches"}`,
+      scan.next_run_at && `Next scan ${relativeTime(scan.next_run_at)}`,
+      `Every ${scan.interval_minutes} min`,
+    ].filter(Boolean).join(" · ");
+  };
 
   return (
-    <Card className="flex flex-wrap items-center gap-x-6 gap-y-3 px-5 py-4">
-      <div className="flex min-w-0 flex-1 items-start gap-3">
-        {scan.running ? (
-          <Loader2 className="mt-0.5 size-4 shrink-0 animate-spin text-zinc-500" />
-        ) : problem ? (
-          <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-500" />
-        ) : (
-          <Clock className="mt-0.5 size-4 shrink-0 text-zinc-400" />
-        )}
-        <div className="min-w-0 text-sm">
-          <p className="font-medium">
-            {SITE_LABELS[scan.site]}
-            {" · "}
-            {scan.running
-              ? "Scanning…"
-              : last
-                ? `Last scan ${relativeTime(last.started_at)} · ${plural(last.new_matches, "new match", "new matches")}`
-                : "No scans yet"}
-          </p>
-          <p className="text-zinc-500">
-            {last?.message && !scan.running ? <span className={problem ? "text-amber-700" : ""}>{last.message} </span> : null}
-            {!scan.running && scan.next_run_at && `Next scan ${relativeTime(scan.next_run_at)}. `}
-            Every {scan.interval_minutes} min · change in Settings.
-          </p>
-        </div>
-      </div>
-      <Button icon={Play} onClick={runNow} loading={requesting} disabled={scan.running}>
-        Run now
-      </Button>
-    </Card>
+    <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-zinc-500">
+      {scans.map((scan, index) => {
+        const last = scan.last_run;
+        const problem = last && (last.status === "partial" || last.status === "failed");
+        return <span key={scan.site} className="contents">
+          {index > 0 && <span className="text-zinc-300">·</span>}
+          <span title={details(scan)} className="inline-flex items-center gap-1">
+            {scan.running ? <><Loader2 className="size-3.5 animate-spin" />{SITE_LABELS[scan.site]} scanning…</> : problem ? <><AlertTriangle className="size-3.5 text-amber-500" />{SITE_LABELS[scan.site]} {relativeTime(last.started_at)}</> : <>{SITE_LABELS[scan.site]} {last ? relativeTime(last.started_at) : "not scanned yet"}</>}
+          </span>
+        </span>;
+      })}
+      {scans.length > 0 && <span className="text-zinc-300">·</span>}
+      <Menu
+        label="Run a scan now"
+        align="left"
+        trigger={<span className="inline-flex items-center gap-1 font-medium text-zinc-700 hover:text-zinc-900"><Play className="size-3.5" />Run now<ChevronDown className="size-3.5" /></span>}
+        items={scans.map((scan) => ({ label: SITE_LABELS[scan.site], onSelect: () => onRun(scan.site), disabled: scan.running }))}
+      />
+    </div>
   );
 }
 
@@ -424,91 +442,6 @@ function linkedinSearchUrl(search: JobSearch) {
     params.set("f_WT", search.work_modes.map((mode) => ({ onsite: "1", remote: "2", hybrid: "3" })[mode]).join(","));
   }
   return `https://www.linkedin.com/jobs/search?${params.toString()}`;
-}
-
-function SearchCard({
-  search,
-  selected,
-  onToggle,
-  onEdit,
-  onDelete,
-}: {
-  search: JobSearch;
-  selected: boolean;
-  onToggle: () => void;
-  onEdit: () => void;
-  onDelete: () => void;
-}) {
-  const [devMode] = useDevMode();
-  const [copiedUrl, setCopiedUrl] = useState(false);
-  const linkedinUrl = linkedinSearchUrl(search);
-
-  async function copyLinkedinUrl() {
-    try {
-      await navigator.clipboard.writeText(linkedinUrl);
-      setCopiedUrl(true);
-      window.setTimeout(() => setCopiedUrl(false), 2000);
-    } catch {
-      setCopiedUrl(false);
-    }
-  }
-
-  return (
-    <Card className="flex flex-col gap-2 p-4">
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex min-w-0 items-center gap-2">
-          <input
-            type="checkbox"
-            checked={selected}
-            onChange={onToggle}
-            aria-label={`Enable LinkedIn scans for ${search.name}`}
-            className="size-4 shrink-0 accent-zinc-900"
-          />
-          <h3 className="min-w-0 truncate whitespace-nowrap font-medium" title={search.name}>{search.name}</h3>
-        </div>
-        <div className="-mt-1 -mr-1 flex shrink-0">
-          <button onClick={onEdit} className="rounded-md p-1.5 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700" aria-label={`Edit ${search.name}`}>
-            <Pencil className="size-4" />
-          </button>
-          <button onClick={onDelete} className="rounded-md p-1.5 text-zinc-400 hover:bg-red-50 hover:text-red-600" aria-label={`Delete ${search.name}`}>
-            <Trash2 className="size-4" />
-          </button>
-        </div>
-      </div>
-      <div className="hide-scrollbar flex min-w-0 gap-1.5 overflow-x-auto whitespace-nowrap py-1" aria-label={`${search.name} titles and keywords`}>
-        {search.titles.map((t) => (
-          <span key={t} className="shrink-0 rounded-md bg-zinc-900 px-2 py-0.5 text-xs font-medium text-white">
-            {t}
-          </span>
-        ))}
-        {search.keywords.map((k) => (
-          <span key={k} className="shrink-0 rounded-md bg-zinc-100 px-2 py-0.5 text-xs text-zinc-700">
-            {k}
-          </span>
-        ))}
-      </div>
-      <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-500">
-        <span className="inline-flex items-center gap-1">
-          <MapPin className="size-3.5" />
-          {search.location ?? "Anywhere"}
-        </span>
-        <span>{search.work_modes.map((m) => WORK_MODE_LABELS[m]).join(" · ")}</span>
-        <span>Past {POSTED_SHORT[search.posted_within]}</span>
-      </p>
-      {devMode && (
-        <div className="flex items-center gap-3 border-t border-zinc-100 pt-2 text-xs">
-          <a href={linkedinUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-zinc-500 hover:text-zinc-900">
-            <ExternalLink className="size-3.5" />
-            LinkedIn
-          </a>
-          <button onClick={copyLinkedinUrl} className="inline-flex items-center gap-1 text-zinc-500 hover:text-zinc-900">
-            {copiedUrl ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
-            {copiedUrl ? "Copied" : "Copy URL"}
-          </button>
-        </div>
-      )}
-    </Card>
-  );
 }
 
 function ScoreBadge({ job, resumeConfirmed }: { job: JobListing; resumeConfirmed: boolean }) {
@@ -576,6 +509,7 @@ function JobRow({
   onSkip: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [fullDescription, setFullDescription] = useState(false);
   const [showJson, setShowJson] = useState(false);
   const [copied, setCopied] = useState(false);
   const [devMode] = useDevMode();
@@ -592,119 +526,59 @@ function JobRow({
   }
 
   return (
-    <Card className={job.status === "dismissed" ? "opacity-60" : ""}>
-      <div className="flex flex-wrap items-start gap-x-4 gap-y-3 p-4">
-        <div className="min-w-0 flex-1">
-          <a href={job.url} target="_blank" rel="noreferrer" className="font-medium hover:underline">
-            {job.title}
-          </a>
-          <span className="ml-2 align-middle">
-            <ScoreBadge job={job} resumeConfirmed={resumeConfirmed} />
-          </span>
-          {job.tailored_at && (
-            <span className="ml-2 inline-flex items-center gap-1 rounded-md bg-emerald-50 px-1.5 py-0.5 align-middle text-xs font-medium text-emerald-700">
-              <CheckCircle2 className="size-3" />
-              Tailored
-            </span>
-          )}
-          <p className="mt-0.5 text-sm text-zinc-600">
-            {job.company_url ? (
-              <a href={job.company_url} target="_blank" rel="noreferrer" className="hover:underline">
-                {job.company}
-              </a>
-            ) : (
-              job.company
-            )}
-          </p>
-          <p className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-500">
-            <span className="inline-flex items-center gap-1">
-              <MapPin className="size-3.5" />
-              {job.location}
-            </span>
-            {job.posted_on && <span>Posted {postedLabel(job.posted_on)}</span>}
-            <span className="rounded-md bg-zinc-100 px-1.5 py-0.5 font-medium text-zinc-600">{SITE_LABELS[job.source]}</span>
-            <span
-              className={`rounded-md px-1.5 py-0.5 font-medium ${job.work_mode ? "bg-sky-50 text-sky-700" : "bg-zinc-100 text-zinc-500"}`}
-              title={job.work_mode ? "Read from the posting text" : "The posting doesn't say"}
-            >
-              {job.work_mode ? WORK_MODE_LABELS[job.work_mode] : "Work mode not specified"}
-            </span>
-          </p>
-          {job.matched_keywords.length > 0 && (
-            <div className="mt-2 flex flex-wrap gap-1.5">
-              {job.matched_keywords.map((k) => (
-                <span key={k} className="rounded-md bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
-                  {k}
-                </span>
-              ))}
-            </div>
-          )}
-        </div>
-        <div className="flex gap-2">
-          {job.status === "saved" ? (
-            <Button icon={BookmarkCheck} onClick={() => onStatus("new")}>
-              Saved
-            </Button>
-          ) : job.status === "applied" ? (
-            <Button icon={RotateCcw} onClick={() => onStatus("new")}>
-              Undo applied
-            </Button>
-          ) : (
-            <Button icon={Bookmark} onClick={() => onStatus("saved")}>
-              Save
-            </Button>
-          )}
-          {job.status !== "applied" && (
-            <Button icon={Check} onClick={() => onStatus("applied")}>
-              <span className="hidden sm:inline">Mark applied</span>
-            </Button>
-          )}
-          {job.status === "dismissed" ? (
-            <Button icon={RotateCcw} onClick={() => onStatus("new")}>
-              Restore
-            </Button>
-          ) : (
-            <Button variant="danger" icon={EyeOff} onClick={() => onStatus("dismissed")} aria-label="Dismiss">
-              <span className="hidden sm:inline">Dismiss</span>
-            </Button>
-          )}
-        </div>
-      </div>
-
-      <div className="flex flex-wrap items-center gap-4 border-t border-zinc-100 px-4 py-2 text-sm">
-        <button onClick={() => setOpen(!open)} className="inline-flex items-center gap-1 font-medium text-zinc-600 hover:text-zinc-900" aria-expanded={open}>
-          <ChevronDown className={`size-4 transition-transform ${open ? "rotate-180" : ""}`} />
-          {open ? "Hide description" : "Description"}
-        </button>
-        <button
-          onClick={copyDescription}
-          disabled={!job.description}
-          className="inline-flex items-center gap-1 text-zinc-500 hover:text-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
-          aria-label={`Copy ${job.title} description`}
+    <div className={`py-3.5 ${job.status === "dismissed" ? "opacity-60" : ""}`}>
+      <div className="flex items-start gap-3">
+        <div
+          role="button"
+          tabIndex={0}
+          aria-expanded={open}
+          onClick={() => setOpen((value) => !value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              setOpen((value) => !value);
+            }
+          }}
+          className="min-w-0 flex-1 cursor-pointer"
         >
-          {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
-          {copied ? "Copied" : "Copy description"}
-        </button>
-        <a href={job.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-zinc-500 hover:text-zinc-900">
-          <ExternalLink className="size-3.5" />
-          {SITE_LABELS[job.source]}
-        </a>
-        {job.company_website && (
-          <a href={job.company_website} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-zinc-500 hover:text-zinc-900">
-            <Globe className="size-3.5" />
-            Company site
-          </a>
-        )}
-        {devMode && (
-          <button onClick={() => setShowJson(!showJson)} className="inline-flex items-center gap-1 text-zinc-500 hover:text-zinc-900">
-            <Braces className="size-3.5" />
-            JSON
-          </button>
-        )}
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-medium text-zinc-900">{job.title}</span>
+            <ScoreBadge job={job} resumeConfirmed={resumeConfirmed} />
+            {job.tailored_at && <span className="inline-flex items-center gap-1 rounded-md bg-emerald-50 px-1.5 py-0.5 text-xs font-medium text-emerald-700"><CheckCircle2 className="size-3" />Tailored</span>}
+          </div>
+          <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-sm text-zinc-500">
+            {[
+              job.company,
+              job.location?.split(",")[0],
+              job.work_mode ? WORK_MODE_LABELS[job.work_mode] : null,
+              job.posted_on ? postedLabel(job.posted_on) : null,
+            ].filter(Boolean).map((part, index) => <span key={`${part}-${index}`} className="contents">{index > 0 && <span className="text-zinc-300">·</span>}{part}</span>)}
+            <span className="text-zinc-300">·</span>
+            <span className={`rounded px-1.5 py-px text-[11px] font-medium ${job.source === "linkedin" ? "bg-sky-50 text-sky-700" : "bg-violet-50 text-violet-700"}`}>{SITE_LABELS[job.source]}</span>
+            {job.matched_keywords.length > 0 && <>
+              <span className="text-zinc-300">·</span>
+              <span className="text-emerald-700">{job.matched_keywords.slice(0, 3).join(", ")}{job.matched_keywords.length > 3 ? ` +${job.matched_keywords.length - 3}` : ""}</span>
+            </>}
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-1">
+          {job.status === "new" && <Button aria-label={`Save ${job.title}`} icon={Bookmark} onClick={() => onStatus("saved")} className="px-2.5 sm:px-3.5"><span className="hidden sm:inline">Save</span></Button>}
+          {job.status === "saved" && <Button aria-label={`Mark ${job.title} as new`} icon={BookmarkCheck} onClick={() => onStatus("new")} className="px-2.5 sm:px-3.5"><span className="hidden sm:inline">Saved</span></Button>}
+          {job.status === "applied" && <Button aria-label={`Undo applied for ${job.title}`} icon={Check} onClick={() => onStatus("new")} className="px-2.5 sm:px-3.5"><span className="hidden sm:inline">Applied</span></Button>}
+          {job.status === "dismissed" && <Button aria-label={`Restore ${job.title}`} icon={RotateCcw} onClick={() => onStatus("new")} className="px-2.5 sm:px-3.5"><span className="hidden sm:inline">Restore</span></Button>}
+          <Menu
+            label={`More actions for ${job.title}`}
+            trigger={<span className="rounded-lg p-2 text-zinc-500 hover:bg-zinc-100"><MoreHorizontal className="size-5" /></span>}
+            items={[
+              ...(job.status !== "applied" ? [{ label: "Mark applied", icon: Check, onSelect: () => onStatus("applied") }] : [{ label: "Undo applied", icon: RotateCcw, onSelect: () => onStatus("new") }]),
+              ...(job.status !== "dismissed" ? [{ label: "Dismiss", icon: EyeOff, onSelect: () => onStatus("dismissed"), danger: true }] : []),
+            ]}
+          />
+        </div>
       </div>
 
       {open && (
-        <div className="border-t border-zinc-100 px-4 py-4">
+        <div className="mt-3 rounded-lg bg-zinc-50 p-4">
           {job.score?.status === "ready" && <MatchDetails score={job.score} />}
           {job.score?.status === "failed" && job.score.error && <p className="mb-3 text-sm text-red-700">Scoring failed: {job.score.error}</p>}
           {job.status === "saved" && resumeConfirmed && job.description && (
@@ -729,14 +603,22 @@ function JobRow({
           {(job.seniority || job.employment_type || job.industries) && (
             <p className="mb-3 text-xs text-zinc-500">{[job.seniority, job.employment_type, job.industries].filter(Boolean).join(" · ")}</p>
           )}
-          <p className="text-sm leading-relaxed whitespace-pre-wrap text-zinc-700">{job.description ?? "Description not fetched yet."}</p>
+          {job.description ? <>
+            <p className={`whitespace-pre-wrap text-sm leading-relaxed text-zinc-700 ${fullDescription ? "" : "line-clamp-4"}`}>{job.description}</p>
+            {job.description.length > 400 && <button type="button" onClick={() => setFullDescription((value) => !value)} className="mt-1 text-sm font-medium text-zinc-700 hover:text-zinc-900">{fullDescription ? "Show less" : "Show full description"}</button>}
+          </> : <p className="text-sm leading-relaxed text-zinc-700">Description not fetched yet.</p>}
+          <div className="mt-3 flex flex-wrap items-center gap-4 text-sm text-zinc-500">
+            <button onClick={copyDescription} disabled={!job.description} className="inline-flex items-center gap-1 hover:text-zinc-900 disabled:cursor-not-allowed disabled:opacity-50" aria-label={`Copy ${job.title} description`}>
+              {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}{copied ? "Copied" : "Copy description"}
+            </button>
+            <a href={job.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:text-zinc-900"><ExternalLink className="size-3.5" />{SITE_LABELS[job.source]}</a>
+            {job.company_url && <a href={job.company_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:text-zinc-900"><Building2 className="size-3.5" />Company page</a>}
+            {job.company_website && <a href={job.company_website} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:text-zinc-900"><Globe className="size-3.5" />Company site</a>}
+            {devMode && <button onClick={() => setShowJson((value) => !value)} className="inline-flex items-center gap-1 hover:text-zinc-900"><Braces className="size-3.5" />JSON</button>}
+          </div>
+          {devMode && showJson && <div className="mt-3"><JsonView value={job} fileName={`job-${job.source_id}.json`} note="Stored job record" /></div>}
         </div>
       )}
-      {devMode && showJson && (
-        <div className="border-t border-zinc-100">
-          <JsonView value={job} fileName={`job-${job.source_id}.json`} note="Stored job record" />
-        </div>
-      )}
-    </Card>
+    </div>
   );
 }
