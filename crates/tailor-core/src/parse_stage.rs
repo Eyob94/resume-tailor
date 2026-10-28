@@ -53,18 +53,15 @@ impl ParseStage {
 }
 
 async fn run(db: Arc<Db>, default_ollama_url: String, mut rx: UnboundedReceiver<ParseMessage>) {
-    let db_for_cleanup = db.clone();
-    match tokio::task::spawn_blocking(move || db_for_cleanup.mark_interrupted_profiles()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::error!("couldn't tidy interrupted resume readings: {e}"),
-        Err(e) => tracing::error!("couldn't tidy interrupted resume readings: {e}"),
+    if let Err(e) = db.mark_interrupted_profiles().await {
+        tracing::error!("couldn't tidy interrupted resume readings: {e}");
     }
     while let Some(message) = rx.recv().await {
         match message {
             ParseMessage::Parse { resume } => {
                 if let Err(e) = start_reading(
                     db.clone(),
-                    configured_ollama_url(&db, &default_ollama_url),
+                    configured_ollama_url(&db, &default_ollama_url).await,
                     resume,
                 )
                 .await
@@ -73,19 +70,16 @@ async fn run(db: Arc<Db>, default_ollama_url: String, mut rx: UnboundedReceiver<
                 }
             }
             ParseMessage::ReadAgain { reply } => {
-                let db_for_read = db.clone();
-                let result = tokio::task::spawn_blocking(move || db_for_read.get_resume())
+                let result = db
+                    .get_resume()
                     .await
-                    .map_err(|e| {
-                        ProfileError::Db(DbError::Io(std::io::Error::other(e.to_string())))
-                    })
-                    .and_then(|result| result.map_err(ProfileError::Db))
+                    .map_err(ProfileError::Db)
                     .and_then(|resume| resume.ok_or(ProfileError::NoResume));
                 let result = match result {
                     Ok(resume) => {
                         start_reading(
                             db.clone(),
-                            configured_ollama_url(&db, &default_ollama_url),
+                            configured_ollama_url(&db, &default_ollama_url).await,
                             resume,
                         )
                         .await
@@ -106,24 +100,27 @@ async fn run(db: Arc<Db>, default_ollama_url: String, mut rx: UnboundedReceiver<
     }
 }
 
-pub fn configured_ollama_url(db: &Db, default_url: &str) -> String {
+pub async fn configured_ollama_url(db: &Db, default_url: &str) -> String {
     db.get_setting(OLLAMA_URL_KEY)
+        .await
         .ok()
         .flatten()
         .unwrap_or_else(|| default_url.to_string())
 }
 
-pub fn ai_step_config(db: &Db, step: AiStep) -> Result<AiStepConfig, DbError> {
+pub async fn ai_step_config(db: &Db, step: AiStep) -> Result<AiStepConfig, DbError> {
     let default_prompt = match step {
         AiStep::ReadResume => DEFAULT_PROMPT,
         AiStep::ScoreJobs => crate::score_stage::DEFAULT_PROMPT,
     };
     let model = db
-        .get_setting(step.model_key())?
-        .or(db.get_setting(MODEL_KEY)?)
+        .get_setting(step.model_key())
+        .await?
+        .or(db.get_setting(MODEL_KEY).await?)
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let prompt = db
-        .get_setting(step.prompt_key())?
+        .get_setting(step.prompt_key())
+        .await?
         .unwrap_or_else(|| default_prompt.to_string());
     Ok(AiStepConfig {
         step,
@@ -144,39 +141,27 @@ async fn start_reading(
     resume: MasterResume,
 ) -> Result<(), ProfileError> {
     let uploaded_at = resume.uploaded_at.clone();
-    let db_for_start = db.clone();
-    let url_for_start = ollama_url.clone();
-    let (id, label, config) = tokio::task::spawn_blocking(move || {
-        if let Some(latest) = db_for_start.latest_profile(&uploaded_at)? {
-            if latest.status == "reading" {
-                return Err(ProfileError::AlreadyReading);
-            }
+    if let Some(latest) = db.latest_profile(&uploaded_at).await? {
+        if latest.status == "reading" {
+            return Err(ProfileError::AlreadyReading);
         }
-        let config = ai_step_config(&db_for_start, AiStep::ReadResume)?;
-        let model = Ollama::new(&url_for_start, &config.model);
-        let label = JsonModel::label(&model);
-        let id = db_for_start.start_profile(&uploaded_at, &label)?;
-        Ok((id, label, config))
-    })
-    .await
-    .map_err(|e| ProfileError::Db(DbError::Io(std::io::Error::other(e.to_string()))))??;
+    }
+    let config = ai_step_config(&db, AiStep::ReadResume).await?;
+    let model = Ollama::new(&ollama_url, &config.model);
+    let label = JsonModel::label(&model);
+    let id = db
+        .start_profile(&uploaded_at, &label)
+        .await?
+        .ok_or(ProfileError::NoResume)?;
     let model = Ollama::new(&ollama_url, &config.model);
     tokio::spawn(async move {
         tracing::info!(model = %label, "reading resume");
         let started = std::time::Instant::now();
         let outcome = match read_resume(&model, &config.prompt, &resume.extracted_text).await {
-            Ok((profile, warnings)) => {
-                let db = db.clone();
-                tokio::task::spawn_blocking(move || db.finish_profile(id, &profile, &warnings))
-                    .await
-                    .unwrap_or_else(|e| Err(DbError::Io(std::io::Error::other(e.to_string()))))
-            }
+            Ok((profile, warnings)) => db.finish_profile(id, &profile, &warnings).await,
             Err(e) => {
                 tracing::warn!("resume reading failed: {e}");
-                let db = db.clone();
-                tokio::task::spawn_blocking(move || db.fail_profile(id, &e.to_string()))
-                    .await
-                    .unwrap_or_else(|e| Err(DbError::Io(std::io::Error::other(e.to_string()))))
+                db.fail_profile(id, &e.to_string()).await
             }
         };
         if let Err(e) = outcome {
@@ -191,15 +176,12 @@ async fn start_reading(
 }
 
 async fn current_profile(db: Arc<Db>) -> Result<(MasterResume, ProfileRecord), ProfileError> {
-    tokio::task::spawn_blocking(move || {
-        let resume = db.get_resume()?.ok_or(ProfileError::NoResume)?;
-        let profile = db
-            .latest_profile(&resume.uploaded_at)?
-            .ok_or(ProfileError::NotRead)?;
-        Ok((resume, profile))
-    })
-    .await
-    .map_err(|e| ProfileError::Db(DbError::Io(std::io::Error::other(e.to_string()))))?
+    let resume = db.get_resume().await?.ok_or(ProfileError::NoResume)?;
+    let profile = db
+        .latest_profile(&resume.uploaded_at)
+        .await?
+        .ok_or(ProfileError::NotRead)?;
+    Ok((resume, profile))
 }
 
 async fn save_edits(
@@ -213,26 +195,25 @@ async fn save_edits(
         return Err(ProfileError::MissingName);
     }
     let warnings = check_against(&profile, &resume.extracted_text);
-    tokio::task::spawn_blocking(move || {
-        if !db.save_profile_edits(record.id, &profile, &warnings)? {
-            return Err(ProfileError::NotEditable);
-        }
-        db.get_profile(record.id)?.ok_or(ProfileError::NotRead)
-    })
-    .await
-    .map_err(|e| ProfileError::Db(DbError::Io(std::io::Error::other(e.to_string()))))?
+    if !db
+        .save_profile_edits(record.id, &profile, &warnings)
+        .await?
+    {
+        return Err(ProfileError::NotEditable);
+    }
+    db.get_profile(record.id)
+        .await?
+        .ok_or(ProfileError::NotRead)
 }
 
 async fn confirm(db: Arc<Db>) -> Result<ProfileRecord, ProfileError> {
     let (_, record) = current_profile(db.clone()).await?;
-    tokio::task::spawn_blocking(move || {
-        if !db.confirm_profile(record.id)? {
-            return Err(ProfileError::NotConfirmable);
-        }
-        db.get_profile(record.id)?.ok_or(ProfileError::NotRead)
-    })
-    .await
-    .map_err(|e| ProfileError::Db(DbError::Io(std::io::Error::other(e.to_string()))))?
+    if !db.confirm_profile(record.id).await? {
+        return Err(ProfileError::NotConfirmable);
+    }
+    db.get_profile(record.id)
+        .await?
+        .ok_or(ProfileError::NotRead)
 }
 
 pub async fn ollama_status(base_url: &str) -> OllamaStatus {
@@ -728,62 +709,65 @@ pub async fn read_resume<M: JsonModel>(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::remove_dir_all, sync::Mutex};
+    use std::sync::Mutex;
+
+    use sqlx::PgPool;
 
     use super::*;
 
     const RESUME_TEXT: &str = "Jordan Rivera\njordan@example.com | Seattle, WA\n\nEXPERIENCE\nSenior Software Engineer, Acme Corp (2021 - Present)\n- Led migration of billing services to Rust, cutting p99 latency by 40%\n- Mentored 4 engineers\n\nSKILLS\nRust, TypeScript";
 
-    fn temp_db() -> (Db, std::path::PathBuf) {
-        let dir =
-            std::env::temp_dir().join(format!("workflow-ai-config-{}", rand::random::<u64>()));
-        let db = Db::open(&dir).unwrap();
-        (db, dir)
+    async fn temp_db(pool: PgPool) -> Db {
+        let user_id: i64 = sqlx::query_scalar(
+            "INSERT INTO users (created_at) VALUES ('2026-01-01T00:00:00Z') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        Db::for_user(pool, user_id)
     }
 
-    #[test]
-    fn ai_step_config_uses_defaults_when_nothing_is_saved() {
-        let (db, dir) = temp_db();
-        let config = ai_step_config(&db, AiStep::ReadResume).unwrap();
+    #[sqlx::test(migrations = "./migrations")]
+    async fn ai_step_config_uses_defaults_when_nothing_is_saved(pool: PgPool) {
+        let db = temp_db(pool).await;
+        let config = ai_step_config(&db, AiStep::ReadResume).await.unwrap();
         assert_eq!(config.model, DEFAULT_MODEL);
         assert_eq!(config.prompt, DEFAULT_PROMPT);
         assert!(config.prompt_is_default);
-        remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn ai_step_config_falls_back_to_legacy_model() {
-        let (db, dir) = temp_db();
-        db.set_setting(MODEL_KEY, "legacy-model").unwrap();
+    #[sqlx::test(migrations = "./migrations")]
+    async fn ai_step_config_falls_back_to_legacy_model(pool: PgPool) {
+        let db = temp_db(pool).await;
+        db.set_setting(MODEL_KEY, "legacy-model").await.unwrap();
         assert_eq!(
-            ai_step_config(&db, AiStep::ScoreJobs).unwrap().model,
+            ai_step_config(&db, AiStep::ScoreJobs).await.unwrap().model,
             "legacy-model"
         );
-        remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn ai_step_config_prefers_step_model_over_legacy_model() {
-        let (db, dir) = temp_db();
-        db.set_setting(MODEL_KEY, "legacy-model").unwrap();
+    #[sqlx::test(migrations = "./migrations")]
+    async fn ai_step_config_prefers_step_model_over_legacy_model(pool: PgPool) {
+        let db = temp_db(pool).await;
+        db.set_setting(MODEL_KEY, "legacy-model").await.unwrap();
         db.set_setting(AiStep::ScoreJobs.model_key(), "score-model")
+            .await
             .unwrap();
         assert_eq!(
-            ai_step_config(&db, AiStep::ScoreJobs).unwrap().model,
+            ai_step_config(&db, AiStep::ScoreJobs).await.unwrap().model,
             "score-model"
         );
-        remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn ai_step_config_returns_saved_prompt() {
-        let (db, dir) = temp_db();
+    #[sqlx::test(migrations = "./migrations")]
+    async fn ai_step_config_returns_saved_prompt(pool: PgPool) {
+        let db = temp_db(pool).await;
         db.set_setting(AiStep::ReadResume.prompt_key(), "custom prompt")
+            .await
             .unwrap();
-        let config = ai_step_config(&db, AiStep::ReadResume).unwrap();
+        let config = ai_step_config(&db, AiStep::ReadResume).await.unwrap();
         assert_eq!(config.prompt, "custom prompt");
         assert!(!config.prompt_is_default);
-        remove_dir_all(dir).unwrap();
     }
 
     struct FakeModel {

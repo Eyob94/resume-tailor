@@ -1,6 +1,5 @@
 use std::{
-    path::Path,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -17,9 +16,9 @@ use axum::{
     Json, Router,
 };
 use rand::RngCore;
-use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sqlx::{Executor, PgPool, Postgres};
 
 use crate::{errors::AppError, AppState, UserServices};
 
@@ -27,140 +26,103 @@ const SESSION_COOKIE: &str = "resume_tailor_session";
 const SESSION_SECONDS: u64 = 60 * 60 * 24 * 30;
 
 #[derive(Clone)]
-pub struct AuthStore(Arc<Mutex<Connection>>);
+pub struct AuthStore(PgPool);
 
 #[derive(Debug)]
 pub enum AuthError {
     InvalidCredentials,
     UserExists,
-    Database(rusqlite::Error),
+    Database(sqlx::Error),
     PasswordHash,
 }
 
 impl AuthStore {
-    pub fn open(data_dir: &Path) -> rusqlite::Result<Self> {
-        std::fs::create_dir_all(data_dir)
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-        let connection = Connection::open(data_dir.join("auth.sqlite"))?;
-        connection.execute_batch(
-            "PRAGMA foreign_keys = ON;
-             CREATE TABLE IF NOT EXISTS users (
-                 id INTEGER PRIMARY KEY,
-                 username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                 password_hash TEXT NOT NULL,
-                 created_at INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS sessions (
-                 token_hash TEXT PRIMARY KEY,
-                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                 expires_at INTEGER NOT NULL
-             );",
-        )?;
-        Ok(Self(Arc::new(Mutex::new(connection))))
+    pub fn new(pool: PgPool) -> Self {
+        Self(pool)
     }
 
-    pub fn register(&self, username: &str, password: &str) -> Result<(i64, String), AuthError> {
+    pub async fn register(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<(i64, String), AuthError> {
         let salt = SaltString::generate(&mut OsRng);
         let password_hash = Argon2::default()
             .hash_password(password.as_bytes(), &salt)
             .map_err(|_| AuthError::PasswordHash)?
             .to_string();
-        let now = unix_time();
-        let connection = self.0.lock().unwrap();
-        connection
-            .execute(
-                "INSERT INTO users (username, password_hash, created_at) VALUES (?1, ?2, ?3)",
-                params![username, password_hash, now],
-            )
-            .map_err(|error| {
-                if matches!(error, rusqlite::Error::SqliteFailure(ref e, _)
-                    if e.code == rusqlite::ErrorCode::ConstraintViolation)
-                {
-                    AuthError::UserExists
-                } else {
-                    AuthError::Database(error)
-                }
+        let mut tx = self.0.begin().await.map_err(AuthError::Database)?;
+        let user_id = sqlx::query_scalar::<_, i64>("INSERT INTO users (username, password_hash, created_at) VALUES ($1, $2, $3) RETURNING id")
+            .bind(username).bind(password_hash).bind(chrono::Utc::now().to_rfc3339()).fetch_one(&mut *tx).await.map_err(|error| {
+                if error.as_database_error().and_then(|e| e.code()).as_deref() == Some("23505") { AuthError::UserExists } else { AuthError::Database(error) }
             })?;
-        let user_id = connection.last_insert_rowid();
-        let token = create_session(&connection, user_id)?;
+        let token = create_session(&mut *tx, user_id).await?;
+        tx.commit().await.map_err(AuthError::Database)?;
         Ok((user_id, token))
     }
 
-    pub fn login(&self, username: &str, password: &str) -> Result<(i64, String), AuthError> {
-        let connection = self.0.lock().unwrap();
-        let user = connection
-            .query_row(
-                "SELECT id, password_hash FROM users WHERE username = ?1 COLLATE NOCASE",
-                [username],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()
-            .map_err(AuthError::Database)?
-            .ok_or(AuthError::InvalidCredentials)?;
-        let parsed = PasswordHash::new(&user.1).map_err(|_| AuthError::PasswordHash)?;
+    pub async fn login(&self, username: &str, password: &str) -> Result<(i64, String), AuthError> {
+        let user = sqlx::query_as::<_, (i64, Option<String>)>(
+            "SELECT id, password_hash FROM users WHERE LOWER(username) = LOWER($1)",
+        )
+        .bind(username)
+        .fetch_optional(&self.0)
+        .await
+        .map_err(AuthError::Database)?
+        .ok_or(AuthError::InvalidCredentials)?;
+        let password_hash = user.1.ok_or(AuthError::InvalidCredentials)?;
+        let parsed = PasswordHash::new(&password_hash).map_err(|_| AuthError::PasswordHash)?;
         Argon2::default()
             .verify_password(password.as_bytes(), &parsed)
             .map_err(|_| AuthError::InvalidCredentials)?;
-        let token = create_session(&connection, user.0)?;
+        let token = create_session(&self.0, user.0).await?;
         Ok((user.0, token))
     }
 
-    pub fn username(&self, user_id: i64) -> Result<Option<String>, AuthError> {
-        self.0
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT username FROM users WHERE id = ?1",
-                [user_id],
-                |row| row.get(0),
-            )
-            .optional()
+    pub async fn username(&self, user_id: i64) -> Result<Option<String>, AuthError> {
+        sqlx::query_scalar("SELECT username FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&self.0)
+            .await
             .map_err(AuthError::Database)
     }
 
-    pub fn session_user(&self, token: &str) -> Result<Option<i64>, AuthError> {
+    pub async fn session_user(&self, token: &str) -> Result<Option<i64>, AuthError> {
         let token_hash = hash_token(token);
-        self.0
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT user_id FROM sessions WHERE token_hash = ?1 AND expires_at > ?2",
-                params![token_hash, unix_time()],
-                |row| row.get(0),
-            )
-            .optional()
+        sqlx::query_scalar("SELECT user_id FROM sessions WHERE token_hash = $1 AND expires_at > $2")
+            .bind(token_hash)
+            .bind(unix_time())
+            .fetch_optional(&self.0)
+            .await
             .map_err(AuthError::Database)
     }
 
-    pub fn logout(&self, token: &str) -> Result<(), AuthError> {
-        self.0
-            .lock()
-            .unwrap()
-            .execute(
-                "DELETE FROM sessions WHERE token_hash = ?1",
-                [hash_token(token)],
-            )
+    pub async fn logout(&self, token: &str) -> Result<(), AuthError> {
+        sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
+            .bind(hash_token(token))
+            .execute(&self.0)
+            .await
             .map(|_| ())
             .map_err(AuthError::Database)
     }
 }
 
-fn create_session(connection: &Connection, user_id: i64) -> Result<String, AuthError> {
+async fn create_session<'e>(
+    connection: impl Executor<'e, Database = Postgres>,
+    user_id: i64,
+) -> Result<String, AuthError> {
     let mut bytes = [0_u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     let token = bytes
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    connection
-        .execute(
-            "INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?1, ?2, ?3)",
-            params![
-                hash_token(&token),
-                user_id,
-                unix_time() + SESSION_SECONDS as i64
-            ],
-        )
+    sqlx::query("INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ($1, $2, $3)")
+        .bind(hash_token(&token))
+        .bind(user_id)
+        .bind(unix_time() + SESSION_SECONDS as i64)
+        .execute(connection)
+        .await
         .map_err(AuthError::Database)?;
     Ok(token)
 }
@@ -184,7 +146,7 @@ struct Credentials {
 
 #[derive(Serialize)]
 struct UserResponse {
-    username: String,
+    username: Option<String>,
 }
 
 pub fn public_routes() -> Router<AppState> {
@@ -226,9 +188,10 @@ async fn register(
     let (_user_id, token) = state
         .auth
         .register(username, &credentials.password)
+        .await
         .map_err(auth_error)?;
     let response = Json(UserResponse {
-        username: username.to_owned(),
+        username: Some(username.to_owned()),
     });
     Ok((StatusCode::CREATED, with_session_cookie(response, &token)?))
 }
@@ -240,12 +203,9 @@ async fn login(
     let (user_id, token) = state
         .auth
         .login(credentials.username.trim(), &credentials.password)
+        .await
         .map_err(auth_error)?;
-    let username = state
-        .auth
-        .username(user_id)
-        .map_err(auth_error)?
-        .ok_or_else(|| AppError::internal("user missing after login"))?;
+    let username = state.auth.username(user_id).await.map_err(auth_error)?;
     Ok(with_session_cookie(
         Json(UserResponse { username }),
         &token,
@@ -257,7 +217,7 @@ async fn logout(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     if let Some(token) = cookie_token(&headers) {
-        state.auth.logout(&token).map_err(auth_error)?;
+        state.auth.logout(&token).await.map_err(auth_error)?;
     }
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(
@@ -308,6 +268,7 @@ pub async fn require_auth(
     let user_id = state
         .auth
         .session_user(&token)
+        .await
         .map_err(auth_error)?
         .ok_or_else(unauthorized)?;
     let user = state
@@ -334,5 +295,39 @@ fn auth_error(error: AuthError) -> AppError {
         AuthError::UserExists => AppError::bad_request("That username is already registered."),
         AuthError::Database(error) => AppError::internal(error),
         AuthError::PasswordHash => AppError::internal("password hashing failed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[sqlx::test(migrations = "../tailor-core/migrations")]
+    async fn password_authentication_uses_postgres_sessions(pool: PgPool) {
+        let auth = AuthStore::new(pool);
+        let (user_id, token) = auth
+            .register("example-user", "correct-horse-battery")
+            .await
+            .unwrap();
+        assert_eq!(
+            auth.username(user_id).await.unwrap().as_deref(),
+            Some("example-user")
+        );
+        assert_eq!(auth.session_user(&token).await.unwrap(), Some(user_id));
+        let (login_id, login_token) = auth
+            .login("EXAMPLE-USER", "correct-horse-battery")
+            .await
+            .unwrap();
+        assert_eq!(login_id, user_id);
+        assert_eq!(
+            auth.session_user(&login_token).await.unwrap(),
+            Some(user_id)
+        );
+        assert!(matches!(
+            auth.login("example-user", "wrong-password").await,
+            Err(AuthError::InvalidCredentials)
+        ));
+        auth.logout(&login_token).await.unwrap();
+        assert_eq!(auth.session_user(&login_token).await.unwrap(), None);
     }
 }

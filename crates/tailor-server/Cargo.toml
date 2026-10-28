@@ -16,5 +16,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 argon2 = "0.5"
 rand = "0.8"
-rusqlite = { version = "0.32", features = ["bundled"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros"] }
 sha2 = "0.10"

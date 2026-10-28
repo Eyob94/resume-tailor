@@ -19,7 +19,9 @@ cd web && npm install && npm run build && cd ..
 cargo run -p tailor-server
 ```
 
-Open http://localhost:8787 and create an account. Existing data in `DATA_DIR` is assigned to the first account created; later accounts get separate data directories under `DATA_DIR/users/`.
+Set `DATABASE_URL` to a direct PostgreSQL connection string before starting the server. Use a direct Neon connection (the host without `-pooler`) or a Supabase session pooler on port 5432. Transaction-mode poolers are not compatible with SQLx prepared statements.
+
+Open http://localhost:8787 and create an account. The server creates its schema on an empty PostgreSQL database; existing SQLite data is not imported.
 
 ### Frontend dev (hot reload)
 
@@ -33,7 +35,7 @@ Open http://localhost:5173 (proxies `/api` to the Rust server).
 
 ## VPS deployment
 
-GitHub Actions runs the Rust tests and the frontend build on pull requests. A push to `main` also builds a release and deploys it to an Ubuntu VPS over IPv4 SSH. Each deploy first runs `deploy/bootstrap.sh` on the server, which installs Caddy, the systemd service and the deploy script if they're missing; it's safe to re-run. Data lives in `/var/lib/resume-tailor`, and Caddy serves `codpal.io` over HTTPS, proxying to the app on `127.0.0.1:8787`.
+GitHub Actions runs the Rust tests against PostgreSQL and builds the frontend on pull requests. A push to `main` also builds a release and deploys it to an Ubuntu VPS over IPv4 SSH. Each deploy first runs `deploy/bootstrap.sh` on the server, which installs Caddy, the systemd service and the deploy script if they're missing; it's safe to re-run. Resume and application data lives in PostgreSQL, and Caddy serves `codpal.io` over HTTPS, proxying to the app on `127.0.0.1:8787`.
 
 One-time setup:
 
@@ -44,6 +46,7 @@ One-time setup:
    - `VPS_HOST`: the VPS IPv4 address, or a hostname that resolves to it.
    - `VPS_USER`: the deploy user, e.g. `root`.
    - `VPS_SSH_PRIVATE_KEY`: the matching private key.
+   - `DATABASE_URL`: a direct PostgreSQL connection string.
 
    The deploy skips SSH host-key verification, so it does not check the server's identity.
 
@@ -56,9 +59,9 @@ Each release is health-checked; a failed restart or check restores the previous 
 | Var | Default | |
 |---|---|---|
 | `PORT` | `8787` | Port for the local server, which binds to 127.0.0.1 |
-| `DATA_DIR` | `data` | SQLite DB + uploaded PDF |
+| `DATABASE_URL` | required | Direct PostgreSQL connection string |
 | `WEB_DIST` | `web/dist` | Built frontend to serve |
-| `OLLAMA_URL` | `http://127.0.0.1:11434` | Initial Ollama server URL; can be changed later in Settings and is saved in SQLite |
+| `OLLAMA_URL` | `http://127.0.0.1:11434` | Initial Ollama server URL; can be changed later in Settings and is saved in PostgreSQL |
 | `SCAN_COOLDOWN_SECONDS` | `600` | Minimum gap before a manual "Run now" scan. Lower only for local testing (the dev launch config uses 60) |
 
 ## Tests
@@ -66,4 +69,12 @@ Each release is health-checked; a failed restart or check restores the previous 
 ```bash
 cargo test --workspace
 cd web && npm run typecheck
+```
+
+Rust tests require a disposable PostgreSQL database. For a local throwaway instance:
+
+```bash
+docker run -d --name tailor-pg -e POSTGRES_PASSWORD=postgres -p 5433:5432 postgres:16
+DATABASE_URL=postgres://postgres:postgres@localhost:5433/postgres cargo test --workspace
+docker rm -f tailor-pg
 ```

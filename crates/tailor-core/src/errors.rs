@@ -47,9 +47,7 @@ pub enum IndeedError {
 #[derive(Debug, Error)]
 pub enum DbError {
     #[error(transparent)]
-    Db(#[from] rusqlite::Error),
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Sqlx(#[from] sqlx::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
