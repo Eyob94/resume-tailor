@@ -69,7 +69,7 @@ export function FanNav({ items }: { items: { to: string; shortLabel: string; ico
           id="fan-nav"
           aria-label="Pages"
           aria-hidden={!open}
-          className="pointer-events-none absolute inset-0 size-14"
+          className="pointer-events-none absolute inset-0 size-[52px]"
         >
           {items.map(({ to, shortLabel, icon: Icon }, index) => {
             const angle = (points[index] ?? 90) * (Math.PI / 180);
@@ -90,7 +90,7 @@ export function FanNav({ items }: { items: { to: string; shortLabel: string; ico
             return (
               <div
                 key={to}
-                className="absolute right-1 top-1"
+                className="absolute right-0.5 top-0.5"
                 style={{
                   transform,
                   opacity: open ? 1 : 0,
@@ -143,7 +143,7 @@ export function FanNav({ items }: { items: { to: string; shortLabel: string; ico
           aria-expanded={open}
           aria-controls="fan-nav"
           onClick={() => (open ? closeMenu() : setOpen(true))}
-          className={`relative z-40 flex size-14 items-center justify-center rounded-full bg-zinc-900 text-white shadow-lg shadow-zinc-900/25 transition-transform active:scale-95 ${open ? "ring-4 ring-white" : ""}`}
+          className={`relative z-40 flex size-[52px] items-center justify-center rounded-full bg-zinc-900 text-white shadow-lg shadow-zinc-900/25 transition-transform active:scale-95 ${open ? "ring-4 ring-white" : ""}`}
         >
           <LayoutGrid className={`absolute size-6 transition-all duration-300 ${open ? "scale-75 rotate-90 opacity-0" : "scale-100 rotate-0 opacity-100"}`} />
           <X className={`absolute size-6 transition-all duration-300 ${open ? "scale-100 rotate-0 opacity-100" : "scale-75 rotate-90 opacity-0"}`} />

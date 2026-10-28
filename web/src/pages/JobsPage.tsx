@@ -64,9 +64,23 @@ export function JobsPage() {
   const [applyingEdit, setApplyingEdit] = useState<"save" | "discard" | null>(null);
   const [filter, setFilter] = useState<Filter>("new");
   const [sort, setSort] = useState<"newest" | "match">("newest");
+  const [filtersOpen, setFiltersOpen] = useState(() => {
+    try {
+      return localStorage.getItem("jobs.filtersOpen") === "true";
+    } catch {
+      return false;
+    }
+  });
   const [resumeConfirmed, setResumeConfirmed] = useState(false);
   const [devMode] = useDevMode();
   const [copiedUrl, setCopiedUrl] = useState(false);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("jobs.filtersOpen", String(filtersOpen));
+    } catch {
+    }
+  }, [filtersOpen]);
 
   useEffect(() => {
     profileApi.get().then(
@@ -250,8 +264,8 @@ export function JobsPage() {
         title="Jobs"
         actions={
           searches?.length && !editing ? (
-            <Button variant="primary" icon={Plus} onClick={() => setEditing("new")}>
-              New preference
+            <Button variant="primary" icon={Plus} aria-label="New preference" onClick={() => setEditing("new")} className="size-10 p-0 sm:size-auto sm:px-3.5 sm:py-2">
+              <span className="hidden sm:inline">New preference</span>
             </Button>
           ) : null
         }
@@ -261,7 +275,7 @@ export function JobsPage() {
       {searches === null ? (
         <Skeleton className="h-40" />
       ) : (
-        <section className="mb-10 space-y-4">
+        <section className="mb-4 space-y-4">
           {editing && (
             <Card>
               <div className="flex items-center justify-between gap-3 border-b border-zinc-100 px-5 py-4">
@@ -296,24 +310,48 @@ export function JobsPage() {
             </EmptyState>
           ) : (
             <>
-              <div className="flex flex-wrap gap-2">
-                {searches.map((search) => (
-                  <div key={search.id} className={`inline-flex items-center rounded-full border text-sm ${search.enabled ? "border-zinc-300 bg-white text-zinc-900" : "border-zinc-200 bg-zinc-50 text-zinc-400"}`}>
-                    <button type="button" aria-label={`${search.enabled ? "Turn off" : "Turn on"} scans for ${search.name}`} onClick={() => void toggleSearch(search)} className="py-1 pl-2.5 pr-1">
-                      {search.enabled ? <CheckCircle2 className="size-4 text-emerald-600" /> : <Circle className="size-4 text-zinc-300" />}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setEditing(search)}
-                      title={`${[...search.titles, ...search.keywords].join(", ")} · ${search.location ?? "Anywhere"} · past ${search.posted_within}`}
-                      className="max-w-56 truncate py-1 pl-1 pr-3 text-left"
-                    >
-                      {search.name}
-                    </button>
-                  </div>
-                ))}
+              <button
+                type="button"
+                aria-expanded={filtersOpen}
+                onClick={() => setFiltersOpen((open) => !open)}
+                className="flex w-full items-center gap-2 text-left text-sm text-zinc-500 sm:hidden"
+              >
+                {scans?.some((scan) => scan.last_run && (scan.last_run.status === "partial" || scan.last_run.status === "failed")) && <AlertTriangle className="size-4 shrink-0 text-amber-500" />}
+                {scans?.some((scan) => scan.running) && <Loader2 className="size-3.5 shrink-0 animate-spin" />}
+                <span className="min-w-0 flex-1 truncate">
+                  {searches.filter((search) => search.enabled).length === searches.length
+                    ? plural(searches.length, "preference")
+                    : `${searches.filter((search) => search.enabled).length} of ${searches.length} preferences`}
+                  {" · "}
+                  {scans?.some((scan) => scan.running)
+                    ? "scanning…"
+                    : (() => {
+                        const latest = scans?.map((scan) => scan.last_run?.started_at).filter((value): value is string => Boolean(value)).sort((first, second) => Date.parse(first) - Date.parse(second)).at(-1);
+                        return latest ? `scanned ${relativeTime(latest)}` : "not scanned yet";
+                      })()}
+                </span>
+                <ChevronDown className={`size-4 shrink-0 transition-transform ${filtersOpen ? "rotate-180" : ""}`} />
+              </button>
+              <div className={`${filtersOpen ? "block" : "hidden"} sm:block`}>
+                <div className="flex flex-wrap gap-2">
+                  {searches.map((search) => (
+                    <div key={search.id} className={`inline-flex items-center rounded-full border text-sm ${search.enabled ? "border-zinc-300 bg-white text-zinc-900" : "border-zinc-200 bg-zinc-50 text-zinc-400"}`}>
+                      <button type="button" aria-label={`${search.enabled ? "Turn off" : "Turn on"} scans for ${search.name}`} onClick={() => void toggleSearch(search)} className="py-1 pl-2.5 pr-1">
+                        {search.enabled ? <CheckCircle2 className="size-4 text-emerald-600" /> : <Circle className="size-4 text-zinc-300" />}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setEditing(search)}
+                        title={`${[...search.titles, ...search.keywords].join(", ")} · ${search.location ?? "Anywhere"} · past ${search.posted_within}`}
+                        className="max-w-56 truncate py-1 pl-1 pr-3 text-left"
+                      >
+                        {search.name}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                {scans && searches.length > 0 && <ScanLine scans={scans} onRun={runScan} />}
               </div>
-              {scans && searches.length > 0 && <ScanLine scans={scans} onRun={runScan} />}
             </>
           )}
         </section>
@@ -321,37 +359,57 @@ export function JobsPage() {
 
       {searches && searches.length > 0 && (
         <section>
-          <div className="mb-4 flex items-end gap-3 border-b border-zinc-200">
-            <div className="flex min-w-0 flex-1 gap-1 overflow-x-auto" role="tablist">
-              {FILTERS.map(([id, label]) => (
-                <button
-                  key={id}
-                  role="tab"
-                  aria-selected={filter === id}
-                  onClick={() => setFilter(id)}
-                  className={`-mb-px flex shrink-0 items-center gap-2 border-b-2 px-3 pb-2.5 text-sm font-medium transition-colors ${
-                    filter === id ? "border-zinc-900 text-zinc-900" : "border-transparent text-zinc-500 hover:text-zinc-900"
-                  }`}
-                >
-                  {label}
-                  <span className="text-xs font-normal text-zinc-400">{counts[id]}</span>
+          <div className="mb-4 border-b border-zinc-200">
+            <div className="flex items-end gap-3">
+              <div className="flex min-w-0 flex-1 gap-px overflow-x-auto sm:gap-1" role="tablist">
+                {FILTERS.map(([id, label]) => (
+                  <button
+                    key={id}
+                    role="tab"
+                    aria-selected={filter === id}
+                    onClick={() => setFilter(id)}
+                    className={`-mb-px flex shrink-0 items-center gap-1 whitespace-nowrap border-b-2 px-1 pb-2.5 text-sm font-medium transition-colors sm:gap-2 sm:px-3 ${
+                      filter === id ? "border-zinc-900 text-zinc-900" : "border-transparent text-zinc-500 hover:text-zinc-900"
+                    }`}
+                  >
+                    {label}
+                    <span className="text-xs font-normal text-zinc-400">{counts[id]}</span>
+                  </button>
+                ))}
+              </div>
+              <select
+                aria-label="Sort jobs"
+                value={sort}
+                onChange={(e) => setSort(e.target.value as "newest" | "match")}
+                className="mb-2 hidden shrink-0 border-0 bg-transparent px-2 py-1.5 text-sm text-zinc-600 shadow-none sm:block"
+              >
+                <option value="newest">Newest</option>
+                <option value="match">Best match</option>
+              </select>
+              {filter === "new" && visible.length > 0 && (
+                <button type="button" title={`Save all ${visible.length} jobs`} onClick={() => saveAll(visible.map((j) => j.id))} className="mb-2 hidden shrink-0 items-center gap-1 text-sm font-medium text-zinc-700 hover:text-zinc-900 sm:inline-flex">
+                  <BookmarkPlus className="size-4" /> Save all
                 </button>
-              ))}
+              )}
             </div>
-            <select
-              aria-label="Sort jobs"
-              value={sort}
-              onChange={(e) => setSort(e.target.value as "newest" | "match")}
-              className="mb-2 shrink-0 border-0 bg-transparent px-2 py-1.5 text-sm text-zinc-600 shadow-none"
-            >
-              <option value="newest">Newest</option>
-              <option value="match">Best match</option>
-            </select>
-            {filter === "new" && visible.length > 0 && (
-              <button type="button" title={`Save all ${visible.length} jobs`} onClick={() => saveAll(visible.map((j) => j.id))} className="mb-2 inline-flex shrink-0 items-center gap-1 text-sm font-medium text-zinc-700 hover:text-zinc-900">
-                <BookmarkPlus className="size-4" /> Save all
-              </button>
-            )}
+            <div className="flex items-center justify-end gap-1 py-1 sm:hidden">
+              <select
+                aria-label="Sort jobs"
+                value={sort}
+                onChange={(e) => setSort(e.target.value as "newest" | "match")}
+                className="border-0 bg-transparent px-2 py-1.5 text-sm text-zinc-600 shadow-none"
+              >
+                <option value="newest">Newest</option>
+                <option value="match">Best match</option>
+              </select>
+              {filter === "new" && visible.length > 0 && (
+                <Menu
+                  label="More job list actions"
+                  trigger={<span className="rounded-lg p-2 text-zinc-500 hover:bg-zinc-100"><MoreHorizontal className="size-5" /></span>}
+                  items={[{ label: `Save all ${visible.length}`, icon: BookmarkPlus, onSelect: () => void saveAll(visible.map((job) => job.id)) }]}
+                />
+              )}
+            </div>
           </div>
 
           {jobs === null ? (
@@ -409,7 +467,7 @@ function ScanLine({ scans, onRun }: { scans: ScanStatus[]; onRun: (site: Site) =
   };
 
   return (
-    <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-zinc-500">
+    <div className="mt-3 flex flex-nowrap items-center gap-x-2 overflow-x-auto text-sm text-zinc-500 sm:flex-wrap">
       {scans.map((scan, index) => {
         const last = scan.last_run;
         const problem = last && (last.status === "partial" || last.status === "failed");
@@ -513,6 +571,9 @@ function JobRow({
   const [showJson, setShowJson] = useState(false);
   const [copied, setCopied] = useState(false);
   const [devMode] = useDevMode();
+  const statusButtonBase = "inline-flex items-center justify-center rounded-lg p-2 transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900 disabled:pointer-events-none disabled:opacity-50 sm:gap-2 sm:border sm:border-zinc-200 sm:bg-white sm:px-3.5 sm:py-2 sm:shadow-sm";
+  const statusButtonMuted = `${statusButtonBase} text-zinc-500 hover:bg-zinc-100 sm:text-zinc-700 sm:hover:bg-zinc-50 sm:hover:text-zinc-900`;
+  const statusButtonActive = `${statusButtonBase} text-zinc-900 hover:bg-zinc-100 sm:text-zinc-700 sm:hover:bg-zinc-50 sm:hover:text-zinc-900`;
 
   async function copyDescription() {
     if (!job.description) return;
@@ -525,9 +586,23 @@ function JobRow({
     }
   }
 
+  const sourceBadge = <span className={`rounded px-1.5 py-px text-[11px] font-medium ${job.source === "linkedin" ? "bg-sky-50 text-sky-700" : "bg-violet-50 text-violet-700"}`}>{SITE_LABELS[job.source]}</span>;
+  const keywordLabel = job.matched_keywords.length > 0
+    ? `${job.matched_keywords.slice(0, 3).join(", ")}${job.matched_keywords.length > 3 ? ` +${job.matched_keywords.length - 3}` : ""}`
+    : undefined;
+  const desktopMetaParts = [
+    { key: "company", value: job.company },
+    { key: "city", value: job.location?.split(",")[0] },
+    { key: "work-mode", value: job.work_mode ? WORK_MODE_LABELS[job.work_mode] : undefined },
+    { key: "posted", value: job.posted_on ? postedLabel(job.posted_on) : undefined },
+    { key: "source", value: SITE_LABELS[job.source] },
+    { key: "keywords", value: keywordLabel },
+  ].filter((part): part is { key: string; value: string } => Boolean(part.value));
+  const expandedMetaParts = desktopMetaParts.filter((part) => part.key !== "company" && part.key !== "posted");
+
   return (
-    <div className={`py-3.5 ${job.status === "dismissed" ? "opacity-60" : ""}`}>
-      <div className="flex items-start gap-3">
+    <div className={`py-3 sm:py-3.5 ${job.status === "dismissed" ? "opacity-60" : ""}`}>
+      <div className="flex items-start gap-3 pr-14 sm:pr-0">
         <div
           role="button"
           tabIndex={0}
@@ -542,30 +617,29 @@ function JobRow({
           className="min-w-0 flex-1 cursor-pointer"
         >
           <div className="flex flex-wrap items-center gap-2">
-            <span className="font-medium text-zinc-900">{job.title}</span>
-            <ScoreBadge job={job} resumeConfirmed={resumeConfirmed} />
-            {job.tailored_at && <span className="inline-flex items-center gap-1 rounded-md bg-emerald-50 px-1.5 py-0.5 text-xs font-medium text-emerald-700"><CheckCircle2 className="size-3" />Tailored</span>}
+            <span className="line-clamp-2 min-w-0 flex-1 font-medium text-zinc-900 sm:line-clamp-none">{job.title}</span>
+            <span className="hidden sm:inline-flex"><ScoreBadge job={job} resumeConfirmed={resumeConfirmed} /></span>
+            {job.tailored_at && <span className="hidden items-center gap-1 rounded-md bg-emerald-50 px-1.5 py-0.5 text-xs font-medium text-emerald-700 sm:inline-flex"><CheckCircle2 className="size-3" />Tailored</span>}
           </div>
-          <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-sm text-zinc-500">
-            {[
-              job.company,
-              job.location?.split(",")[0],
-              job.work_mode ? WORK_MODE_LABELS[job.work_mode] : null,
-              job.posted_on ? postedLabel(job.posted_on) : null,
-            ].filter(Boolean).map((part, index) => <span key={`${part}-${index}`} className="contents">{index > 0 && <span className="text-zinc-300">·</span>}{part}</span>)}
-            <span className="text-zinc-300">·</span>
-            <span className={`rounded px-1.5 py-px text-[11px] font-medium ${job.source === "linkedin" ? "bg-sky-50 text-sky-700" : "bg-violet-50 text-violet-700"}`}>{SITE_LABELS[job.source]}</span>
-            {job.matched_keywords.length > 0 && <>
-              <span className="text-zinc-300">·</span>
-              <span className="text-emerald-700">{job.matched_keywords.slice(0, 3).join(", ")}{job.matched_keywords.length > 3 ? ` +${job.matched_keywords.length - 3}` : ""}</span>
-            </>}
+          <div className="mt-0.5 flex min-w-0 items-center gap-x-1.5 overflow-hidden whitespace-nowrap text-sm text-zinc-500 sm:hidden">
+            <span title={SITE_LABELS[job.source]} className={`size-1.5 shrink-0 rounded-full ${job.source === "linkedin" ? "bg-sky-500" : "bg-violet-500"}`} />
+            <span className="min-w-0 truncate">{job.company}</span>
+            {job.posted_on && <><span className="shrink-0 text-zinc-300">·</span><span className="shrink-0">{postedLabel(job.posted_on)}</span></>}
+          </div>
+          <div className="mt-0.5 hidden flex-wrap items-center gap-x-1.5 text-sm text-zinc-500 sm:flex">
+            {desktopMetaParts.map((part, index) => (
+              <span key={part.key} className="inline-flex shrink-0 items-center gap-x-1.5 whitespace-nowrap">
+                {part.key === "source" ? sourceBadge : <span className={part.key === "keywords" ? "text-emerald-700" : ""}>{part.value}</span>}
+                {index < desktopMetaParts.length - 1 && <span className="text-zinc-300">·</span>}
+              </span>
+            ))}
           </div>
         </div>
-        <div className="flex shrink-0 items-center gap-1">
-          {job.status === "new" && <Button aria-label={`Save ${job.title}`} icon={Bookmark} onClick={() => onStatus("saved")} className="px-2.5 sm:px-3.5"><span className="hidden sm:inline">Save</span></Button>}
-          {job.status === "saved" && <Button aria-label={`Mark ${job.title} as new`} icon={BookmarkCheck} onClick={() => onStatus("new")} className="px-2.5 sm:px-3.5"><span className="hidden sm:inline">Saved</span></Button>}
-          {job.status === "applied" && <Button aria-label={`Undo applied for ${job.title}`} icon={Check} onClick={() => onStatus("new")} className="px-2.5 sm:px-3.5"><span className="hidden sm:inline">Applied</span></Button>}
-          {job.status === "dismissed" && <Button aria-label={`Restore ${job.title}`} icon={RotateCcw} onClick={() => onStatus("new")} className="px-2.5 sm:px-3.5"><span className="hidden sm:inline">Restore</span></Button>}
+        <div className="flex shrink-0 items-center gap-0 sm:gap-1">
+          {job.status === "new" && <button type="button" aria-label={`Save ${job.title}`} onClick={() => onStatus("saved")} className={statusButtonMuted}><Bookmark className="size-4 shrink-0" /><span className="hidden sm:inline">Save</span></button>}
+          {job.status === "saved" && <button type="button" aria-label={`Mark ${job.title} as new`} onClick={() => onStatus("new")} className={statusButtonActive}><BookmarkCheck className="size-4 shrink-0" /><span className="hidden sm:inline">Saved</span></button>}
+          {job.status === "applied" && <button type="button" aria-label={`Undo applied for ${job.title}`} onClick={() => onStatus("new")} className={statusButtonActive}><Check className="size-4 shrink-0" /><span className="hidden sm:inline">Applied</span></button>}
+          {job.status === "dismissed" && <button type="button" aria-label={`Restore ${job.title}`} onClick={() => onStatus("new")} className={statusButtonMuted}><RotateCcw className="size-4 shrink-0" /><span className="hidden sm:inline">Restore</span></button>}
           <Menu
             label={`More actions for ${job.title}`}
             trigger={<span className="rounded-lg p-2 text-zinc-500 hover:bg-zinc-100"><MoreHorizontal className="size-5" /></span>}
@@ -579,6 +653,18 @@ function JobRow({
 
       {open && (
         <div className="mt-3 rounded-lg bg-zinc-50 p-4">
+          <div className="mb-3 flex flex-wrap items-center gap-x-1.5 text-sm text-zinc-500">
+            {expandedMetaParts.map((part, index) => (
+              <span key={part.key} className="inline-flex shrink-0 items-center gap-x-1.5 whitespace-nowrap">
+                {part.key === "source" ? sourceBadge : <span className={part.key === "keywords" ? "text-emerald-700" : ""}>{part.value}</span>}
+                {index < expandedMetaParts.length - 1 && <span className="text-zinc-300">·</span>}
+              </span>
+            ))}
+          </div>
+          <div className="mb-3 flex items-center gap-2 sm:hidden">
+            <ScoreBadge job={job} resumeConfirmed={resumeConfirmed} />
+            {job.tailored_at && <span className="inline-flex items-center gap-1 rounded-md bg-emerald-50 px-1.5 py-0.5 text-xs font-medium text-emerald-700"><CheckCircle2 className="size-3" />Tailored</span>}
+          </div>
           {job.score?.status === "ready" && <MatchDetails score={job.score} />}
           {job.score?.status === "failed" && job.score.error && <p className="mb-3 text-sm text-red-700">Scoring failed: {job.score.error}</p>}
           {job.status === "saved" && resumeConfirmed && job.description && (
