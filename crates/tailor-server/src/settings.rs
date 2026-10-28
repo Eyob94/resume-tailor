@@ -32,11 +32,11 @@ pub(super) fn routes() -> Router<AppState> {
 async fn get_ai_steps(
     Extension(state): Extension<std::sync::Arc<UserServices>>,
 ) -> Result<Json<Vec<AiStepConfig>>, AppError> {
-    AiStep::ALL
-        .into_iter()
-        .map(|step| ai_step_config(&state.store, step).map_err(AppError::from))
-        .collect::<Result<Vec<_>, _>>()
-        .map(Json)
+    let mut configs = Vec::new();
+    for step in AiStep::ALL {
+        configs.push(ai_step_config(&state.store, step).await?);
+    }
+    Ok(Json(configs))
 }
 
 #[derive(Deserialize)]
@@ -66,22 +66,22 @@ async fn update_ai_step(
         }
     }
     let current = if prompt.is_some() {
-        Some(ai_step_config(&state.store, step)?)
+        Some(ai_step_config(&state.store, step).await?)
     } else {
         None
     };
     if let Some(model) = model {
-        state.store.set_setting(step.model_key(), model)?;
+        state.store.set_setting(step.model_key(), model).await?;
     }
     if let Some(prompt) = prompt {
         let current = current.unwrap();
         if prompt == current.default_prompt {
-            state.store.delete_setting(step.prompt_key())?;
+            state.store.delete_setting(step.prompt_key()).await?;
         } else {
-            state.store.set_setting(step.prompt_key(), prompt)?;
+            state.store.set_setting(step.prompt_key(), prompt).await?;
         }
     }
-    Ok(Json(ai_step_config(&state.store, step)?))
+    Ok(Json(ai_step_config(&state.store, step).await?))
 }
 
 async fn reset_ai_prompt(
@@ -89,8 +89,8 @@ async fn reset_ai_prompt(
     Path(step): Path<String>,
 ) -> Result<Json<AiStepConfig>, AppError> {
     let step = AiStep::parse(&step).ok_or_else(|| AppError::not_found_msg("Unknown step."))?;
-    state.store.delete_setting(step.prompt_key())?;
-    Ok(Json(ai_step_config(&state.store, step)?))
+    state.store.delete_setting(step.prompt_key()).await?;
+    Ok(Json(ai_step_config(&state.store, step).await?))
 }
 
 #[derive(Debug, Serialize)]
@@ -105,11 +105,13 @@ async fn ai_status(
 ) -> Result<Json<AiStatus>, AppError> {
     let model = state
         .store
-        .get_setting(MODEL_KEY)?
+        .get_setting(MODEL_KEY)
+        .await?
         .unwrap_or_else(|| DEFAULT_MODEL.into());
     let ollama_url = state
         .store
-        .get_setting(OLLAMA_URL_KEY)?
+        .get_setting(OLLAMA_URL_KEY)
+        .await?
         .unwrap_or_else(|| state.ollama_url.clone());
     Ok(Json(AiStatus {
         ollama: ollama_status(&ollama_url).await,
@@ -146,10 +148,10 @@ async fn update_ai_settings(
         }
     }
     if let Some(url) = url {
-        state.store.set_setting(OLLAMA_URL_KEY, url)?;
+        state.store.set_setting(OLLAMA_URL_KEY, url).await?;
     }
     if let Some(model) = model {
-        state.store.set_setting(MODEL_KEY, model)?;
+        state.store.set_setting(MODEL_KEY, model).await?;
     }
     ai_status(Extension(state)).await
 }
@@ -162,8 +164,8 @@ struct Settings {
 
 async fn get_settings(Extension(user): Extension<std::sync::Arc<UserServices>>) -> Json<Settings> {
     Json(Settings {
-        scan_interval_minutes: interval_minutes(&user.store, Site::LinkedIn),
-        indeed_scan_interval_minutes: interval_minutes(&user.store, Site::Indeed),
+        scan_interval_minutes: interval_minutes(&user.store, Site::LinkedIn).await,
+        indeed_scan_interval_minutes: interval_minutes(&user.store, Site::Indeed).await,
     })
 }
 
@@ -186,7 +188,8 @@ async fn update_settings(
     for (site, minutes) in intervals {
         state
             .store
-            .set_setting(interval_key(site), &minutes.to_string())?;
+            .set_setting(interval_key(site), &minutes.to_string())
+            .await?;
     }
     let _ = state.senders.scrape.send(ScrapeMessage::Reschedule);
     Ok(Json(settings))

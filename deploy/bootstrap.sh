@@ -27,14 +27,12 @@ if ! id resume-tailor >/dev/null 2>&1; then
 fi
 
 install -d -o "$deploy_user" -g "$deploy_group" -m 755 /opt/resume-tailor /opt/resume-tailor/releases
-install -d -o resume-tailor -g resume-tailor -m 750 /var/lib/resume-tailor
 install -m 644 "$repo_root/deploy/resume-tailor.service" /etc/systemd/system/resume-tailor.service
 install -m 755 "$repo_root/deploy/resume-tailor-deploy.sh" /usr/local/sbin/resume-tailor-deploy
 
 if [[ ! -e /etc/resume-tailor.env ]]; then
   cat > /etc/resume-tailor.env <<'EOF'
 PORT=8787
-DATA_DIR=/var/lib/resume-tailor
 WEB_DIST=/opt/resume-tailor/current/web/dist
 OLLAMA_URL=http://127.0.0.1:11434
 EOF

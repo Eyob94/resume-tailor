@@ -163,25 +163,24 @@ async fn run(
     mut rx: UnboundedReceiver<ScrapeMessage>,
     matcher: UnboundedSender<MatchMessage>,
 ) {
-    let db_for_cleanup = db.clone();
-    match tokio::task::spawn_blocking(move || db_for_cleanup.mark_interrupted_scan_runs()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::error!("couldn't tidy previous scan runs: {e}"),
-        Err(e) => tracing::error!("couldn't tidy previous scan runs: {e}"),
+    if let Err(e) = db.mark_interrupted_scan_runs().await {
+        tracing::error!("couldn't tidy previous scan runs: {e}");
     }
 
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<Site>();
-    let mut schedules: HashMap<Site, Schedule> =
-        SITES.iter().map(|site| (*site, Schedule::default())).collect();
+    let mut schedules: HashMap<Site, Schedule> = SITES
+        .iter()
+        .map(|site| (*site, Schedule::default()))
+        .collect();
     loop {
         for site in SITES {
             let schedule = schedules.get_mut(&site).expect("every site has a schedule");
             if schedule.running {
                 continue;
             }
-            schedule.next_run_at = compute_next_run(&db, site);
+            schedule.next_run_at = compute_next_run(&db, site).await;
             let due = schedule.next_run_at.is_some_and(|time| time <= Utc::now());
-            if (schedule.run_requested || due) && has_searches(&db) {
+            if (schedule.run_requested || due) && has_searches(&db).await {
                 schedule.running = true;
                 schedule.next_run_at = None;
                 let (db, matcher, done_tx) = (db.clone(), matcher.clone(), done_tx.clone());
@@ -214,18 +213,20 @@ async fn run(
             message = rx.recv() => match message {
                 None => break,
                 Some(ScrapeMessage::Status { reply }) => {
-                    let statuses = SITES
-                        .iter()
-                        .map(|site| {
-                            let schedule = &schedules[site];
-                            status(&db, *site, schedule.running, schedule.next_run_at)
-                        })
-                        .collect();
-                    let _ = reply.send(statuses);
+                    let mut statuses = Vec::new();
+                    let mut status_error = None;
+                    for site in SITES {
+                        let schedule = &schedules[&site];
+                        match status(&db, site, schedule.running, schedule.next_run_at).await {
+                            Ok(value) => statuses.push(value),
+                            Err(error) => { status_error = Some(error); break; }
+                        }
+                    }
+                    let _ = reply.send(status_error.map_or(Ok(statuses), Err));
                 }
                 Some(ScrapeMessage::RunNow { site, reply }) => {
                     let schedule = schedules.get_mut(&site).expect("every site has a schedule");
-                    let result = check_run_now(&db, site, schedule.running, cooldown);
+                    let result = check_run_now(&db, site, schedule.running, cooldown).await;
                     if result.is_ok() {
                         schedule.run_requested = true;
                     }
@@ -261,8 +262,9 @@ fn default_interval_minutes(site: Site) -> u32 {
     }
 }
 
-pub fn interval_minutes(db: &Db, site: Site) -> u32 {
+pub async fn interval_minutes(db: &Db, site: Site) -> u32 {
     db.get_setting(interval_key(site))
+        .await
         .ok()
         .flatten()
         .and_then(|value| value.parse().ok())
@@ -270,33 +272,36 @@ pub fn interval_minutes(db: &Db, site: Site) -> u32 {
         .unwrap_or_else(|| default_interval_minutes(site))
 }
 
-fn has_searches(db: &Db) -> bool {
+async fn has_searches(db: &Db) -> bool {
     db.list_searches()
+        .await
         .map(|searches| searches.iter().any(|search| search.enabled))
         .unwrap_or(false)
 }
 
-fn last_started(db: &Db, site: Site) -> Option<DateTime<Utc>> {
+async fn last_started(db: &Db, site: Site) -> Option<DateTime<Utc>> {
     db.last_scan_run(site)
+        .await
         .ok()
         .flatten()
         .and_then(|run| DateTime::parse_from_rfc3339(&run.started_at).ok())
         .map(|time| time.with_timezone(&Utc))
 }
 
-fn compute_next_run(db: &Db, site: Site) -> Option<DateTime<Utc>> {
-    if !has_searches(db) {
+async fn compute_next_run(db: &Db, site: Site) -> Option<DateTime<Utc>> {
+    if !has_searches(db).await {
         return None;
     }
-    let interval = ChronoDuration::minutes(interval_minutes(db, site).into());
+    let interval = ChronoDuration::minutes(interval_minutes(db, site).await.into());
     Some(
         last_started(db, site)
+            .await
             .map(|time| time + interval)
             .unwrap_or_else(Utc::now),
     )
 }
 
-fn status(
+async fn status(
     db: &Db,
     site: Site,
     running: bool,
@@ -305,13 +310,13 @@ fn status(
     Ok(ScanStatus {
         site,
         running,
-        interval_minutes: interval_minutes(db, site),
+        interval_minutes: interval_minutes(db, site).await,
         next_run_at: next_run_at.map(|time| time.to_rfc3339()),
-        last_run: db.last_scan_run(site)?,
+        last_run: db.last_scan_run(site).await?,
     })
 }
 
-fn check_run_now(
+async fn check_run_now(
     db: &Db,
     site: Site,
     running: bool,
@@ -320,7 +325,7 @@ fn check_run_now(
     if running {
         return Err("A scan is already running.".into());
     }
-    if let Some(last) = last_started(db, site) {
+    if let Some(last) = last_started(db, site).await {
         let ready_at = last + cooldown;
         if Utc::now() < ready_at {
             let wait = (ready_at - Utc::now()).num_seconds() + 1;
@@ -336,15 +341,10 @@ fn check_run_now(
 }
 
 async fn start_run(db: &Arc<Db>, site: Site) -> Option<i64> {
-    let db = db.clone();
-    match tokio::task::spawn_blocking(move || db.start_scan_run(site)).await {
-        Ok(Ok(id)) => {
+    match db.start_scan_run(site).await {
+        Ok(id) => {
             tracing::info!(site = site.as_str(), "scan started");
             Some(id)
-        }
-        Ok(Err(e)) => {
-            tracing::error!("couldn't record scan start: {e}");
-            None
         }
         Err(e) => {
             tracing::error!("couldn't record scan start: {e}");
@@ -383,7 +383,10 @@ async fn linkedin_run<S: JobSource + Send + Sync + 'static>(
     .await;
     let _ = matcher.send(MatchMessage::RunFinished { run_id, report });
     let (flushed_tx, flushed_rx) = oneshot::channel();
-    if matcher.send(MatchMessage::Flush { reply: flushed_tx }).is_ok() {
+    if matcher
+        .send(MatchMessage::Flush { reply: flushed_tx })
+        .is_ok()
+    {
         let _ = flushed_rx.await;
     }
     fetch_company_sites(&db, source.as_ref(), &ScanLimits::default()).await;
@@ -410,17 +413,8 @@ async fn indeed_run<I: IndeedSource + Send + Sync + 'static>(
 const MAX_COMPANIES_PER_RUN: usize = 8;
 
 async fn fetch_company_sites<S: JobSource>(db: &Db, source: &S, limits: &ScanLimits) {
-    let db_for_list = db.clone();
-    let urls = match tokio::task::spawn_blocking(move || {
-        db_for_list.companies_missing_site(MAX_COMPANIES_PER_RUN)
-    })
-    .await
-    {
-        Ok(Ok(urls)) => urls,
-        Ok(Err(e)) => {
-            tracing::error!("couldn't list companies: {e}");
-            return;
-        }
+    let urls = match db.companies_missing_site(MAX_COMPANIES_PER_RUN).await {
+        Ok(urls) => urls,
         Err(e) => {
             tracing::error!("couldn't list companies: {e}");
             return;
@@ -443,13 +437,8 @@ async fn fetch_company_sites<S: JobSource>(db: &Db, source: &S, limits: &ScanLim
                 continue;
             }
         };
-        let db = db.clone();
-        match tokio::task::spawn_blocking(move || db.save_company_site(&url, website.as_deref()))
-            .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::error!("couldn't save company site: {e}"),
-            Err(e) => tracing::error!("couldn't save company site: {e}"),
+        if let Err(e) = db.save_company_site(&url, website.as_deref()).await {
+            tracing::error!("couldn't save company site: {e}");
         }
     }
 }
@@ -460,16 +449,8 @@ async fn scrape_searches<S: JobSource>(
     limits: &ScanLimits,
     mut on_batch: impl FnMut(&JobSearch, Vec<ScrapedJob>),
 ) -> ScanReport {
-    let db_for_searches = db.clone();
-    let searches = match tokio::task::spawn_blocking(move || db_for_searches.list_searches()).await
-    {
-        Ok(Ok(searches)) => searches,
-        Ok(Err(e)) => {
-            return ScanReport {
-                error: Some(e.to_string()),
-                ..ScanReport::default()
-            };
-        }
+    let searches = match db.list_searches().await {
+        Ok(searches) => searches,
         Err(e) => {
             return ScanReport {
                 error: Some(e.to_string()),
@@ -572,26 +553,17 @@ async fn scrape_search<S: JobSource>(
 
     let mut jobs = Vec::new();
     for card in candidates {
-        let mut description = if let Some(description) = fetched_descriptions.get(&card.source_id)
-        {
+        let mut description = if let Some(description) = fetched_descriptions.get(&card.source_id) {
             Some(description.clone())
         } else {
-            let db_for_known = db.clone();
-            let source_id = card.source_id.clone();
-            match tokio::task::spawn_blocking(move || db_for_known.known_job(&source_id)).await {
-                Ok(Ok(known)) => known
+            match db.known_job(&card.source_id).await {
+                Ok(known) => known
                     .map(|job| {
                         let _id = job.id;
                         job.description
                     })
                     .flatten(),
-                Ok(Err(error)) => return (jobs, Err(error.into())),
-                Err(error) => {
-                    return (
-                        jobs,
-                        Err(DbError::Io(std::io::Error::other(error.to_string())).into()),
-                    )
-                }
+                Err(error) => return (jobs, Err(error.into())),
             }
         };
         let mut detail = None;
@@ -646,32 +618,6 @@ fn jitter(limits: &ScanLimits) -> Duration {
     Duration::from_millis(ms)
 }
 
-#[cfg(test)]
-pub(crate) async fn run_scan_for_test<S: JobSource>(
-    db: &Db,
-    source: &S,
-    limits: &ScanLimits,
-) -> ScanReport {
-    let mut new_matches = 0;
-    let mut match_error = None;
-    let mut report =
-        scrape_searches(
-            db,
-            source,
-            limits,
-            |search, jobs| match crate::match_stage::apply_batch(db, search, jobs) {
-                Ok(count) => new_matches += count,
-                Err(error) => match_error = Some(error.to_string()),
-            },
-        )
-        .await;
-    report.new_matches = new_matches;
-    if let Some(error) = match_error {
-        report.error = Some(error);
-    }
-    report
-}
-
 const MAX_INDEED_REQUESTS_PER_RUN: usize = 24;
 const MAX_INDEED_PAGES_PER_QUERY: usize = 3;
 
@@ -682,14 +628,8 @@ async fn scrape_indeed<I: IndeedSource>(
     mut on_batch: impl FnMut(&JobSearch, Vec<ScrapedJob>),
 ) -> ScanReport {
     let mut report = ScanReport::default();
-    let db_for_searches = db.clone();
-    let searches = match tokio::task::spawn_blocking(move || db_for_searches.list_searches()).await
-    {
-        Ok(Ok(searches)) => searches,
-        Ok(Err(e)) => {
-            report.error = Some(e.to_string());
-            return report;
-        }
+    let searches = match db.list_searches().await {
+        Ok(searches) => searches,
         Err(e) => {
             report.error = Some(e.to_string());
             return report;
@@ -759,17 +699,10 @@ async fn scrape_indeed<I: IndeedSource>(
             .filter_map(|job| Some((job.card.company_url.clone()?, job.company_website.clone()?)))
             .collect();
         if !sites.is_empty() {
-            let db = db.clone();
-            let saved = tokio::task::spawn_blocking(move || {
-                sites
-                    .iter()
-                    .try_for_each(|(url, website)| db.save_company_site(url, Some(website)))
-            })
-            .await;
-            match saved {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::error!("couldn't save company site: {e}"),
-                Err(e) => tracing::error!("couldn't save company site: {e}"),
+            for (url, website) in sites {
+                if let Err(e) = db.save_company_site(&url, Some(&website)).await {
+                    tracing::error!("couldn't save company site: {e}");
+                }
             }
         }
 
@@ -793,7 +726,8 @@ async fn scrape_indeed<I: IndeedSource>(
 const INDEED_API_URL: &str = "https://apis.indeed.com/graphql";
 const INDEED_API_KEY: &str = "161092c2017b5bbab13edb12461a62d5a833871e7cad6d9d475304573de67ac8";
 const INDEED_USER_AGENT: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Indeed App 193.1";
-const INDEED_APP_INFO: &str = "appv=193.1; appid=com.indeed.jobsearch; osv=16.6.1; os=ios; dtype=phone";
+const INDEED_APP_INFO: &str =
+    "appv=193.1; appid=com.indeed.jobsearch; osv=16.6.1; os=ios; dtype=phone";
 const INDEED_PAGE_SIZE: usize = 100;
 const INDEED_REMOTE_KEY: &str = "DSQF7";
 const INDEED_HYBRID_KEY: &str = "PAXZC";
@@ -890,8 +824,14 @@ pub struct IndeedClient {
 impl IndeedClient {
     pub fn new() -> Result<Self, reqwest::Error> {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("indeed-api-key", reqwest::header::HeaderValue::from_static(INDEED_API_KEY));
-        headers.insert("indeed-app-info", reqwest::header::HeaderValue::from_static(INDEED_APP_INFO));
+        headers.insert(
+            "indeed-api-key",
+            reqwest::header::HeaderValue::from_static(INDEED_API_KEY),
+        );
+        headers.insert(
+            "indeed-app-info",
+            reqwest::header::HeaderValue::from_static(INDEED_APP_INFO),
+        );
         headers.insert(
             reqwest::header::ACCEPT,
             reqwest::header::HeaderValue::from_static("application/json"),
@@ -937,8 +877,9 @@ fn indeed_graphql(query: &IndeedQuery<'_>) -> String {
         PostedWithin::Week => 24 * 7,
         PostedWithin::Month => 24 * 30,
     };
-    let mut filters =
-        vec![format!(r#"{{ date: {{ field: "dateOnIndeed", start: "{hours}h" }} }}"#)];
+    let mut filters = vec![format!(
+        r#"{{ date: {{ field: "dateOnIndeed", start: "{hours}h" }} }}"#
+    )];
     if query.remote_only {
         filters.push(format!(
             r#"{{ keyword: {{ field: "attributes", keys: ["{INDEED_REMOTE_KEY}"] }} }}"#
@@ -946,7 +887,12 @@ fn indeed_graphql(query: &IndeedQuery<'_>) -> String {
     }
     let location = query
         .location
-        .map(|place| format!("location: {{ where: {}, radius: 50, radiusUnit: MILES }}", quote(place)))
+        .map(|place| {
+            format!(
+                "location: {{ where: {}, radius: 50, radiusUnit: MILES }}",
+                quote(place)
+            )
+        })
         .unwrap_or_default();
     let cursor = query
         .cursor
@@ -981,7 +927,9 @@ fn indeed_graphql(query: &IndeedQuery<'_>) -> String {
 
 pub fn parse_indeed_page(body: &serde_json::Value, host: &str) -> Result<IndeedPage, IndeedError> {
     if let Some(message) = body["errors"][0]["message"].as_str() {
-        return Err(IndeedError::BadResponse(message.chars().take(200).collect()));
+        return Err(IndeedError::BadResponse(
+            message.chars().take(200).collect(),
+        ));
     }
     let search = &body["data"]["jobSearch"];
     let results = search["results"]
@@ -1026,7 +974,8 @@ fn parse_indeed_job(job: &serde_json::Value, host: &str) -> Option<IndeedJob> {
         .filter(|url| matches!(url.scheme(), "http" | "https"))
         .map(|url| url.to_string());
 
-    let place = text(&job["location"]["formatted"]["long"]).or_else(|| text(&job["location"]["city"]));
+    let place =
+        text(&job["location"]["formatted"]["long"]).or_else(|| text(&job["location"]["city"]));
     let country = text(&job["location"]["countryName"]);
     let location = match (place, country) {
         (Some(place), Some(country)) if !place.contains(&country) => format!("{place}, {country}"),
@@ -1170,7 +1119,10 @@ impl LinkedInClient {
         }
     }
 
-    pub async fn company_website(&self, company_url: &str) -> Result<Option<String>, LinkedInError> {
+    pub async fn company_website(
+        &self,
+        company_url: &str,
+    ) -> Result<Option<String>, LinkedInError> {
         let html = self.get("company", company_url, &[], None).await?;
         Ok(parse_company_website(&html))
     }
@@ -1385,65 +1337,38 @@ fn block_text(root: ElementRef) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Mutex};
-
     use super::*;
-    use crate::types::{PostedWithin, SearchInput, WorkMode};
+    use crate::{match_stage::apply_batch, types::SearchInput};
+    use sqlx::PgPool;
 
-    #[derive(Default)]
-    struct FakeSource {
-        pages: HashMap<String, Vec<Vec<JobCard>>>,
-        details: HashMap<String, String>,
-        block_details: bool,
-        block_after_first_page: bool,
-        blocked_queries: Vec<String>,
-        detail_calls: Mutex<usize>,
+    async fn store_with_search(pool: PgPool) -> Db {
+        let user_id: i64 = sqlx::query_scalar(
+            "INSERT INTO users (created_at) VALUES ('2026-01-01T00:00:00Z') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let store = Db::for_user(pool, user_id);
+        let criteria = SearchInput {
+            name: None,
+            titles: vec!["Backend Engineer".into()],
+            keywords: vec!["Rust".into()],
+            location: Some("Dubai".into()),
+            work_modes: vec![WorkMode::Remote],
+            posted_within: PostedWithin::Week,
+        }
+        .validate()
+        .unwrap();
+        store.create_search(&criteria).await.unwrap();
+        store
     }
 
-    impl JobSource for FakeSource {
-        fn search(
-            &self,
-            query: &SearchQuery<'_>,
-        ) -> impl Future<Output = Result<Vec<JobCard>, LinkedInError>> + Send {
-            let pages = self.pages.get(query.keywords).cloned().unwrap_or_default();
-            let blocked = self.blocked_queries.iter().any(|q| q == query.keywords);
-            let result = if blocked || (self.block_after_first_page && query.start > 0) {
-                Err(LinkedInError::Blocked(429))
-            } else {
-                Ok(pages.get(query.start / 2).cloned().unwrap_or_default())
-            };
-            async move { result }
-        }
-
-        fn job_detail(
-            &self,
-            id: &str,
-        ) -> impl Future<Output = Result<Option<JobDetail>, LinkedInError>> + Send {
-            *self.detail_calls.lock().unwrap() += 1;
-            let result = if self.block_details {
-                Err(LinkedInError::Blocked(999))
-            } else {
-                Ok(self.details.get(id).map(|d| JobDetail {
-                    description: d.clone(),
-                    seniority: None,
-                    employment_type: None,
-                    industries: None,
-                }))
-            };
-            async move { result }
-        }
-    }
-
-    fn card(id: &str, title: &str) -> JobCard {
-        JobCard {
-            source: Site::LinkedIn,
-            source_id: id.into(),
-            title: title.into(),
-            company: "Acme".into(),
-            company_url: None,
-            location: "Dubai".into(),
-            posted_on: None,
-            url: format!("https://www.linkedin.com/jobs/view/{id}"),
+    fn test_limits() -> ScanLimits {
+        ScanLimits {
+            max_load_more_per_run: 2,
+            max_details_per_run: 10,
+            min_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
         }
     }
 
@@ -1492,16 +1417,25 @@ mod tests {
         assert_eq!(job.card.source, Site::Indeed);
         assert_eq!(job.card.source_id, "1b7c87ebd61932f5");
         assert_eq!(job.card.company, "Acme");
-        assert_eq!(job.card.company_url.as_deref(), Some("https://ae.indeed.com/cmp/Acme"));
+        assert_eq!(
+            job.card.company_url.as_deref(),
+            Some("https://ae.indeed.com/cmp/Acme")
+        );
         assert_eq!(job.card.location, "Dubai, UAE");
         assert_eq!(job.card.posted_on.as_deref(), Some("2026-10-27"));
-        assert_eq!(job.card.url, "https://ae.indeed.com/viewjob?jk=1b7c87ebd61932f5");
+        assert_eq!(
+            job.card.url,
+            "https://ae.indeed.com/viewjob?jk=1b7c87ebd61932f5"
+        );
         assert!(job.detail.description.contains("Rust"));
         assert!(!job.detail.description.contains('<'));
         assert_eq!(job.detail.employment_type.as_deref(), Some("Full-time"));
         assert_eq!(job.detail.industries.as_deref(), Some("Software"));
         assert_eq!(job.work_mode, Some(WorkMode::Remote));
-        assert_eq!(job.company_website.as_deref(), Some("https://acme.example/"));
+        assert_eq!(
+            job.company_website.as_deref(),
+            Some("https://acme.example/")
+        );
         assert_eq!(page.jobs[1].company_website, None);
     }
 
@@ -1523,322 +1457,98 @@ mod tests {
         assert_eq!(code("Austin, Texas, United States"), Some("US"));
         assert_eq!(code("Atlantis"), None);
         assert_eq!(indeed_country(None), None);
-        assert_eq!(indeed_country(Some("Berlin")).unwrap().host, "de.indeed.com");
+        assert_eq!(
+            indeed_country(Some("Berlin")).unwrap().host,
+            "de.indeed.com"
+        );
     }
 
-    struct FakeIndeed {
-        calls: Mutex<Vec<(String, Option<String>, &'static str, bool)>>,
+    struct FakeLinkedIn;
+
+    impl JobSource for FakeLinkedIn {
+        fn search(
+            &self,
+            query: &SearchQuery<'_>,
+        ) -> impl Future<Output = Result<Vec<JobCard>, LinkedInError>> + Send {
+            let cards = if query.start == 0 {
+                vec![JobCard {
+                    source: Site::LinkedIn,
+                    source_id: "linkedin-1".into(),
+                    title: "Backend Engineer".into(),
+                    company: "Acme".into(),
+                    company_url: None,
+                    location: "Dubai".into(),
+                    posted_on: None,
+                    url: "https://www.linkedin.com/jobs/view/linkedin-1".into(),
+                }]
+            } else {
+                Vec::new()
+            };
+            async move { Ok(cards) }
+        }
+
+        fn job_detail(
+            &self,
+            _: &str,
+        ) -> impl Future<Output = Result<Option<JobDetail>, LinkedInError>> + Send {
+            async {
+                Ok(Some(JobDetail {
+                    description: "This is a fully remote role using Rust.".into(),
+                    seniority: None,
+                    employment_type: None,
+                    industries: None,
+                }))
+            }
+        }
     }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn linkedin_scan_stores_a_matched_job(pool: PgPool) {
+        let store = store_with_search(pool).await;
+        let mut batches = Vec::new();
+        let report = scrape_searches(&store, &FakeLinkedIn, &test_limits(), |search, jobs| {
+            batches.push((search.clone(), jobs))
+        })
+        .await;
+        assert_eq!(report.error, None);
+        for (search, jobs) in batches {
+            apply_batch(&store, &search, jobs).await.unwrap();
+        }
+        let jobs = store.list_jobs(None).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].source, Site::LinkedIn);
+        assert_eq!(jobs[0].matched_keywords, vec!["Rust"]);
+    }
+
+    struct FakeIndeed;
 
     impl IndeedSource for FakeIndeed {
         fn search(
             &self,
             query: &IndeedQuery<'_>,
         ) -> impl Future<Output = Result<IndeedPage, IndeedError>> + Send {
-            self.calls.lock().unwrap().push((
-                query.keywords.to_string(),
-                query.cursor.map(str::to_string),
-                query.country.code,
-                query.remote_only,
-            ));
-            let result = parse_indeed_page(&indeed_body(Some("more")), query.country.host);
-            async move { result }
+            let page = parse_indeed_page(&indeed_body(None), query.country.host);
+            async move { page }
         }
     }
 
-    #[tokio::test]
-    async fn indeed_jobs_are_matched_and_stored() {
-        let (store, dir) = setup(vec![WorkMode::Remote]);
-        let indeed = FakeIndeed { calls: Mutex::new(Vec::new()) };
-        let mut new_matches = 0;
-        let report = scrape_indeed(&store, &indeed, &fast(), |search, jobs| {
-            new_matches += crate::match_stage::apply_batch(&store, search, jobs).unwrap();
+    #[sqlx::test(migrations = "./migrations")]
+    async fn indeed_scan_stores_a_matched_job(pool: PgPool) {
+        let store = store_with_search(pool).await;
+        let mut batches = Vec::new();
+        let report = scrape_indeed(&store, &FakeIndeed, &test_limits(), |search, jobs| {
+            batches.push((search.clone(), jobs))
         })
         .await;
-
         assert_eq!(report.error, None);
-        assert_eq!(report.requests, MAX_INDEED_PAGES_PER_QUERY);
-        let calls = indeed.calls.lock().unwrap().clone();
-        assert_eq!(calls[0], ("Backend Engineer".into(), None, "AE", true));
-        assert_eq!(calls[1].1.as_deref(), Some("more"));
-        assert_eq!(new_matches, 1);
-        let jobs = store.list_jobs(None).unwrap();
+        for (search, jobs) in batches {
+            apply_batch(&store, &search, jobs).await.unwrap();
+        }
+        let jobs = store.list_jobs(None).await.unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].source, Site::Indeed);
         assert_eq!(jobs[0].work_mode, Some(WorkMode::Remote));
-        assert_eq!(jobs[0].company_website.as_deref(), Some("https://acme.example/"));
-        assert!(store.companies_missing_site(8).unwrap().is_empty());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn indeed_skips_unknown_countries() {
-        let dir = crate::db::test_dir("tailor-scan-test");
-        let store = Db::open(&dir).unwrap();
-        let criteria = SearchInput {
-            name: None,
-            titles: vec!["Backend Engineer".into()],
-            keywords: vec![],
-            location: Some("Atlantis".into()),
-            work_modes: vec![WorkMode::Onsite],
-            posted_within: PostedWithin::Week,
-        }
-        .validate()
-        .unwrap();
-        store.create_search(&criteria).unwrap();
-        let indeed = FakeIndeed { calls: Mutex::new(Vec::new()) };
-        let report = scrape_indeed(&store, &indeed, &fast(), |_, _| {}).await;
-        assert_eq!(report.skipped_locations, vec!["Atlantis".to_string()]);
-        assert!(indeed.calls.lock().unwrap().is_empty());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn each_site_has_its_own_interval() {
-        let (store, dir) = setup(vec![WorkMode::Remote]);
-        assert_eq!(interval_minutes(&store, Site::LinkedIn), 60);
-        assert_eq!(interval_minutes(&store, Site::Indeed), 15);
-        store.set_setting(interval_key(Site::Indeed), "5").unwrap();
-        assert_eq!(interval_minutes(&store, Site::Indeed), 5);
-        assert_eq!(interval_minutes(&store, Site::LinkedIn), 60);
-        store.start_scan_run(Site::LinkedIn).unwrap();
-        assert!(compute_next_run(&store, Site::LinkedIn).unwrap() > Utc::now());
-        assert!(compute_next_run(&store, Site::Indeed).unwrap() <= Utc::now());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    fn fast() -> ScanLimits {
-        ScanLimits {
-            max_load_more_per_run: 2,
-            max_details_per_run: 10,
-            min_delay: Duration::ZERO,
-            max_delay: Duration::ZERO,
-        }
-    }
-
-    fn setup(modes: Vec<WorkMode>) -> (Db, std::path::PathBuf) {
-        setup_with(vec!["Backend Engineer".into()], modes)
-    }
-
-    fn setup_with(titles: Vec<String>, modes: Vec<WorkMode>) -> (Db, std::path::PathBuf) {
-        let dir = crate::db::test_dir("tailor-scan-test");
-        let store = Db::open(&dir).unwrap();
-        let criteria = SearchInput {
-            name: None,
-            titles,
-            keywords: vec!["Rust".into()],
-            location: Some("Dubai".into()),
-            work_modes: modes,
-            posted_within: PostedWithin::Week,
-        }
-        .validate()
-        .unwrap();
-        store.create_search(&criteria).unwrap();
-        (store, dir)
-    }
-
-    fn source() -> FakeSource {
-        let mut source = FakeSource::default();
-        source.pages.insert(
-            "Backend Engineer".into(),
-            vec![
-                vec![
-                    card("1", "Senior Backend Engineer"),
-                    card("2", "iOS Developer"),
-                ],
-                vec![
-                    card("3", "Backend Engineer (Remote)"),
-                    card("4", "Backend Engineer, Payments"),
-                ],
-            ],
-        );
-        source
-            .details
-            .insert("1".into(), "Hybrid role. We use Rust.".into());
-        source.details.insert("3".into(), "Rust everywhere.".into());
-        source.details.insert("4".into(), "Java shop.".into());
-        source
-    }
-
-    #[tokio::test]
-    async fn filters_by_title_keywords_and_work_mode() {
-        let (store, dir) = setup(vec![WorkMode::Hybrid, WorkMode::Onsite]);
-        let src = source();
-        let report = run_scan_for_test(&store, &src, &fast()).await;
-
-        assert_eq!(report.error, None);
-        assert_eq!(*src.detail_calls.lock().unwrap(), 3);
-        let jobs = store.list_jobs(None).unwrap();
-        assert_eq!(
-            jobs.iter()
-                .map(|j| j.source_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["1"]
-        );
-        assert_eq!(jobs[0].matched_keywords, vec!["Rust"]);
-        assert_eq!(jobs[0].work_mode, Some(WorkMode::Hybrid));
-        assert_eq!(report.new_matches, 1);
-
-        let again = run_scan_for_test(&store, &src, &fast()).await;
-        assert_eq!(*src.detail_calls.lock().unwrap(), 3);
-        assert_eq!(again.new_matches, 0);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn detail_budget_defers_to_next_scan() {
-        let (store, dir) = setup(vec![WorkMode::Remote, WorkMode::Hybrid]);
-        let src = source();
-        let limits = ScanLimits {
-            max_details_per_run: 1,
-            ..fast()
-        };
-
-        let first = run_scan_for_test(&store, &src, &limits).await;
-        assert_eq!((first.new_matches, first.pending_details), (1, 2));
-        let second = run_scan_for_test(&store, &src, &limits).await;
-        assert_eq!((second.new_matches, second.pending_details), (1, 1));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn paging_cap_keeps_first_page() {
-        let (store, dir) = setup(vec![WorkMode::Hybrid, WorkMode::Onsite]);
-        let src = FakeSource {
-            block_after_first_page: true,
-            ..source()
-        };
-        let report = run_scan_for_test(&store, &src, &fast()).await;
-        assert_eq!(report.error, None);
-        assert_eq!(report.new_matches, 1);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn blocked_results_page_keeps_collected_jobs() {
-        let titles = vec!["Backend Engineer".into(), "Platform Engineer".into()];
-        let (store, dir) = setup_with(titles, vec![WorkMode::Hybrid, WorkMode::Onsite]);
-        let src = FakeSource {
-            blocked_queries: vec!["Platform Engineer".into()],
-            ..source()
-        };
-        let report = run_scan_for_test(&store, &src, &fast()).await;
-        assert!(report.search_blocked);
-        assert!(report.error.unwrap().contains("rate-limiting"));
-        assert_eq!(report.new_matches, 1);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn load_more_budget_is_shared_across_titles() {
-        let titles = vec!["Backend Engineer".into(), "Engineer".into()];
-        let (store, dir) = setup_with(titles, vec![WorkMode::Hybrid]);
-        let mut src = source();
-        let pages = src.pages["Backend Engineer"].clone();
-        src.pages.insert("Engineer".into(), pages);
-        let limits = ScanLimits {
-            max_load_more_per_run: 1,
-            ..fast()
-        };
-        let report = run_scan_for_test(&store, &src, &limits).await;
-        let searches = report.requests - *src.detail_calls.lock().unwrap();
-        assert_eq!(searches, 3);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn without_keywords_jobs_list_before_descriptions() {
-        let (store, dir) = setup_with(
-            vec!["Backend Engineer".into()],
-            vec![WorkMode::Hybrid, WorkMode::Onsite],
-        );
-        store
-            .update_search(store.list_searches().unwrap()[0].id, &{
-                let mut c = store.list_searches().unwrap()[0].criteria.clone();
-                c.keywords.clear();
-                c
-            })
-            .unwrap();
-        let src = source();
-        let limits = ScanLimits {
-            max_details_per_run: 0,
-            ..fast()
-        };
-        let report = run_scan_for_test(&store, &src, &limits).await;
-        assert_eq!(report.new_matches, 2);
-        assert_eq!(*src.detail_calls.lock().unwrap(), 0);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn later_description_can_remove_a_match() {
-        let (store, dir) = setup_with(vec!["Backend Engineer".into()], vec![WorkMode::Remote]);
-        let search = store.list_searches().unwrap()[0].clone();
-        let mut criteria = search.criteria.clone();
-        criteria.keywords.clear();
-        store.update_search(search.id, &criteria).unwrap();
-
-        let mut src = source();
-        src.details
-            .insert("4".into(), "Fully on-site in Dubai.".into());
-        run_scan_for_test(
-            &store,
-            &src,
-            &ScanLimits {
-                max_details_per_run: 0,
-                ..fast()
-            },
-        )
-        .await;
-        assert_eq!(store.list_jobs(None).unwrap().len(), 3);
-        run_scan_for_test(&store, &src, &fast()).await;
-        let ids: Vec<String> = store
-            .list_jobs(None)
-            .unwrap()
-            .into_iter()
-            .map(|j| j.source_id)
-            .collect();
-        assert_eq!(ids, vec!["3"]);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn blocked_job_pages_pause_softly() {
-        let (store, dir) = setup(vec![WorkMode::Hybrid]);
-        let src = FakeSource {
-            block_details: true,
-            ..source()
-        };
-        let report = run_scan_for_test(&store, &src, &fast()).await;
-        assert_eq!(report.error, None);
-        assert!(report.details_paused);
-        assert_eq!(*src.detail_calls.lock().unwrap(), 1);
-        assert_eq!(report.pending_details, 3);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn blocked_search_stops_the_scan() {
-        let (store, dir) = setup(vec![WorkMode::Hybrid]);
-
-        struct AlwaysBlocked;
-        impl JobSource for AlwaysBlocked {
-            fn search(
-                &self,
-                _: &SearchQuery<'_>,
-            ) -> impl Future<Output = Result<Vec<JobCard>, LinkedInError>> + Send {
-                async { Err(LinkedInError::Blocked(429)) }
-            }
-            fn job_detail(
-                &self,
-                _: &str,
-            ) -> impl Future<Output = Result<Option<JobDetail>, LinkedInError>> + Send {
-                async { Ok(None) }
-            }
-        }
-        let report = run_scan_for_test(&store, &AlwaysBlocked, &fast()).await;
-        assert!(report.error.unwrap().contains("rate-limiting"));
-        std::fs::remove_dir_all(dir).unwrap();
+        assert!(store.companies_missing_site(8).await.unwrap().is_empty());
     }
 }
 
@@ -1944,7 +1654,8 @@ mod linkedin_tests {
     #[test]
     fn company_website_rejects_missing_or_unsafe_links() {
         assert!(parse_company_website("<html><body>Sign in</body></html>").is_none());
-        let html = r#"<div data-test-id="about-us__website"><a href="javascript:alert(1)">x</a></div>"#;
+        let html =
+            r#"<div data-test-id="about-us__website"><a href="javascript:alert(1)">x</a></div>"#;
         assert!(parse_company_website(html).is_none());
     }
 }

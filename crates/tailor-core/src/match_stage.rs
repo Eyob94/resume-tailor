@@ -9,9 +9,9 @@ use tokio::{
 };
 
 use crate::{
-    score_stage::ScoreMessage,
     db::Db,
     errors::DbError,
+    score_stage::ScoreMessage,
     scrape_stage::{ScanReport, ScrapedJob},
     types::{JobSearch, WorkMode},
 };
@@ -36,7 +36,11 @@ pub struct MatchStage {
 }
 
 impl MatchStage {
-    pub fn new(db: Arc<Db>, rx: UnboundedReceiver<MatchMessage>, scorer: UnboundedSender<ScoreMessage>) -> Self {
+    pub fn new(
+        db: Arc<Db>,
+        rx: UnboundedReceiver<MatchMessage>,
+        scorer: UnboundedSender<ScoreMessage>,
+    ) -> Self {
         let handle = tokio::spawn(run(db, rx, scorer));
         Self { handle }
     }
@@ -46,7 +50,11 @@ impl MatchStage {
     }
 }
 
-async fn run(db: Arc<Db>, mut rx: UnboundedReceiver<MatchMessage>, scorer: UnboundedSender<ScoreMessage>) {
+async fn run(
+    db: Arc<Db>,
+    mut rx: UnboundedReceiver<MatchMessage>,
+    scorer: UnboundedSender<ScoreMessage>,
+) {
     let mut new_matches: HashMap<i64, usize> = HashMap::new();
     let mut match_errors: HashMap<i64, String> = HashMap::new();
     while let Some(message) = rx.recv().await {
@@ -55,24 +63,16 @@ async fn run(db: Arc<Db>, mut rx: UnboundedReceiver<MatchMessage>, scorer: Unbou
                 run_id,
                 search,
                 jobs,
-            } => {
-                let db = db.clone();
-                match tokio::task::spawn_blocking(move || apply_batch(&db, &search, jobs)).await {
-                    Ok(Ok(count)) => {
-                        *new_matches.entry(run_id).or_default() += count;
-                        let _ = scorer.send(ScoreMessage::Kick);
-                    }
-                    Ok(Err(error)) => {
-                        tracing::error!("couldn't match scanned jobs: {error}");
-                        match_errors.insert(run_id, error.to_string());
-                    }
-                    Err(error) => {
-                        let error = DbError::Io(std::io::Error::other(error.to_string()));
-                        tracing::error!("couldn't match scanned jobs: {error}");
-                        match_errors.insert(run_id, error.to_string());
-                    }
+            } => match apply_batch(&db, &search, jobs).await {
+                Ok(count) => {
+                    *new_matches.entry(run_id).or_default() += count;
+                    let _ = scorer.send(ScoreMessage::Kick);
                 }
-            }
+                Err(error) => {
+                    tracing::error!("couldn't match scanned jobs: {error}");
+                    match_errors.insert(run_id, error.to_string());
+                }
+            },
             MatchMessage::RunFinished { run_id, mut report } => {
                 report.new_matches = new_matches.remove(&run_id).unwrap_or_default();
                 if let Some(error) = match_errors.remove(&run_id) {
@@ -87,7 +87,7 @@ async fn run(db: Arc<Db>, mut rx: UnboundedReceiver<MatchMessage>, scorer: Unbou
     }
 }
 
-pub(crate) fn apply_batch(
+pub(crate) async fn apply_batch(
     db: &Db,
     search: &JobSearch,
     jobs: Vec<ScrapedJob>,
@@ -102,7 +102,7 @@ pub(crate) fn apply_batch(
         } = job;
         let work_mode = work_mode
             .or_else(|| infer_work_mode(&card.title, &card.location, description.as_deref()));
-        let job_id = db.upsert_job(&card, detail.as_ref(), work_mode)?;
+        let job_id = db.upsert_job(&card, detail.as_ref(), work_mode).await?;
         let text = format!(
             "{}\n{}",
             card.title,
@@ -112,13 +112,13 @@ pub(crate) fn apply_batch(
         let keywords_ok = search.criteria.keywords.is_empty() || !hits.is_empty();
         let wrong_mode = work_mode.is_some_and(|mode| !search.criteria.work_modes.contains(&mode));
         if wrong_mode || (!keywords_ok && description.is_some()) {
-            db.remove_match(search.id, job_id)?;
+            db.remove_match(search.id, job_id).await?;
             continue;
         }
         if !keywords_ok {
             continue;
         }
-        if db.add_match(search.id, job_id, &hits)? {
+        if db.add_match(search.id, job_id, &hits).await? {
             new_matches += 1;
         }
     }
@@ -162,16 +162,11 @@ async fn finish_run(db: &Arc<Db>, run_id: i64, report: &ScanReport) {
         requests = report.requests,
         "scan finished"
     );
-    let db = db.clone();
-    let new_matches = report.new_matches;
-    match tokio::task::spawn_blocking(move || {
-        db.finish_scan_run(run_id, status, new_matches, message.as_deref())
-    })
-    .await
+    if let Err(error) = db
+        .finish_scan_run(run_id, status, report.new_matches, message.as_deref())
+        .await
     {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::error!("couldn't record scan result: {error}"),
-        Err(error) => tracing::error!("couldn't record scan result: {error}"),
+        tracing::error!("couldn't record scan result: {error}");
     }
 }
 

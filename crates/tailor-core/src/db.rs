@@ -1,12 +1,7 @@
-use std::{
-    collections::HashMap,
-    fs, io,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-};
+use std::collections::HashMap;
 
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use sqlx::{PgPool, Row};
 
 use crate::{
     errors::DbError,
@@ -16,10 +11,11 @@ use crate::{
         Site, Warning, WorkMode,
     },
 };
+
 #[derive(Clone)]
 pub struct Db {
-    conn: Arc<Mutex<Connection>>,
-    data_dir: Arc<PathBuf>,
+    pool: PgPool,
+    user_id: i64,
 }
 
 pub(crate) struct KnownJob {
@@ -27,943 +23,565 @@ pub(crate) struct KnownJob {
     pub(crate) description: Option<String>,
 }
 
-const MIGRATIONS: &[&str] = &[
-    "CREATE TABLE master_resume (
-        id             INTEGER PRIMARY KEY CHECK (id = 1),
-        file_name      TEXT    NOT NULL,
-        size_bytes     INTEGER NOT NULL,
-        page_count     INTEGER NOT NULL,
-        extracted_text TEXT    NOT NULL,
-        uploaded_at    TEXT    NOT NULL
-    );",
-    "CREATE TABLE job_searches (
-        id            INTEGER PRIMARY KEY,
-        name          TEXT NOT NULL,
-        titles        TEXT NOT NULL,
-        keywords      TEXT NOT NULL,
-        location      TEXT,
-        work_modes    TEXT NOT NULL,
-        posted_within TEXT NOT NULL,
-        created_at    TEXT NOT NULL,
-        updated_at    TEXT NOT NULL
-    );
-    CREATE TABLE jobs (
-        id              INTEGER PRIMARY KEY,
-        linkedin_id     TEXT NOT NULL UNIQUE,
-        title           TEXT NOT NULL,
-        company         TEXT NOT NULL,
-        company_url     TEXT,
-        location        TEXT NOT NULL,
-        posted_on       TEXT,
-        url             TEXT NOT NULL,
-        description     TEXT,
-        seniority       TEXT,
-        employment_type TEXT,
-        industries      TEXT,
-        work_mode       TEXT,
-        status          TEXT NOT NULL DEFAULT 'new',
-        first_seen_at   TEXT NOT NULL,
-        updated_at      TEXT NOT NULL
-    );
-    CREATE TABLE search_matches (
-        search_id        INTEGER NOT NULL REFERENCES job_searches(id) ON DELETE CASCADE,
-        job_id           INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-        matched_keywords TEXT NOT NULL,
-        matched_at       TEXT NOT NULL,
-        PRIMARY KEY (search_id, job_id)
-    );
-    CREATE TABLE settings (
-        key   TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-    );
-    CREATE TABLE scan_runs (
-        id          INTEGER PRIMARY KEY,
-        started_at  TEXT NOT NULL,
-        finished_at TEXT,
-        status      TEXT NOT NULL,
-        new_matches INTEGER NOT NULL DEFAULT 0,
-        message     TEXT
-    );",
-    "ALTER TABLE jobs ADD COLUMN tailored_at TEXT;",
-    "CREATE TABLE resume_profiles (
-        id                 INTEGER PRIMARY KEY,
-        resume_uploaded_at TEXT NOT NULL,
-        status             TEXT NOT NULL,
-        model              TEXT NOT NULL,
-        data               TEXT,
-        warnings           TEXT NOT NULL DEFAULT '[]',
-        error              TEXT,
-        created_at         TEXT NOT NULL,
-        updated_at         TEXT NOT NULL,
-        confirmed_at       TEXT
-    );",
-    "ALTER TABLE job_searches ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;",
-    "CREATE TABLE job_scores (
-        job_id       INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
-        profile_id   INTEGER NOT NULL,
-        status       TEXT NOT NULL,
-        score        INTEGER,
-        summary      TEXT,
-        requirements TEXT NOT NULL DEFAULT '[]',
-        model        TEXT NOT NULL,
-        error        TEXT,
-        updated_at   TEXT NOT NULL
-    );",
-    "CREATE TABLE companies (
-        url        TEXT PRIMARY KEY,
-        website    TEXT,
-        fetched_at TEXT NOT NULL
-    );",
-    "ALTER TABLE jobs RENAME COLUMN linkedin_id TO source_id;
-     ALTER TABLE jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'linkedin';",
-    "ALTER TABLE scan_runs ADD COLUMN site TEXT NOT NULL DEFAULT 'linkedin';",
-];
-
-#[cfg(test)]
-pub(crate) fn test_dir(prefix: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()))
-}
-
-fn migrate(conn: &Connection) -> rusqlite::Result<()> {
-    let applied = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? as usize;
-    for (index, sql) in MIGRATIONS.iter().enumerate().skip(applied) {
-        conn.execute_batch(sql)?;
-        conn.pragma_update(None, "user_version", (index + 1) as i64)?;
-    }
-    Ok(())
-}
+const PROFILE_COLUMNS: &str = "id, resume_uploaded_at, status, model, data, warnings, error, created_at, updated_at, confirmed_at";
 
 fn now() -> String {
     Utc::now().to_rfc3339()
 }
 
-const COLUMNS: &str = "id, resume_uploaded_at, status, model, data, warnings, error, created_at, updated_at, confirmed_at";
-
-fn profile_from_row(row: &Row) -> rusqlite::Result<(ProfileRecord, Option<String>, String)> {
-    Ok((
-        ProfileRecord {
-            id: row.get(0)?,
-            resume_uploaded_at: row.get(1)?,
-            status: row.get(2)?,
-            model: row.get(3)?,
-            profile: None,
-            warnings: Vec::new(),
-            error: row.get(6)?,
-            created_at: row.get(7)?,
-            updated_at: row.get(8)?,
-            confirmed_at: row.get(9)?,
-        },
-        row.get(4)?,
-        row.get(5)?,
-    ))
-}
-
-fn profile_finish(
-    parts: (ProfileRecord, Option<String>, String),
-) -> Result<ProfileRecord, DbError> {
-    let (mut record, data, warnings) = parts;
-    record.profile = data.map(|d| serde_json::from_str(&d)).transpose()?;
-    record.warnings = serde_json::from_str(&warnings)?;
-    Ok(record)
-}
-
 impl Db {
-    pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, DbError> {
-        let data_dir = data_dir.as_ref().to_path_buf();
-        fs::create_dir_all(&data_dir)?;
-        let conn = Connection::open(data_dir.join("db.sqlite"))?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        migrate(&conn)?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-            data_dir: Arc::new(data_dir),
+    pub fn for_user(pool: PgPool, user_id: i64) -> Self {
+        Self { pool, user_id }
+    }
+
+    pub async fn get_resume(&self) -> Result<Option<MasterResume>, DbError> {
+        let row = sqlx::query("SELECT file_name, size_bytes, page_count, extracted_text, uploaded_at FROM master_resume WHERE user_id = $1")
+            .bind(self.user_id).fetch_optional(&self.pool).await?;
+        row.map(|row| {
+            Ok(MasterResume {
+                file_name: row.try_get("file_name")?,
+                size_bytes: row.try_get::<i64, _>("size_bytes")?.max(0) as u64,
+                page_count: row.try_get::<i64, _>("page_count")?.max(0) as usize,
+                extracted_text: row.try_get("extracted_text")?,
+                uploaded_at: row.try_get("uploaded_at")?,
+            })
         })
+        .transpose()
     }
 
-    pub fn resume_pdf_path(&self) -> PathBuf {
-        self.data_dir.join("resume.pdf")
-    }
-
-    pub fn get_resume(&self) -> Result<Option<MasterResume>, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let resume = conn
-            .query_row(
-                "SELECT file_name, size_bytes, page_count, extracted_text, uploaded_at
-             FROM master_resume WHERE id = 1",
-                [],
-                |row| {
-                    Ok(MasterResume {
-                        file_name: row.get(0)?,
-                        size_bytes: row.get::<_, i64>(1)? as u64,
-                        page_count: row.get::<_, i64>(2)? as usize,
-                        extracted_text: row.get(3)?,
-                        uploaded_at: row.get(4)?,
-                    })
-                },
-            )
-            .optional()?;
-        Ok(resume)
-    }
-
-    pub fn save_resume(
+    pub async fn save_resume(
         &self,
         file_name: &str,
         bytes: &[u8],
         info: &PdfInfo,
     ) -> Result<MasterResume, DbError> {
-        let conn = self.conn.lock().unwrap();
-
-        let tmp = self.data_dir.join("resume.pdf.tmp");
-        fs::write(&tmp, bytes)?;
-        fs::rename(&tmp, self.resume_pdf_path())?;
-
         let resume = MasterResume {
-            file_name: file_name.to_string(),
+            file_name: file_name.to_owned(),
             size_bytes: bytes.len() as u64,
             page_count: info.page_count,
             extracted_text: info.text.clone(),
-            uploaded_at: chrono::Utc::now().to_rfc3339(),
+            uploaded_at: now(),
         };
-        conn.execute(
-        "INSERT INTO master_resume (id, file_name, size_bytes, page_count, extracted_text, uploaded_at)
-         VALUES (1, ?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(id) DO UPDATE SET
-            file_name = excluded.file_name,
-            size_bytes = excluded.size_bytes,
-            page_count = excluded.page_count,
-            extracted_text = excluded.extracted_text,
-            uploaded_at = excluded.uploaded_at",
-        params![
-            resume.file_name,
-            resume.size_bytes as i64,
-            resume.page_count as i64,
-            resume.extracted_text,
-            resume.uploaded_at,
-        ],
-    )?;
+        sqlx::query("INSERT INTO master_resume (user_id, file_name, size_bytes, page_count, extracted_text, pdf, uploaded_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (user_id) DO UPDATE SET file_name = EXCLUDED.file_name, size_bytes = EXCLUDED.size_bytes, page_count = EXCLUDED.page_count, extracted_text = EXCLUDED.extracted_text, pdf = EXCLUDED.pdf, uploaded_at = EXCLUDED.uploaded_at")
+            .bind(self.user_id).bind(&resume.file_name).bind(resume.size_bytes as i64).bind(resume.page_count as i64).bind(&resume.extracted_text).bind(bytes).bind(&resume.uploaded_at).execute(&self.pool).await?;
         Ok(resume)
     }
 
-    pub fn delete_resume(&self) -> Result<bool, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let deleted = conn.execute("DELETE FROM master_resume WHERE id = 1", [])?;
-        match fs::remove_file(self.resume_pdf_path()) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-        Ok(deleted > 0)
+    pub async fn resume_pdf(&self) -> Result<Option<Vec<u8>>, DbError> {
+        Ok(
+            sqlx::query_scalar("SELECT pdf FROM master_resume WHERE user_id = $1")
+                .bind(self.user_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
     }
 
-    pub fn list_searches(&self) -> Result<Vec<JobSearch>, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-        "SELECT id, name, titles, keywords, location, work_modes, posted_within, created_at, updated_at, enabled
-         FROM job_searches ORDER BY id",
-    )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, String>(8)?,
-                row.get::<_, bool>(9)?,
-            ))
-        })?;
-        rows.map(|row| {
-            let (
-                id,
-                name,
-                titles,
-                keywords,
-                location,
-                work_modes,
-                posted_within,
-                created_at,
-                updated_at,
-                enabled,
-            ) = row?;
-            Ok(JobSearch {
-                id,
-                enabled,
-                criteria: SearchCriteria {
-                    name,
-                    titles: serde_json::from_str(&titles)?,
-                    keywords: serde_json::from_str(&keywords)?,
-                    location,
-                    work_modes: serde_json::from_str(&work_modes)?,
-                    posted_within: PostedWithin::parse(&posted_within).unwrap_or_default(),
-                },
-                created_at,
-                updated_at,
+    pub async fn delete_resume(&self) -> Result<bool, DbError> {
+        Ok(sqlx::query("DELETE FROM master_resume WHERE user_id = $1")
+            .bind(self.user_id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+            > 0)
+    }
+
+    pub async fn list_searches(&self) -> Result<Vec<JobSearch>, DbError> {
+        let rows = sqlx::query("SELECT id, name, titles, keywords, location, work_modes, posted_within, created_at, updated_at, enabled FROM job_searches WHERE user_id = $1 ORDER BY id")
+            .bind(self.user_id).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(JobSearch {
+                    id: row.try_get("id")?,
+                    enabled: row.try_get("enabled")?,
+                    criteria: SearchCriteria {
+                        name: row.try_get("name")?,
+                        titles: serde_json::from_str(&row.try_get::<String, _>("titles")?)?,
+                        keywords: serde_json::from_str(&row.try_get::<String, _>("keywords")?)?,
+                        location: row.try_get("location")?,
+                        work_modes: serde_json::from_str(&row.try_get::<String, _>("work_modes")?)?,
+                        posted_within: PostedWithin::parse(
+                            &row.try_get::<String, _>("posted_within")?,
+                        )
+                        .unwrap_or_default(),
+                    },
+                    created_at: row.try_get("created_at")?,
+                    updated_at: row.try_get("updated_at")?,
+                })
             })
-        })
-        .collect()
+            .collect()
     }
 
-    fn get_search(&self, id: i64) -> Result<Option<JobSearch>, DbError> {
-        Ok(self.list_searches()?.into_iter().find(|s| s.id == id))
+    pub async fn create_search(&self, criteria: &SearchCriteria) -> Result<JobSearch, DbError> {
+        let ts = now();
+        let id: i64 = sqlx::query_scalar("INSERT INTO job_searches (user_id, name, titles, keywords, location, work_modes, posted_within, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8) RETURNING id")
+            .bind(self.user_id).bind(&criteria.name).bind(serde_json::to_string(&criteria.titles)?).bind(serde_json::to_string(&criteria.keywords)?).bind(&criteria.location).bind(serde_json::to_string(&criteria.work_modes)?).bind(criteria.posted_within.as_str()).bind(ts).fetch_one(&self.pool).await?;
+        Ok(self
+            .list_searches()
+            .await?
+            .into_iter()
+            .find(|search| search.id == id)
+            .expect("search was just inserted"))
     }
 
-    pub fn create_search(&self, criteria: &SearchCriteria) -> Result<JobSearch, DbError> {
-        let id = {
-            let conn = self.conn.lock().unwrap();
-            conn.execute(
-            "INSERT INTO job_searches (name, titles, keywords, location, work_modes, posted_within, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-            params![
-                criteria.name,
-                serde_json::to_string(&criteria.titles)?,
-                serde_json::to_string(&criteria.keywords)?,
-                criteria.location,
-                serde_json::to_string(&criteria.work_modes)?,
-                criteria.posted_within.as_str(),
-                now(),
-            ],
-        )?;
-            conn.last_insert_rowid()
-        };
-        Ok(self.get_search(id)?.expect("search was just inserted"))
-    }
-
-    pub fn update_search(
+    pub async fn update_search(
         &self,
         id: i64,
         criteria: &SearchCriteria,
     ) -> Result<Option<JobSearch>, DbError> {
-        {
-            let mut conn = self.conn.lock().unwrap();
-            let tx = conn.transaction()?;
-            let changed = tx.execute(
-                "UPDATE job_searches SET name = ?2, titles = ?3, keywords = ?4, location = ?5,
-                work_modes = ?6, posted_within = ?7, updated_at = ?8
-             WHERE id = ?1",
-                params![
-                    id,
-                    criteria.name,
-                    serde_json::to_string(&criteria.titles)?,
-                    serde_json::to_string(&criteria.keywords)?,
-                    criteria.location,
-                    serde_json::to_string(&criteria.work_modes)?,
-                    criteria.posted_within.as_str(),
-                    now(),
-                ],
-            )?;
-            if changed == 0 {
-                return Ok(None);
-            }
-            tx.execute(
-                "DELETE FROM search_matches
-                 WHERE search_id = ?1 AND job_id IN (SELECT id FROM jobs WHERE status = 'new')",
-                params![id],
-            )?;
-            tx.commit()?;
-        }
-        self.get_search(id)
-    }
-
-    pub fn delete_search(&self, id: i64) -> Result<bool, DbError> {
-        let conn = self.conn.lock().unwrap();
-        Ok(conn.execute("DELETE FROM job_searches WHERE id = ?1", params![id])? > 0)
-    }
-
-    pub fn set_search_enabled(&self, id: i64, enabled: bool) -> Result<Option<JobSearch>, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let changed = conn.execute(
-            "UPDATE job_searches SET enabled = ?2 WHERE id = ?1",
-            params![id, enabled],
-        )?;
-        drop(conn);
+        let mut tx = self.pool.begin().await?;
+        let changed = sqlx::query("UPDATE job_searches SET name=$3, titles=$4, keywords=$5, location=$6, work_modes=$7, posted_within=$8, updated_at=$9 WHERE id=$1 AND user_id=$2")
+            .bind(id).bind(self.user_id).bind(&criteria.name).bind(serde_json::to_string(&criteria.titles)?).bind(serde_json::to_string(&criteria.keywords)?).bind(&criteria.location).bind(serde_json::to_string(&criteria.work_modes)?).bind(criteria.posted_within.as_str()).bind(now()).execute(&mut *tx).await?.rows_affected();
         if changed == 0 {
-            Ok(None)
-        } else {
-            self.get_search(id)
+            tx.rollback().await?;
+            return Ok(None);
         }
+        sqlx::query("DELETE FROM search_matches m USING jobs j WHERE m.search_id=$1 AND m.job_id=j.id AND j.user_id=$2 AND j.status='new'")
+            .bind(id).bind(self.user_id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(self
+            .list_searches()
+            .await?
+            .into_iter()
+            .find(|search| search.id == id))
     }
 
-    pub(crate) fn known_job(&self, source_id: &str) -> Result<Option<KnownJob>, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let job = conn
-            .query_row(
-                "SELECT id, description FROM jobs WHERE source_id = ?1",
-                params![source_id],
-                |row| {
-                    Ok(KnownJob {
-                        id: row.get(0)?,
-                        description: row.get(1)?,
-                    })
-                },
-            )
-            .optional()?;
-        Ok(job)
+    pub async fn delete_search(&self, id: i64) -> Result<bool, DbError> {
+        Ok(
+            sqlx::query("DELETE FROM job_searches WHERE id=$1 AND user_id=$2")
+                .bind(id)
+                .bind(self.user_id)
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+                > 0,
+        )
     }
 
-    pub fn upsert_job(
+    pub async fn set_search_enabled(
+        &self,
+        id: i64,
+        enabled: bool,
+    ) -> Result<Option<JobSearch>, DbError> {
+        let changed = sqlx::query("UPDATE job_searches SET enabled=$3 WHERE id=$1 AND user_id=$2")
+            .bind(id)
+            .bind(self.user_id)
+            .bind(enabled)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if changed == 0 {
+            return Ok(None);
+        }
+        Ok(self
+            .list_searches()
+            .await?
+            .into_iter()
+            .find(|search| search.id == id))
+    }
+
+    pub(crate) async fn known_job(&self, source_id: &str) -> Result<Option<KnownJob>, DbError> {
+        let row = sqlx::query("SELECT id, description FROM jobs WHERE source_id=$1 AND user_id=$2")
+            .bind(source_id)
+            .bind(self.user_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            Ok(KnownJob {
+                id: row.try_get("id")?,
+                description: row.try_get("description")?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn upsert_job(
         &self,
         card: &JobCard,
         detail: Option<&JobDetail>,
         work_mode: Option<WorkMode>,
     ) -> Result<i64, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let id = conn.query_row(
-        "INSERT INTO jobs (source, source_id, title, company, company_url, location, posted_on, url, description,
-                           seniority, employment_type, industries, work_mode, first_seen_at, updated_at)
-         VALUES (?14, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
-         ON CONFLICT(source_id) DO UPDATE SET
-            title = excluded.title,
-            company = excluded.company,
-            company_url = excluded.company_url,
-            location = excluded.location,
-            posted_on = COALESCE(excluded.posted_on, jobs.posted_on),
-            url = excluded.url,
-            description = COALESCE(excluded.description, jobs.description),
-            seniority = COALESCE(excluded.seniority, jobs.seniority),
-            employment_type = COALESCE(excluded.employment_type, jobs.employment_type),
-            industries = COALESCE(excluded.industries, jobs.industries),
-            work_mode = excluded.work_mode,
-            updated_at = excluded.updated_at
-         RETURNING id",
-        params![
-            card.source_id,
-            card.title,
-            card.company,
-            card.company_url,
-            card.location,
-            card.posted_on,
-            card.url,
-            detail.map(|d| &d.description),
-            detail.and_then(|d| d.seniority.as_ref()),
-            detail.and_then(|d| d.employment_type.as_ref()),
-            detail.and_then(|d| d.industries.as_ref()),
-            work_mode.map(WorkMode::as_str),
-            now(),
-            card.source.as_str(),
-        ],
-        |row| row.get(0),
-    )?;
-        Ok(id)
+        let ts = now();
+        Ok(sqlx::query_scalar("INSERT INTO jobs (user_id, source, source_id, title, company, company_url, location, posted_on, url, description, seniority, employment_type, industries, work_mode, first_seen_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15) ON CONFLICT (user_id, source_id) DO UPDATE SET title=EXCLUDED.title, company=EXCLUDED.company, company_url=EXCLUDED.company_url, location=EXCLUDED.location, posted_on=COALESCE(EXCLUDED.posted_on,jobs.posted_on), url=EXCLUDED.url, description=COALESCE(EXCLUDED.description,jobs.description), seniority=COALESCE(EXCLUDED.seniority,jobs.seniority), employment_type=COALESCE(EXCLUDED.employment_type,jobs.employment_type), industries=COALESCE(EXCLUDED.industries,jobs.industries), work_mode=EXCLUDED.work_mode, updated_at=EXCLUDED.updated_at RETURNING id")
+            .bind(self.user_id).bind(card.source.as_str()).bind(&card.source_id).bind(&card.title).bind(&card.company).bind(&card.company_url).bind(&card.location).bind(&card.posted_on).bind(&card.url).bind(detail.map(|d| &d.description)).bind(detail.and_then(|d| d.seniority.as_ref())).bind(detail.and_then(|d| d.employment_type.as_ref())).bind(detail.and_then(|d| d.industries.as_ref())).bind(work_mode.map(WorkMode::as_str)).bind(ts).fetch_one(&self.pool).await?)
     }
 
-    pub fn add_match(
+    pub async fn add_match(
         &self,
         search_id: i64,
         job_id: i64,
         keywords: &[String],
     ) -> Result<bool, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let keywords = serde_json::to_string(keywords)?;
-        let inserted = conn.execute(
-            "INSERT OR IGNORE INTO search_matches (search_id, job_id, matched_keywords, matched_at)
-         VALUES (?1, ?2, ?3, ?4)",
-            params![search_id, job_id, keywords, now()],
-        )?;
-        if inserted == 0 {
-            conn.execute(
-            "UPDATE search_matches SET matched_keywords = ?3 WHERE search_id = ?1 AND job_id = ?2",
-            params![search_id, job_id, keywords],
-        )?;
-        }
-        Ok(inserted == 1)
+        let mut tx = self.pool.begin().await?;
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM search_matches m JOIN jobs j ON j.id=m.job_id JOIN job_searches q ON q.id=m.search_id WHERE m.search_id=$1 AND m.job_id=$2 AND j.user_id=$3 AND q.user_id=$3)")
+            .bind(search_id).bind(job_id).bind(self.user_id).fetch_one(&mut *tx).await?;
+        let inserted = sqlx::query("INSERT INTO search_matches (search_id, job_id, matched_keywords, matched_at) SELECT $1,$2,$3,$4 WHERE EXISTS (SELECT 1 FROM jobs WHERE id=$2 AND user_id=$5) AND EXISTS (SELECT 1 FROM job_searches WHERE id=$1 AND user_id=$5) ON CONFLICT (search_id, job_id) DO UPDATE SET matched_keywords=EXCLUDED.matched_keywords")
+            .bind(search_id).bind(job_id).bind(serde_json::to_string(keywords)?).bind(now()).bind(self.user_id).execute(&mut *tx).await?.rows_affected();
+        tx.commit().await?;
+        Ok(!exists && inserted > 0)
     }
 
-    pub fn remove_match(&self, search_id: i64, job_id: i64) -> Result<bool, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let removed = conn.execute(
-            "DELETE FROM search_matches WHERE search_id = ?1 AND job_id = ?2",
-            params![search_id, job_id],
-        )?;
-        Ok(removed > 0)
+    pub async fn remove_match(&self, search_id: i64, job_id: i64) -> Result<bool, DbError> {
+        Ok(sqlx::query("DELETE FROM search_matches m USING jobs j, job_searches q WHERE m.job_id=j.id AND m.search_id=q.id AND m.search_id=$1 AND m.job_id=$2 AND j.user_id=$3 AND q.user_id=$3")
+            .bind(search_id).bind(job_id).bind(self.user_id).execute(&self.pool).await?.rows_affected() > 0)
     }
 
-    pub fn current_confirmed_profile(&self) -> Result<Option<ProfileRecord>, DbError> {
-        let Some(resume) = self.get_resume()? else {
+    pub async fn current_confirmed_profile(&self) -> Result<Option<ProfileRecord>, DbError> {
+        let Some(resume) = self.get_resume().await? else {
             return Ok(None);
         };
         Ok(self
-            .latest_profile(&resume.uploaded_at)?
+            .latest_profile(&resume.uploaded_at)
+            .await?
             .filter(|record| record.status == "confirmed" && record.profile.is_some()))
     }
 
-    pub fn companies_missing_site(&self, limit: usize) -> Result<Vec<String>, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT j.company_url
-             FROM jobs j JOIN search_matches m ON m.job_id = j.id
-             LEFT JOIN companies c ON c.url = j.company_url
-             WHERE j.source = 'linkedin' AND j.company_url IS NOT NULL AND c.url IS NULL
-             GROUP BY j.company_url
-             ORDER BY MAX(j.status = 'saved') DESC, MAX(j.first_seen_at) DESC
-             LIMIT ?1",
-        )?;
-        let urls = stmt
-            .query_map(params![limit as i64], |row| row.get(0))?
-            .collect::<Result<Vec<String>, _>>()?;
-        Ok(urls)
+    pub async fn companies_missing_site(&self, limit: usize) -> Result<Vec<String>, DbError> {
+        Ok(sqlx::query_scalar("SELECT j.company_url FROM jobs j JOIN search_matches m ON m.job_id=j.id JOIN job_searches q ON q.id=m.search_id LEFT JOIN companies c ON c.user_id=j.user_id AND c.url=j.company_url WHERE j.user_id=$1 AND q.user_id=$1 AND j.source='linkedin' AND j.company_url IS NOT NULL AND c.url IS NULL GROUP BY j.company_url ORDER BY BOOL_OR(j.status='saved') DESC, MAX(j.first_seen_at) DESC LIMIT $2")
+            .bind(self.user_id).bind(limit as i64).fetch_all(&self.pool).await?)
     }
 
-    pub fn save_company_site(&self, url: &str, website: Option<&str>) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO companies (url, website, fetched_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(url) DO UPDATE SET website = excluded.website, fetched_at = excluded.fetched_at",
-            params![url, website, Utc::now().to_rfc3339()],
-        )?;
+    pub async fn save_company_site(&self, url: &str, website: Option<&str>) -> Result<(), DbError> {
+        sqlx::query("INSERT INTO companies (user_id,url,website,fetched_at) VALUES ($1,$2,$3,$4) ON CONFLICT (user_id,url) DO UPDATE SET website=EXCLUDED.website,fetched_at=EXCLUDED.fetched_at")
+            .bind(self.user_id).bind(url).bind(website).bind(now()).execute(&self.pool).await?;
         Ok(())
     }
 
-    pub fn next_job_to_score(&self, profile_id: i64) -> Result<Option<JobToScore>, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let job = conn
-            .query_row(
-                "SELECT j.id, j.title, j.company, j.description
-                 FROM jobs j LEFT JOIN job_scores s ON s.job_id = j.id
-                 WHERE j.status = 'saved' AND j.description IS NOT NULL
-                   AND (s.job_id IS NULL OR (s.profile_id != ?1 AND s.status NOT IN ('scoring', 'skipped')))
-                 ORDER BY EXISTS (
-                     SELECT 1 FROM search_matches m JOIN job_searches q ON q.id = m.search_id
-                     WHERE m.job_id = j.id AND q.enabled = 1
-                 ) DESC, j.updated_at DESC, j.id DESC
-                 LIMIT 1",
-                params![profile_id],
-                |row| {
-                    Ok(JobToScore {
-                        job_id: row.get(0)?,
-                        title: row.get(1)?,
-                        company: row.get(2)?,
-                        description: row.get(3)?,
-                    })
-                },
-            )
-            .optional()?;
-        Ok(job)
+    pub async fn next_job_to_score(&self, profile_id: i64) -> Result<Option<JobToScore>, DbError> {
+        let row=sqlx::query("SELECT j.id,j.title,j.company,j.description FROM jobs j LEFT JOIN job_scores s ON s.job_id=j.id WHERE j.user_id=$1 AND j.status='saved' AND j.description IS NOT NULL AND (s.job_id IS NULL OR (s.profile_id<>$2 AND s.status NOT IN ('scoring','skipped'))) ORDER BY EXISTS (SELECT 1 FROM search_matches m JOIN job_searches q ON q.id=m.search_id WHERE m.job_id=j.id AND q.enabled=TRUE AND q.user_id=$1) DESC,j.updated_at DESC,j.id DESC LIMIT 1")
+            .bind(self.user_id).bind(profile_id).fetch_optional(&self.pool).await?;
+        row.map(|row| {
+            Ok(JobToScore {
+                job_id: row.try_get("id")?,
+                title: row.try_get("title")?,
+                company: row.try_get("company")?,
+                description: row.try_get("description")?,
+            })
+        })
+        .transpose()
     }
 
-    pub fn start_score(&self, job_id: i64, profile_id: i64, model: &str) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO job_scores (job_id, profile_id, status, model, updated_at)
-             VALUES (?1, ?2, 'scoring', ?3, ?4)
-             ON CONFLICT(job_id) DO UPDATE SET
-                profile_id = excluded.profile_id,
-                status = 'scoring',
-                score = NULL,
-                summary = NULL,
-                requirements = '[]',
-                model = excluded.model,
-                error = NULL,
-                updated_at = excluded.updated_at",
-            params![job_id, profile_id, model, now()],
-        )?;
+    pub async fn start_score(
+        &self,
+        job_id: i64,
+        profile_id: i64,
+        model: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query("INSERT INTO job_scores (job_id,profile_id,status,model,updated_at) SELECT $1,$2,'scoring',$3,$4 WHERE EXISTS(SELECT 1 FROM jobs WHERE id=$1 AND user_id=$5) ON CONFLICT(job_id) DO UPDATE SET profile_id=EXCLUDED.profile_id,status='scoring',score=NULL,summary=NULL,requirements='[]',model=EXCLUDED.model,error=NULL,updated_at=EXCLUDED.updated_at")
+            .bind(job_id).bind(profile_id).bind(model).bind(now()).bind(self.user_id).execute(&self.pool).await?;
         Ok(())
     }
 
-    pub fn finish_score(
+    pub async fn finish_score(
         &self,
         job_id: i64,
         score: u8,
         summary: &str,
         requirements: &[Requirement],
     ) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE job_scores SET status = 'ready', score = ?2, summary = ?3, requirements = ?4,
-                error = NULL, updated_at = ?5
-             WHERE job_id = ?1 AND status = 'scoring'",
-            params![
-                job_id,
-                score,
-                summary,
-                serde_json::to_string(requirements)?,
-                now()
-            ],
-        )?;
+        sqlx::query("UPDATE job_scores s SET status='ready',score=$3,summary=$4,requirements=$5,error=NULL,updated_at=$6 FROM jobs j WHERE s.job_id=j.id AND j.user_id=$1 AND s.job_id=$2 AND s.status='scoring'")
+            .bind(self.user_id).bind(job_id).bind(score as i64).bind(summary).bind(serde_json::to_string(requirements)?).bind(now()).execute(&self.pool).await?;
         Ok(())
     }
 
-    pub fn fail_score(&self, job_id: i64, error: &str) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE job_scores SET status = 'failed', error = ?2, updated_at = ?3
-             WHERE job_id = ?1 AND status = 'scoring'",
-            params![job_id, error, now()],
-        )?;
+    pub async fn fail_score(&self, job_id: i64, error: &str) -> Result<(), DbError> {
+        sqlx::query("UPDATE job_scores s SET status='failed',error=$3,updated_at=$4 FROM jobs j WHERE s.job_id=j.id AND j.user_id=$1 AND s.job_id=$2 AND s.status='scoring'")
+            .bind(self.user_id).bind(job_id).bind(error).bind(now()).execute(&self.pool).await?;
         Ok(())
     }
 
-    pub fn skip_score(&self, job_id: i64, profile_id: i64) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO job_scores (job_id, profile_id, status, model, updated_at)
-             VALUES (?1, ?2, 'skipped', '', ?3)
-             ON CONFLICT(job_id) DO UPDATE SET
-                status = 'skipped',
-                score = NULL,
-                summary = NULL,
-                requirements = '[]',
-                error = NULL,
-                updated_at = excluded.updated_at",
-            params![job_id, profile_id, now()],
-        )?;
+    pub async fn skip_score(&self, job_id: i64, profile_id: i64) -> Result<(), DbError> {
+        sqlx::query("INSERT INTO job_scores (job_id,profile_id,status,model,updated_at) SELECT $1,$2,'skipped','',$3 WHERE EXISTS(SELECT 1 FROM jobs WHERE id=$1 AND user_id=$4) ON CONFLICT(job_id) DO UPDATE SET status='skipped',score=NULL,summary=NULL,requirements='[]',error=NULL,updated_at=EXCLUDED.updated_at")
+            .bind(job_id).bind(profile_id).bind(now()).bind(self.user_id).execute(&self.pool).await?;
         Ok(())
     }
 
-    pub fn score_status(&self, job_id: i64) -> Result<Option<String>, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let status = conn
-            .query_row(
-                "SELECT status FROM job_scores WHERE job_id = ?1",
-                params![job_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(status)
+    pub async fn score_status(&self, job_id: i64) -> Result<Option<String>, DbError> {
+        Ok(sqlx::query_scalar("SELECT s.status FROM job_scores s JOIN jobs j ON j.id=s.job_id WHERE s.job_id=$1 AND j.user_id=$2").bind(job_id).bind(self.user_id).fetch_optional(&self.pool).await?)
     }
 
-    pub fn clear_score(&self, job_id: i64) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM job_scores WHERE job_id = ?1", params![job_id])?;
+    pub async fn clear_score(&self, job_id: i64) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM job_scores s USING jobs j WHERE s.job_id=j.id AND s.job_id=$1 AND j.user_id=$2").bind(job_id).bind(self.user_id).execute(&self.pool).await?;
         Ok(())
     }
 
-    pub fn job_status(&self, job_id: i64) -> Result<Option<JobStatus>, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let status = conn
-            .query_row(
-                "SELECT status FROM jobs WHERE id = ?1",
-                params![job_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        Ok(status.as_deref().map(JobStatus::parse))
+    pub async fn job_status(&self, job_id: i64) -> Result<Option<JobStatus>, DbError> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT status FROM jobs WHERE id=$1 AND user_id=$2")
+                .bind(job_id)
+                .bind(self.user_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .as_deref()
+                .map(JobStatus::parse),
+        )
     }
 
-    pub fn requeue_interrupted_scores(&self) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM job_scores WHERE status = 'scoring'", [])?;
+    pub async fn requeue_interrupted_scores(&self) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM job_scores s USING jobs j WHERE s.job_id=j.id AND j.user_id=$1 AND s.status='scoring'").bind(self.user_id).execute(&self.pool).await?;
         Ok(())
     }
 
-    pub fn list_jobs(&self, status: Option<JobStatus>) -> Result<Vec<JobListing>, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-        "SELECT j.id, j.source_id, j.title, j.company, j.company_url, j.location, j.posted_on, j.url,
-                j.description, j.seniority, j.employment_type, j.industries, j.work_mode, j.status,
-                j.first_seen_at, m.search_id, m.matched_keywords, j.tailored_at,
-                s.status, s.score, s.summary, s.requirements, s.model, s.error, s.profile_id, s.updated_at,
-                c.website, j.source
-         FROM jobs j JOIN search_matches m ON m.job_id = j.id
-         LEFT JOIN job_scores s ON s.job_id = j.id
-         LEFT JOIN companies c ON c.url = j.company_url
-         WHERE ?1 IS NULL OR j.status = ?1
-         ORDER BY COALESCE(j.posted_on, '') DESC, j.first_seen_at DESC, j.id DESC, m.search_id",
-    )?;
-        let rows = stmt.query_map(params![status.map(JobStatus::as_str)], |row| {
+    pub async fn list_jobs(&self, status: Option<JobStatus>) -> Result<Vec<JobListing>, DbError> {
+        let rows=sqlx::query("SELECT j.id,j.source_id,j.title,j.company,j.company_url,c.website AS company_website,j.location,j.posted_on,j.url,j.description,j.seniority,j.employment_type,j.industries,j.work_mode,j.status,j.first_seen_at,m.search_id,m.matched_keywords,j.tailored_at,s.status AS score_status,s.score,s.summary,s.requirements,s.model,s.error,s.profile_id,s.updated_at AS score_updated_at,j.source FROM jobs j JOIN search_matches m ON m.job_id=j.id JOIN job_searches q ON q.id=m.search_id LEFT JOIN job_scores s ON s.job_id=j.id LEFT JOIN companies c ON c.user_id=j.user_id AND c.url=j.company_url WHERE j.user_id=$1 AND q.user_id=$1 AND ($2::text IS NULL OR j.status=$2) ORDER BY COALESCE(j.posted_on,'') DESC,j.first_seen_at DESC,j.id DESC,m.search_id")
+            .bind(self.user_id).bind(status.map(JobStatus::as_str)).fetch_all(&self.pool).await?;
+        let mut jobs: Vec<JobListing> = Vec::new();
+        let mut indexes: HashMap<i64, usize> = HashMap::new();
+        for row in rows {
+            let id: i64 = row.try_get("id")?;
+            let keywords: Vec<String> =
+                serde_json::from_str(&row.try_get::<String, _>("matched_keywords")?)?;
+            let score_status: Option<String> = row.try_get("score_status")?;
+            let score = if let Some(status) = score_status {
+                Some(JobScore {
+                    status,
+                    score: row
+                        .try_get::<Option<i64>, _>("score")?
+                        .map(|v| v.clamp(0, 100) as u8),
+                    summary: row.try_get("summary")?,
+                    requirements: serde_json::from_str(&row.try_get::<String, _>("requirements")?)?,
+                    model: row.try_get("model")?,
+                    error: row.try_get("error")?,
+                    profile_id: row.try_get("profile_id")?,
+                    updated_at: row.try_get("score_updated_at")?,
+                })
+            } else {
+                None
+            };
             let listing = JobListing {
-                id: row.get(0)?,
-                source: Site::parse(&row.get::<_, String>(27)?),
-                source_id: row.get(1)?,
-                title: row.get(2)?,
-                company: row.get(3)?,
-                company_url: row.get(4)?,
-                company_website: row.get(26)?,
-                location: row.get(5)?,
-                posted_on: row.get(6)?,
-                url: row.get(7)?,
-                description: row.get(8)?,
-                seniority: row.get(9)?,
-                employment_type: row.get(10)?,
-                industries: row.get(11)?,
+                id,
+                source: Site::parse(&row.try_get::<String, _>("source")?),
+                source_id: row.try_get("source_id")?,
+                title: row.try_get("title")?,
+                company: row.try_get("company")?,
+                company_url: row.try_get("company_url")?,
+                company_website: row.try_get("company_website")?,
+                location: row.try_get("location")?,
+                posted_on: row.try_get("posted_on")?,
+                url: row.try_get("url")?,
+                description: row.try_get("description")?,
+                seniority: row.try_get("seniority")?,
+                employment_type: row.try_get("employment_type")?,
+                industries: row.try_get("industries")?,
                 work_mode: row
-                    .get::<_, Option<String>>(12)?
+                    .try_get::<Option<String>, _>("work_mode")?
                     .as_deref()
                     .and_then(WorkMode::parse),
-                status: JobStatus::parse(&row.get::<_, String>(13)?),
-                first_seen_at: row.get(14)?,
-                tailored_at: row.get(17)?,
-                search_ids: vec![row.get(15)?],
+                status: JobStatus::parse(&row.try_get::<String, _>("status")?),
+                first_seen_at: row.try_get("first_seen_at")?,
+                tailored_at: row.try_get("tailored_at")?,
+                search_ids: vec![row.try_get("search_id")?],
                 matched_keywords: Vec::new(),
-                score: None,
-            };
-            let score = match row.get::<_, Option<String>>(18)? {
-                Some(status) => Some((
-                    status,
-                    row.get::<_, Option<i64>>(19)?,
-                    row.get::<_, Option<String>>(20)?,
-                    row.get::<_, String>(21)?,
-                    row.get::<_, String>(22)?,
-                    row.get::<_, Option<String>>(23)?,
-                    row.get::<_, i64>(24)?,
-                    row.get::<_, String>(25)?,
-                )),
-                None => None,
-            };
-            Ok((listing, row.get::<_, String>(16)?, score))
-        })?;
-
-        let mut jobs: Vec<JobListing> = Vec::new();
-        let mut index: HashMap<i64, usize> = HashMap::new();
-        for row in rows {
-            let (mut listing, keywords, score) = row?;
-            let keywords: Vec<String> = serde_json::from_str(&keywords)?;
-            if let Some((
-                status,
                 score,
-                summary,
-                requirements,
-                model,
-                error,
-                profile_id,
-                updated_at,
-            )) = score
-            {
-                listing.score = Some(JobScore {
-                    status,
-                    score: score.map(|s| s.clamp(0, 100) as u8),
-                    summary,
-                    requirements: serde_json::from_str(&requirements)?,
-                    model,
-                    error,
-                    profile_id,
-                    updated_at,
-                });
-            }
-            let job = match index.get(&listing.id) {
-                Some(&i) => {
-                    jobs[i].search_ids.extend(listing.search_ids);
-                    &mut jobs[i]
-                }
-                None => {
-                    index.insert(listing.id, jobs.len());
-                    jobs.push(listing);
-                    jobs.last_mut().unwrap()
-                }
             };
-            for keyword in keywords {
-                if !job
-                    .matched_keywords
-                    .iter()
-                    .any(|k| k.eq_ignore_ascii_case(&keyword))
-                {
-                    job.matched_keywords.push(keyword);
+            if let Some(&i) = indexes.get(&id) {
+                let job = &mut jobs[i];
+                job.search_ids.extend(listing.search_ids);
+                for keyword in keywords {
+                    if !job
+                        .matched_keywords
+                        .iter()
+                        .any(|k| k.eq_ignore_ascii_case(&keyword))
+                    {
+                        job.matched_keywords.push(keyword);
+                    }
                 }
+            } else {
+                let mut listing = listing;
+                listing.matched_keywords = keywords;
+                indexes.insert(id, jobs.len());
+                jobs.push(listing);
             }
         }
         Ok(jobs)
     }
 
-    pub fn set_job_status(&self, id: i64, status: JobStatus) -> Result<bool, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let changed = conn.execute(
-            "UPDATE jobs SET status = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id, status.as_str(), now()],
-        )?;
-        Ok(changed > 0)
+    pub async fn set_job_status(&self, id: i64, status: JobStatus) -> Result<bool, DbError> {
+        Ok(
+            sqlx::query("UPDATE jobs SET status=$3,updated_at=$4 WHERE id=$1 AND user_id=$2")
+                .bind(id)
+                .bind(self.user_id)
+                .bind(status.as_str())
+                .bind(now())
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+                > 0,
+        )
     }
 
-    pub fn set_jobs_status(&self, ids: &[i64], status: JobStatus) -> Result<usize, DbError> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        let mut changed = 0;
-        {
-            let mut stmt = tx.prepare(
-                "UPDATE jobs SET status = ?2, updated_at = ?3 WHERE id = ?1 AND status != ?2",
-            )?;
-            let ts = now();
-            for id in ids {
-                changed += stmt.execute(params![id, status.as_str(), ts])?;
-            }
-        }
-        tx.commit()?;
-        Ok(changed)
+    pub async fn set_jobs_status(&self, ids: &[i64], status: JobStatus) -> Result<usize, DbError> {
+        Ok(
+            sqlx::query("UPDATE jobs SET status=$3,updated_at=$4 WHERE id=ANY($1) AND user_id=$2")
+                .bind(ids)
+                .bind(self.user_id)
+                .bind(status.as_str())
+                .bind(now())
+                .execute(&self.pool)
+                .await?
+                .rows_affected() as usize,
+        )
     }
 
-    pub fn get_setting(&self, key: &str) -> Result<Option<String>, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let value = conn
-            .query_row(
-                "SELECT value FROM settings WHERE key = ?1",
-                params![key],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(value)
+    pub async fn get_setting(&self, key: &str) -> Result<Option<String>, DbError> {
+        Ok(
+            sqlx::query_scalar("SELECT value FROM settings WHERE user_id=$1 AND key=$2")
+                .bind(self.user_id)
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
     }
 
-    pub fn set_setting(&self, key: &str, value: &str) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-        "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![key, value],
-    )?;
+    pub async fn set_setting(&self, key: &str, value: &str) -> Result<(), DbError> {
+        sqlx::query("INSERT INTO settings (user_id,key,value) VALUES ($1,$2,$3) ON CONFLICT(user_id,key) DO UPDATE SET value=EXCLUDED.value").bind(self.user_id).bind(key).bind(value).execute(&self.pool).await?;
         Ok(())
     }
 
-    pub fn delete_setting(&self, key: &str) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+    pub async fn delete_setting(&self, key: &str) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM settings WHERE user_id=$1 AND key=$2")
+            .bind(self.user_id)
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
-    pub fn start_scan_run(&self, site: Site) -> Result<i64, DbError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO scan_runs (started_at, status, site) VALUES (?1, 'running', ?2)",
-            params![now(), site.as_str()],
-        )?;
-        Ok(conn.last_insert_rowid())
+    pub async fn start_scan_run(&self, site: Site) -> Result<i64, DbError> {
+        Ok(sqlx::query_scalar("INSERT INTO scan_runs (user_id,started_at,status,site) VALUES ($1,$2,'running',$3) RETURNING id").bind(self.user_id).bind(now()).bind(site.as_str()).fetch_one(&self.pool).await?)
     }
 
-    pub fn finish_scan_run(
+    pub async fn finish_scan_run(
         &self,
         id: i64,
         status: &str,
         new_matches: usize,
         message: Option<&str>,
     ) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-        "UPDATE scan_runs SET finished_at = ?2, status = ?3, new_matches = ?4, message = ?5 WHERE id = ?1",
-        params![id, now(), status, new_matches as i64, message],
-    )?;
+        sqlx::query("UPDATE scan_runs SET finished_at=$3,status=$4,new_matches=$5,message=$6 WHERE id=$1 AND user_id=$2").bind(id).bind(self.user_id).bind(now()).bind(status).bind(new_matches as i64).bind(message).execute(&self.pool).await?;
         Ok(())
     }
 
-    pub fn last_scan_run(&self, site: Site) -> Result<Option<ScanRun>, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let run = conn
-            .query_row(
-                "SELECT id, started_at, finished_at, status, new_matches, message
-             FROM scan_runs WHERE site = ?1 ORDER BY id DESC LIMIT 1",
-                params![site.as_str()],
-                |row| {
-                    Ok(ScanRun {
-                        id: row.get(0)?,
-                        started_at: row.get(1)?,
-                        finished_at: row.get(2)?,
-                        status: row.get(3)?,
-                        new_matches: row.get(4)?,
-                        message: row.get(5)?,
-                    })
-                },
-            )
-            .optional()?;
-        Ok(run)
+    pub async fn last_scan_run(&self, site: Site) -> Result<Option<ScanRun>, DbError> {
+        let row=sqlx::query("SELECT id,started_at,finished_at,status,new_matches,message FROM scan_runs WHERE user_id=$1 AND site=$2 ORDER BY id DESC LIMIT 1").bind(self.user_id).bind(site.as_str()).fetch_optional(&self.pool).await?;
+        row.map(|row| {
+            Ok(ScanRun {
+                id: row.try_get("id")?,
+                started_at: row.try_get("started_at")?,
+                finished_at: row.try_get("finished_at")?,
+                status: row.try_get("status")?,
+                new_matches: row.try_get("new_matches")?,
+                message: row.try_get("message")?,
+            })
+        })
+        .transpose()
     }
 
-    pub fn mark_interrupted_scan_runs(&self) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-        "UPDATE scan_runs SET status = 'interrupted', finished_at = ?1 WHERE status = 'running'",
-        params![now()],
-    )?;
+    pub async fn mark_interrupted_scan_runs(&self) -> Result<(), DbError> {
+        sqlx::query("UPDATE scan_runs SET status='interrupted',finished_at=$2 WHERE user_id=$1 AND status='running'").bind(self.user_id).bind(now()).execute(&self.pool).await?;
         Ok(())
     }
 
-    pub fn start_profile(&self, resume_uploaded_at: &str, model: &str) -> Result<i64, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let ts = now();
-        conn.execute(
-        "INSERT INTO resume_profiles (resume_uploaded_at, status, model, created_at, updated_at)
-         VALUES (?1, 'reading', ?2, ?3, ?3)",
-        params![resume_uploaded_at, model, ts],
-    )?;
-        Ok(conn.last_insert_rowid())
+    pub async fn start_profile(
+        &self,
+        resume_uploaded_at: &str,
+        model: &str,
+    ) -> Result<i64, DbError> {
+        Ok(sqlx::query_scalar("INSERT INTO resume_profiles (user_id,resume_uploaded_at,status,model,created_at,updated_at) SELECT $1,$2,'reading',$3,$4,$4 WHERE EXISTS(SELECT 1 FROM master_resume WHERE user_id=$1) RETURNING id").bind(self.user_id).bind(resume_uploaded_at).bind(model).bind(now()).fetch_one(&self.pool).await?)
     }
 
-    pub fn finish_profile(
+    pub async fn finish_profile(
         &self,
         id: i64,
         profile: &ResumeProfile,
         warnings: &[Warning],
     ) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-        "UPDATE resume_profiles SET status = 'ready', data = ?2, warnings = ?3, error = NULL, updated_at = ?4
-         WHERE id = ?1",
-        params![id, serde_json::to_string(profile)?, serde_json::to_string(warnings)?, now()],
-    )?;
+        sqlx::query("UPDATE resume_profiles SET status='ready',data=$3,warnings=$4,error=NULL,updated_at=$5 WHERE id=$1 AND user_id=$2").bind(id).bind(self.user_id).bind(serde_json::to_string(profile)?).bind(serde_json::to_string(warnings)?).bind(now()).execute(&self.pool).await?;
         Ok(())
     }
 
-    pub fn fail_profile(&self, id: i64, error: &str) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-        "UPDATE resume_profiles SET status = 'failed', error = ?2, updated_at = ?3 WHERE id = ?1",
-        params![id, error, now()],
-    )?;
+    pub async fn fail_profile(&self, id: i64, error: &str) -> Result<(), DbError> {
+        sqlx::query("UPDATE resume_profiles SET status='failed',error=$3,updated_at=$4 WHERE id=$1 AND user_id=$2").bind(id).bind(self.user_id).bind(error).bind(now()).execute(&self.pool).await?;
         Ok(())
     }
 
-    pub fn latest_profile(
+    async fn profile_by_query(
+        &self,
+        query: &str,
+        bind_value: &str,
+    ) -> Result<Option<ProfileRecord>, DbError> {
+        let row = sqlx::query(query)
+            .bind(bind_value)
+            .bind(self.user_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            let data: Option<String> = row.try_get("data")?;
+            let warnings: String = row.try_get("warnings")?;
+            Ok(ProfileRecord {
+                id: row.try_get("id")?,
+                resume_uploaded_at: row.try_get("resume_uploaded_at")?,
+                status: row.try_get("status")?,
+                model: row.try_get("model")?,
+                profile: data.map(|value| serde_json::from_str(&value)).transpose()?,
+                warnings: serde_json::from_str(&warnings)?,
+                error: row.try_get("error")?,
+                created_at: row.try_get("created_at")?,
+                updated_at: row.try_get("updated_at")?,
+                confirmed_at: row.try_get("confirmed_at")?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn latest_profile(
         &self,
         resume_uploaded_at: &str,
     ) -> Result<Option<ProfileRecord>, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let parts = conn
-        .query_row(
-            &format!(
-                "SELECT {COLUMNS} FROM resume_profiles WHERE resume_uploaded_at = ?1 ORDER BY id DESC LIMIT 1"
-            ),
-            params![resume_uploaded_at],
-            profile_from_row,
-        )
-        .optional()?;
-        parts.map(profile_finish).transpose()
+        self.profile_by_query(&format!("SELECT {PROFILE_COLUMNS} FROM resume_profiles WHERE resume_uploaded_at=$1 AND user_id=$2 ORDER BY id DESC LIMIT 1"),resume_uploaded_at).await
     }
 
-    pub fn get_profile(&self, id: i64) -> Result<Option<ProfileRecord>, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let parts = conn
-            .query_row(
-                &format!("SELECT {COLUMNS} FROM resume_profiles WHERE id = ?1"),
-                params![id],
-                profile_from_row,
-            )
-            .optional()?;
-        parts.map(profile_finish).transpose()
+    pub async fn get_profile(&self, id: i64) -> Result<Option<ProfileRecord>, DbError> {
+        let row = sqlx::query(&format!(
+            "SELECT {PROFILE_COLUMNS} FROM resume_profiles WHERE id=$1 AND user_id=$2"
+        ))
+        .bind(id)
+        .bind(self.user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            let data: Option<String> = row.try_get("data")?;
+            let warnings: String = row.try_get("warnings")?;
+            Ok(ProfileRecord {
+                id: row.try_get("id")?,
+                resume_uploaded_at: row.try_get("resume_uploaded_at")?,
+                status: row.try_get("status")?,
+                model: row.try_get("model")?,
+                profile: data.map(|value| serde_json::from_str(&value)).transpose()?,
+                warnings: serde_json::from_str(&warnings)?,
+                error: row.try_get("error")?,
+                created_at: row.try_get("created_at")?,
+                updated_at: row.try_get("updated_at")?,
+                confirmed_at: row.try_get("confirmed_at")?,
+            })
+        })
+        .transpose()
     }
 
-    pub fn save_profile_edits(
+    pub async fn save_profile_edits(
         &self,
         id: i64,
         profile: &ResumeProfile,
         warnings: &[Warning],
     ) -> Result<bool, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let changed = conn.execute(
-        "UPDATE resume_profiles SET status = 'ready', data = ?2, warnings = ?3, confirmed_at = NULL, updated_at = ?4
-         WHERE id = ?1 AND status IN ('ready', 'confirmed')",
-        params![id, serde_json::to_string(profile)?, serde_json::to_string(warnings)?, now()],
-    )?;
-        Ok(changed > 0)
+        Ok(sqlx::query("UPDATE resume_profiles SET status='ready',data=$3,warnings=$4,confirmed_at=NULL,updated_at=$5 WHERE id=$1 AND user_id=$2 AND status IN ('ready','confirmed')").bind(id).bind(self.user_id).bind(serde_json::to_string(profile)?).bind(serde_json::to_string(warnings)?).bind(now()).execute(&self.pool).await?.rows_affected()>0)
     }
 
-    pub fn confirm_profile(&self, id: i64) -> Result<bool, DbError> {
-        let conn = self.conn.lock().unwrap();
-        let ts = now();
-        let changed = conn.execute(
-            "UPDATE resume_profiles SET status = 'confirmed', confirmed_at = ?2, updated_at = ?2
-         WHERE id = ?1 AND status = 'ready'",
-            params![id, ts],
-        )?;
-        Ok(changed > 0)
+    pub async fn confirm_profile(&self, id: i64) -> Result<bool, DbError> {
+        Ok(sqlx::query("UPDATE resume_profiles SET status='confirmed',confirmed_at=$3,updated_at=$3 WHERE id=$1 AND user_id=$2 AND status='ready'").bind(id).bind(self.user_id).bind(now()).execute(&self.pool).await?.rows_affected()>0)
     }
 
-    pub fn mark_interrupted_profiles(&self) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-        "UPDATE resume_profiles SET status = 'failed', error = 'Interrupted by a restart. Try again.', updated_at = ?1
-         WHERE status = 'reading'",
-        params![now()],
-    )?;
+    pub async fn mark_interrupted_profiles(&self) -> Result<(), DbError> {
+        sqlx::query("UPDATE resume_profiles SET status='failed',error='Interrupted by a restart. Try again.',updated_at=$2 WHERE user_id=$1 AND status='reading'").bind(self.user_id).bind(now()).execute(&self.pool).await?;
         Ok(())
     }
 }
@@ -971,431 +589,73 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Contact, SearchInput};
-    fn temp_store() -> (Db, PathBuf) {
-        let dir = test_dir("tailor-store-test");
-        (Db::open(&dir).unwrap(), dir)
-    }
+    use sqlx::PgPool;
 
-    #[test]
-    fn save_replace_and_delete() {
-        let (store, dir) = temp_store();
-        assert!(store.get_resume().unwrap().is_none());
-
-        let info = PdfInfo {
-            page_count: 1,
-            text: "first".into(),
-        };
-        store.save_resume("a.pdf", b"%PDF-1", &info).unwrap();
-        let info = PdfInfo {
-            page_count: 2,
-            text: "second".into(),
-        };
-        store.save_resume("b.pdf", b"%PDF-22", &info).unwrap();
-
-        let resume = store.get_resume().unwrap().unwrap();
-        assert_eq!(resume.file_name, "b.pdf");
-        assert_eq!(resume.page_count, 2);
-        assert_eq!(fs::read(store.resume_pdf_path()).unwrap(), b"%PDF-22");
-
-        assert!(store.delete_resume().unwrap());
-        assert!(store.get_resume().unwrap().is_none());
-        assert!(!store.resume_pdf_path().exists());
-
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn reopening_keeps_data() {
-        let (store, dir) = temp_store();
-        let info = PdfInfo {
-            page_count: 1,
-            text: String::new(),
-        };
-        store.save_resume("a.pdf", b"%PDF-1", &info).unwrap();
-        drop(store);
-
-        let store = Db::open(&dir).unwrap();
-        assert_eq!(store.get_resume().unwrap().unwrap().file_name, "a.pdf");
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    fn temp_job_store() -> (Db, std::path::PathBuf) {
-        let dir = test_dir("tailor-jobs-test");
-        (Db::open(&dir).unwrap(), dir)
-    }
-
-    fn criteria(title: &str) -> SearchCriteria {
-        SearchInput {
-            name: None,
-            titles: vec![title.into()],
-            keywords: vec!["Rust".into()],
-            location: Some("Dubai".into()),
-            work_modes: vec![WorkMode::Hybrid],
-            posted_within: PostedWithin::Week,
-        }
-        .validate()
+    async fn user_id(pool: &PgPool) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO users (created_at) VALUES ('2026-01-01T00:00:00Z') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
         .unwrap()
     }
 
-    fn card(id: &str) -> JobCard {
-        JobCard {
+    #[sqlx::test(migrations = "./migrations")]
+    async fn users_do_not_share_jobs_searches_or_settings(pool: PgPool) {
+        let first = Db::for_user(pool.clone(), user_id(&pool).await);
+        let second = Db::for_user(pool.clone(), user_id(&pool).await);
+        let criteria = SearchCriteria {
+            name: "Backend Engineer · Dubai".into(),
+            titles: vec!["Backend Engineer".into()],
+            keywords: vec!["Rust".into()],
+            location: Some("Dubai".into()),
+            work_modes: vec![WorkMode::Onsite],
+            posted_within: PostedWithin::Week,
+        };
+        let search = first.create_search(&criteria).await.unwrap();
+        let card = JobCard {
             source: Site::LinkedIn,
-            source_id: id.into(),
+            source_id: "job-1".into(),
             title: "Backend Engineer".into(),
             company: "Acme".into(),
             company_url: None,
             location: "Dubai".into(),
-            posted_on: Some("2026-10-19".into()),
-            url: format!("https://www.linkedin.com/jobs/view/{id}"),
-        }
-    }
-
-    #[test]
-    fn search_crud() {
-        let (store, dir) = temp_job_store();
-        let search = store.create_search(&criteria("Backend Engineer")).unwrap();
-        assert_eq!(search.criteria.titles, vec!["Backend Engineer"]);
-
-        let updated = store
-            .update_search(search.id, &criteria("Platform Engineer"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(updated.criteria.titles, vec!["Platform Engineer"]);
-        assert!(store.update_search(999, &criteria("x")).unwrap().is_none());
-
-        assert!(store.delete_search(search.id).unwrap());
-        assert!(store.list_searches().unwrap().is_empty());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn scoring_queue_picks_saved_jobs_for_the_confirmed_profile() {
-        let (store, dir) = temp_store();
-        assert!(store.current_confirmed_profile().unwrap().is_none());
-
-        let resume = store
-            .save_resume(
-                "cv.pdf",
-                b"%PDF-1",
-                &PdfInfo {
-                    page_count: 1,
-                    text: "cv".into(),
-                },
-            )
-            .unwrap();
-        let profile_id = store.start_profile(&resume.uploaded_at, "fake").unwrap();
-        let profile = ResumeProfile::default();
-        store.finish_profile(profile_id, &profile, &[]).unwrap();
-        assert!(store.current_confirmed_profile().unwrap().is_none());
-        store.confirm_profile(profile_id).unwrap();
-        assert_eq!(
-            store.current_confirmed_profile().unwrap().unwrap().id,
-            profile_id
-        );
-
-        let detail = JobDetail {
-            description: "Rust".into(),
-            seniority: None,
-            employment_type: None,
-            industries: None,
+            posted_on: None,
+            url: "https://example.com/job-1".into(),
         };
-        let job = store.upsert_job(&card("1"), Some(&detail), None).unwrap();
-        let undescribed = store.upsert_job(&card("2"), None, None).unwrap();
-        store
-            .set_jobs_status(&[job, undescribed], JobStatus::Saved)
+        let job_id = first
+            .upsert_job(&card, None, Some(WorkMode::Onsite))
+            .await
             .unwrap();
-        assert_eq!(
-            store.next_job_to_score(profile_id).unwrap().unwrap().job_id,
-            job
-        );
+        first
+            .add_match(search.id, job_id, &["Rust".into()])
+            .await
+            .unwrap();
+        first.set_setting("private", "first-account").await.unwrap();
 
-        store.start_score(job, profile_id, "fake").unwrap();
-        assert!(store.next_job_to_score(profile_id).unwrap().is_none());
-        assert!(store.next_job_to_score(profile_id + 1).unwrap().is_none());
-
-        let reqs = vec![Requirement {
-            text: "Rust".into(),
-            importance: crate::types::Importance::Must,
-            verdict: crate::types::Verdict::Met,
-            evidence: None,
-        }];
-        store.finish_score(job, 80, "Good fit.", &reqs).unwrap();
-        assert!(store.next_job_to_score(profile_id).unwrap().is_none());
-        assert_eq!(
-            store
-                .next_job_to_score(profile_id + 1)
-                .unwrap()
-                .unwrap()
-                .job_id,
-            job
-        );
-
-        let search = store.create_search(&criteria("Backend Engineer")).unwrap();
-        store.add_match(search.id, job, &[]).unwrap();
-        let listed = store.list_jobs(None).unwrap();
-        let score = listed[0].score.as_ref().unwrap();
-        assert_eq!(
-            (score.status.as_str(), score.score, score.requirements.len()),
-            ("ready", Some(80), 1)
-        );
-
-        store.clear_score(job).unwrap();
-        assert_eq!(
-            store.next_job_to_score(profile_id).unwrap().unwrap().job_id,
-            job
-        );
-        store.set_job_status(job, JobStatus::New).unwrap();
-        assert!(store.next_job_to_score(profile_id).unwrap().is_none());
-
-        store.set_job_status(job, JobStatus::Saved).unwrap();
-        store.start_score(job, profile_id, "fake").unwrap();
-        assert!(store.next_job_to_score(profile_id).unwrap().is_none());
-        store.skip_score(job, profile_id).unwrap();
-        store.finish_score(job, 90, "late result", &[]).unwrap();
-        assert_eq!(store.score_status(job).unwrap().as_deref(), Some("skipped"));
-        assert!(store.next_job_to_score(profile_id).unwrap().is_none());
-        assert!(store.next_job_to_score(profile_id + 1).unwrap().is_none());
-        store.clear_score(job).unwrap();
-        store.start_score(job, profile_id, "fake").unwrap();
-        store.requeue_interrupted_scores().unwrap();
-        assert_eq!(store.score_status(job).unwrap(), None);
-        assert_eq!(
-            store.next_job_to_score(profile_id).unwrap().unwrap().job_id,
-            job
-        );
-        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(second.list_searches().await.unwrap().len(), 0);
+        assert_eq!(second.list_jobs(None).await.unwrap().len(), 0);
+        assert_eq!(second.get_setting("private").await.unwrap(), None);
+        assert!(!second.add_match(search.id, job_id, &[]).await.unwrap());
+        assert!(!second.remove_match(search.id, job_id).await.unwrap());
     }
 
-    #[test]
-    fn scoring_queue_puts_enabled_preferences_first() {
-        let (store, dir) = temp_store();
-        let detail = JobDetail {
-            description: "Rust".into(),
-            seniority: None,
-            employment_type: None,
-            industries: None,
+    #[sqlx::test(migrations = "./migrations")]
+    async fn resume_pdf_is_stored_and_deleted_with_its_record(pool: PgPool) {
+        let store = Db::for_user(pool.clone(), user_id(&pool).await);
+        let info = PdfInfo {
+            page_count: 1,
+            text: "Resume text".into(),
         };
-        let paused_job = store.upsert_job(&card("1"), Some(&detail), None).unwrap();
-        let enabled_job = store.upsert_job(&card("2"), Some(&detail), None).unwrap();
         store
-            .set_jobs_status(&[enabled_job], JobStatus::Saved)
-            .unwrap();
-        store
-            .set_jobs_status(&[paused_job], JobStatus::Saved)
-            .unwrap();
-
-        let paused = store.create_search(&criteria("Backend Engineer")).unwrap();
-        let enabled = store.create_search(&criteria("Platform Engineer")).unwrap();
-        store.set_search_enabled(paused.id, false).unwrap();
-        store.add_match(paused.id, paused_job, &[]).unwrap();
-        store.add_match(enabled.id, enabled_job, &[]).unwrap();
-
-        assert_eq!(
-            store.next_job_to_score(1).unwrap().unwrap().job_id,
-            enabled_job
-        );
-        store.set_search_enabled(enabled.id, false).unwrap();
-        assert_eq!(
-            store.next_job_to_score(1).unwrap().unwrap().job_id,
-            paused_job
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn upsert_keeps_description_and_matches_fold() {
-        let (store, dir) = temp_job_store();
-        let a = store.create_search(&criteria("Backend Engineer")).unwrap();
-        let b = store.create_search(&criteria("Engineer")).unwrap();
-
-        let detail = JobDetail {
-            description: "Rust and Kafka".into(),
-            seniority: Some("Mid-Senior level".into()),
-            employment_type: None,
-            industries: None,
-        };
-        let id = store
-            .upsert_job(&card("1"), Some(&detail), Some(WorkMode::Hybrid))
+            .save_resume("resume.pdf", b"%PDF-content", &info)
+            .await
             .unwrap();
         assert_eq!(
-            store
-                .upsert_job(&card("1"), None, Some(WorkMode::Hybrid))
-                .unwrap(),
-            id
+            store.resume_pdf().await.unwrap().as_deref(),
+            Some(&b"%PDF-content"[..])
         );
-        assert_eq!(
-            store
-                .known_job("1")
-                .unwrap()
-                .unwrap()
-                .description
-                .as_deref(),
-            Some("Rust and Kafka")
-        );
-
-        assert!(store.add_match(a.id, id, &["Rust".into()]).unwrap());
-        assert!(!store.add_match(a.id, id, &["Rust".into()]).unwrap());
-        assert!(store.add_match(b.id, id, &["Kafka".into()]).unwrap());
-
-        let jobs = store.list_jobs(None).unwrap();
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].search_ids, vec![a.id, b.id]);
-        assert_eq!(jobs[0].matched_keywords, vec!["Rust", "Kafka"]);
-        assert_eq!(jobs[0].work_mode, Some(WorkMode::Hybrid));
-
-        assert_eq!(jobs[0].tailored_at, None);
-        assert_eq!(
-            store.set_jobs_status(&[id, 999], JobStatus::Saved).unwrap(),
-            1
-        );
-        assert_eq!(
-            store.set_jobs_status(&[id], JobStatus::Saved).unwrap(),
-            0,
-            "already saved"
-        );
-        assert!(store.set_job_status(id, JobStatus::Dismissed).unwrap());
-        assert!(store.list_jobs(Some(JobStatus::New)).unwrap().is_empty());
-        assert_eq!(
-            store.list_jobs(Some(JobStatus::Dismissed)).unwrap().len(),
-            1
-        );
-
-        store
-            .update_search(a.id, &criteria("Backend Engineer"))
-            .unwrap();
-        assert_eq!(
-            store.list_jobs(None).unwrap()[0].search_ids,
-            vec![a.id, b.id]
-        );
-
-        store.set_job_status(id, JobStatus::New).unwrap();
-        store
-            .update_search(a.id, &criteria("Backend Engineer"))
-            .unwrap();
-        assert_eq!(store.list_jobs(None).unwrap()[0].search_ids, vec![b.id]);
-        store.delete_search(b.id).unwrap();
-        assert!(store.list_jobs(None).unwrap().is_empty());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn settings_and_scan_runs() {
-        let (store, dir) = temp_job_store();
-        assert_eq!(store.get_setting("k").unwrap(), None);
-        store.set_setting("k", "30").unwrap();
-        store.set_setting("k", "45").unwrap();
-        assert_eq!(store.get_setting("k").unwrap().as_deref(), Some("45"));
-
-        let run = store.start_scan_run(Site::LinkedIn).unwrap();
-        store.mark_interrupted_scan_runs().unwrap();
-        assert_eq!(
-            store.last_scan_run(Site::LinkedIn).unwrap().unwrap().status,
-            "interrupted"
-        );
-        store.finish_scan_run(run, "ok", 3, None).unwrap();
-        let last = store.last_scan_run(Site::LinkedIn).unwrap().unwrap();
-        assert_eq!((last.status.as_str(), last.new_matches), ("ok", 3));
-        assert!(store.last_scan_run(Site::Indeed).unwrap().is_none());
-        let indeed = store.start_scan_run(Site::Indeed).unwrap();
-        assert_eq!(
-            store.last_scan_run(Site::Indeed).unwrap().unwrap().id,
-            indeed
-        );
-        assert_eq!(
-            store.last_scan_run(Site::LinkedIn).unwrap().unwrap().id,
-            run
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn delete_setting_removes_saved_value() {
-        let (store, dir) = temp_job_store();
-        store.set_setting("k", "value").unwrap();
-        store.delete_setting("k").unwrap();
-        assert_eq!(store.get_setting("k").unwrap(), None);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn reading_lifecycle() {
-        let dir = test_dir("tailor-profile-test");
-        let store = Db::open(&dir).unwrap();
-
-        let id = store.start_profile("t1", "fake").unwrap();
-        assert_eq!(
-            store.latest_profile("t1").unwrap().unwrap().status,
-            "reading"
-        );
-        assert!(store.latest_profile("t2").unwrap().is_none());
-        assert!(!store.confirm_profile(id).unwrap());
-
-        let profile = ResumeProfile {
-            contact: Contact {
-                name: "Jordan".into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let warnings = vec![Warning {
-            item_id: "e1.b1".into(),
-            message: "x".into(),
-        }];
-        store.finish_profile(id, &profile, &warnings).unwrap();
-        let record = store.latest_profile("t1").unwrap().unwrap();
-        assert_eq!(
-            (record.status.as_str(), record.warnings.len()),
-            ("ready", 1)
-        );
-        assert_eq!(record.profile.unwrap().contact.name, "Jordan");
-
-        assert!(store.confirm_profile(id).unwrap());
-        assert!(store
-            .get_profile(id)
-            .unwrap()
-            .unwrap()
-            .confirmed_at
-            .is_some());
-
-        assert!(store.save_profile_edits(id, &profile, &[]).unwrap());
-        let record = store.get_profile(id).unwrap().unwrap();
-        assert_eq!(
-            (record.status.as_str(), record.confirmed_at),
-            ("ready", None)
-        );
-
-        let other = store.start_profile("t1", "fake").unwrap();
-        store.mark_interrupted_profiles().unwrap();
-        let record = store.latest_profile("t1").unwrap().unwrap();
-        assert_eq!((record.id, record.status.as_str()), (other, "failed"));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn company_sites_are_fetched_once_and_listed() {
-        let (store, dir) = temp_store();
-        let company = "https://ae.linkedin.com/company/acme";
-        let mut with_company = card("1");
-        with_company.company_url = Some(company.into());
-        let job = store.upsert_job(&with_company, None, None).unwrap();
-        store.upsert_job(&card("2"), None, None).unwrap();
-        let search = store.create_search(&criteria("Backend Engineer")).unwrap();
-        store.add_match(search.id, job, &[]).unwrap();
-
-        assert_eq!(
-            store.companies_missing_site(8).unwrap(),
-            vec![company.to_string()]
-        );
-        store
-            .save_company_site(company, Some("https://acme.com/"))
-            .unwrap();
-        assert!(store.companies_missing_site(8).unwrap().is_empty());
-        let listed = store.list_jobs(None).unwrap();
-        assert_eq!(
-            listed[0].company_website.as_deref(),
-            Some("https://acme.com/")
-        );
-        std::fs::remove_dir_all(dir).unwrap();
+        assert!(store.delete_resume().await.unwrap());
+        assert_eq!(store.resume_pdf().await.unwrap(), None);
     }
 }

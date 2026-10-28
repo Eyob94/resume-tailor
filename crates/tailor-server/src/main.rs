@@ -16,6 +16,7 @@ use errors::AppError;
 
 use serde::Deserialize;
 use serde_json::json;
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use tailor_core::{
     db::Db,
     errors::{ProfileError, ResumeError, ScoreError},
@@ -40,7 +41,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Clone)]
 struct AppState {
     auth: auth::AuthStore,
-    data_dir: PathBuf,
+    pool: PgPool,
     ollama_url: String,
     cooldown_seconds: i64,
     users: Arc<AsyncMutex<std::collections::HashMap<i64, Arc<UserServices>>>>,
@@ -49,7 +50,7 @@ struct AppState {
 struct UserServices {
     store: Arc<Db>,
     senders: PipelineSenders,
-    username: String,
+    username: Option<String>,
     ollama_url: String,
     _pipeline: Pipeline,
 }
@@ -60,12 +61,7 @@ impl AppState {
         if let Some(user) = users.get(&user_id) {
             return Ok(user.clone());
         }
-        let data_dir = if user_id == 1 {
-            self.data_dir.clone()
-        } else {
-            self.data_dir.join("users").join(user_id.to_string())
-        };
-        let store = Arc::new(Db::open(&data_dir).map_err(|error| error.to_string())?);
+        let store = Arc::new(Db::for_user(self.pool.clone(), user_id));
         let (pipeline, senders) = Pipeline::new(
             store.clone(),
             PipelineConfig {
@@ -77,8 +73,8 @@ impl AppState {
         let username = self
             .auth
             .username(user_id)
-            .map_err(|error| format!("couldn't load user: {error:?}"))?
-            .ok_or_else(|| "user not found".to_string())?;
+            .await
+            .map_err(|error| format!("couldn't load user: {error:?}"))?;
         let user = Arc::new(UserServices {
             store,
             senders,
@@ -99,7 +95,6 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let data_dir = env::var("DATA_DIR").unwrap_or_else(|_| "data".into());
     let web_dist = PathBuf::from(env::var("WEB_DIST").unwrap_or_else(|_| "web/dist".into()));
     let port: u16 = env::var("PORT")
         .ok()
@@ -114,10 +109,18 @@ async fn main() -> anyhow::Result<()> {
     if cooldown_seconds != DEFAULT_COOLDOWN_SECONDS {
         tracing::warn!(cooldown_seconds, "manual scan cooldown overridden");
     }
-    let data_dir = PathBuf::from(data_dir);
+    let database_url =
+        env::var("DATABASE_URL").map_err(|_| anyhow::anyhow!("DATABASE_URL is not set."))?;
+    let pool = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&database_url)
+        .await?;
+    sqlx::migrate!("../tailor-core/migrations")
+        .run(&pool)
+        .await?;
     let state = AppState {
-        auth: auth::AuthStore::open(&data_dir)?,
-        data_dir,
+        auth: auth::AuthStore::new(pool.clone()),
+        pool,
         ollama_url,
         cooldown_seconds,
         users: Arc::new(AsyncMutex::new(std::collections::HashMap::new())),
@@ -213,7 +216,7 @@ async fn health() -> Json<serde_json::Value> {
 async fn get_resume(
     Extension(user): Extension<Arc<UserServices>>,
 ) -> Result<Json<Option<MasterResume>>, AppError> {
-    Ok(Json(user.store.get_resume()?))
+    Ok(Json(user.store.get_resume().await?))
 }
 
 async fn upload_resume(
@@ -250,14 +253,14 @@ async fn delete_resume(
 }
 
 async fn resume_file(Extension(user): Extension<Arc<UserServices>>) -> Result<Response, AppError> {
-    let Some(resume) = user.store.get_resume()? else {
+    let Some(resume) = user.store.get_resume().await? else {
         return Err(AppError::not_found());
     };
-    let bytes = match tokio::fs::read(user.store.resume_pdf_path()).await {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(AppError::not_found()),
-        Err(e) => return Err(AppError::internal(e)),
-    };
+    let bytes = user
+        .store
+        .resume_pdf()
+        .await?
+        .ok_or_else(AppError::not_found)?;
     let header_name: String = resume
         .file_name
         .chars()
@@ -283,10 +286,10 @@ async fn resume_file(Extension(user): Extension<Arc<UserServices>>) -> Result<Re
 async fn get_profile(
     Extension(user): Extension<Arc<UserServices>>,
 ) -> Result<Json<Option<ProfileRecord>>, AppError> {
-    let Some(resume) = user.store.get_resume()? else {
+    let Some(resume) = user.store.get_resume().await? else {
         return Ok(Json(None));
     };
-    Ok(Json(user.store.latest_profile(&resume.uploaded_at)?))
+    Ok(Json(user.store.latest_profile(&resume.uploaded_at).await?))
 }
 
 async fn read_profile(
@@ -328,7 +331,7 @@ async fn confirm_profile(
 async fn list_searches(
     Extension(user): Extension<Arc<UserServices>>,
 ) -> Result<Json<Vec<JobSearch>>, AppError> {
-    Ok(Json(user.store.list_searches()?))
+    Ok(Json(user.store.list_searches().await?))
 }
 
 async fn create_search(
@@ -336,7 +339,7 @@ async fn create_search(
     Json(input): Json<SearchInput>,
 ) -> Result<(StatusCode, Json<JobSearch>), AppError> {
     let criteria = input.validate().map_err(|e| AppError::bad_request(e.0))?;
-    let search = state.store.create_search(&criteria)?;
+    let search = state.store.create_search(&criteria).await?;
     let _ = state.senders.scrape.send(ScrapeMessage::Reschedule);
     Ok((StatusCode::CREATED, Json(search)))
 }
@@ -349,7 +352,8 @@ async fn update_search(
     let criteria = input.validate().map_err(|e| AppError::bad_request(e.0))?;
     let search = state
         .store
-        .update_search(id, &criteria)?
+        .update_search(id, &criteria)
+        .await?
         .ok_or_else(|| AppError::not_found_msg("Search not found."))?;
     let _ = state.senders.scrape.send(ScrapeMessage::Reschedule);
     Ok(Json(search))
@@ -367,7 +371,8 @@ async fn update_search_enabled(
 ) -> Result<Json<JobSearch>, AppError> {
     let search = state
         .store
-        .set_search_enabled(id, input.enabled)?
+        .set_search_enabled(id, input.enabled)
+        .await?
         .ok_or_else(|| AppError::not_found_msg("Preference not found."))?;
     let _ = state.senders.scrape.send(ScrapeMessage::Reschedule);
     Ok(Json(search))
@@ -377,7 +382,7 @@ async fn delete_search(
     Extension(state): Extension<Arc<UserServices>>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, AppError> {
-    if !state.store.delete_search(id)? {
+    if !state.store.delete_search(id).await? {
         return Err(AppError::not_found_msg("Search not found."));
     }
     let _ = state.senders.scrape.send(ScrapeMessage::Reschedule);
@@ -393,7 +398,7 @@ async fn list_jobs(
     Extension(user): Extension<Arc<UserServices>>,
     Query(query): Query<JobsQuery>,
 ) -> Result<Json<Vec<JobListing>>, AppError> {
-    Ok(Json(user.store.list_jobs(query.status)?))
+    Ok(Json(user.store.list_jobs(query.status).await?))
 }
 
 #[derive(Deserialize)]
@@ -406,7 +411,7 @@ async fn update_job(
     Path(id): Path<i64>,
     Json(patch): Json<JobPatch>,
 ) -> Result<StatusCode, AppError> {
-    if user.store.set_job_status(id, patch.status)? {
+    if user.store.set_job_status(id, patch.status).await? {
         if patch.status == JobStatus::Saved {
             let _ = user.senders.score.send(ScoreMessage::Kick);
         }
@@ -433,7 +438,7 @@ async fn update_jobs_status(
             "Update at most {MAX_BULK_IDS} jobs at once."
         )));
     }
-    let updated = user.store.set_jobs_status(&body.ids, body.status)?;
+    let updated = user.store.set_jobs_status(&body.ids, body.status).await?;
     if body.status == JobStatus::Saved {
         let _ = user.senders.score.send(ScoreMessage::Kick);
     }
@@ -444,20 +449,26 @@ async fn rescore_job(
     Extension(user): Extension<Arc<UserServices>>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, AppError> {
-    ask(&user.senders.score, |reply| ScoreMessage::Rescore { job_id: id, reply })
-        .await?
-        .map(|()| StatusCode::ACCEPTED)
-        .map_err(map_score_error)
+    ask(&user.senders.score, |reply| ScoreMessage::Rescore {
+        job_id: id,
+        reply,
+    })
+    .await?
+    .map(|()| StatusCode::ACCEPTED)
+    .map_err(map_score_error)
 }
 
 async fn skip_job_score(
     Extension(user): Extension<Arc<UserServices>>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, AppError> {
-    ask(&user.senders.score, |reply| ScoreMessage::Skip { job_id: id, reply })
-        .await?
-        .map(|()| StatusCode::NO_CONTENT)
-        .map_err(map_score_error)
+    ask(&user.senders.score, |reply| ScoreMessage::Skip {
+        job_id: id,
+        reply,
+    })
+    .await?
+    .map(|()| StatusCode::NO_CONTENT)
+    .map_err(map_score_error)
 }
 
 fn map_score_error(error: ScoreError) -> AppError {
@@ -486,7 +497,10 @@ async fn run_scan_now(
     Extension(state): Extension<Arc<UserServices>>,
     Path(site): Path<Site>,
 ) -> Result<StatusCode, AppError> {
-    ask(&state.senders.scrape, |reply| ScrapeMessage::RunNow { site, reply })
+    ask(&state.senders.scrape, |reply| ScrapeMessage::RunNow {
+        site,
+        reply,
+    })
     .await?
     .map(|()| StatusCode::ACCEPTED)
     .map_err(|message| AppError {

@@ -15,6 +15,17 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-retries 10
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -36,6 +47,8 @@ jobs:
         run: npm run build --prefix web
 
       - name: Test Rust workspace
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
         run: cargo test --locked --workspace
 
       - name: Build server
@@ -111,12 +124,16 @@ jobs:
           }
 
       - name: Set up VPS
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           set -euo pipefail
+          test -n "$DATABASE_URL" || { echo "Missing DATABASE_URL secret" >&2; exit 1; }
           setup_dir="/tmp/resume-tailor-setup-${GITHUB_SHA}"
           ssh -4 resume-tailor-vps "rm -rf '$setup_dir' && mkdir -p '$setup_dir'"
           scp -4 -r deploy Caddyfile "resume-tailor-vps:$setup_dir/"
           ssh -4 resume-tailor-vps "if [ \"\$(id -u)\" -eq 0 ]; then bash '$setup_dir/deploy/bootstrap.sh' root; else sudo -n bash '$setup_dir/deploy/bootstrap.sh' \"\$USER\"; fi && rm -rf '$setup_dir'"
+          printf '%s\n' "$DATABASE_URL" | ssh -4 resume-tailor-vps 'read -r value && sed -i "/^DATABASE_URL=/d" /etc/resume-tailor.env && printf "DATABASE_URL=%s\n" "$value" >> /etc/resume-tailor.env'
 
       - name: Copy release to VPS
         run: scp -4 resume-tailor-release.tar.gz resume-tailor-vps:/tmp/resume-tailor-${GITHUB_SHA}.tar.gz

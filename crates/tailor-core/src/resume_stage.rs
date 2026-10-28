@@ -10,7 +10,7 @@ use tokio::{
 
 use crate::{
     db::Db,
-    errors::{DbError, PdfError, ResumeError},
+    errors::{PdfError, ResumeError},
     parse_stage::ParseMessage,
     types::{MasterResume, PdfInfo},
 };
@@ -70,18 +70,17 @@ async fn run(
                 }
             }
             ResumeMessage::Remove { reply } => {
-                let db = db.clone();
-                let result = tokio::task::spawn_blocking(move || db.delete_resume())
-                    .await
-                    .map_err(|e| ResumeError::Db(DbError::Io(std::io::Error::other(e.to_string()))))
-                    .and_then(|result| result.map_err(ResumeError::Db))
-                    .and_then(|deleted| {
-                        if deleted {
-                            Ok(())
-                        } else {
-                            Err(ResumeError::NoResume)
-                        }
-                    });
+                let result =
+                    db.delete_resume()
+                        .await
+                        .map_err(ResumeError::Db)
+                        .and_then(|deleted| {
+                            if deleted {
+                                Ok(())
+                            } else {
+                                Err(ResumeError::NoResume)
+                            }
+                        });
                 let _ = reply.send(result);
             }
         }
@@ -103,7 +102,7 @@ async fn upload(
     let bytes_for_inspection = bytes.clone();
     let info = tokio::task::spawn_blocking(move || inspect_pdf(&bytes_for_inspection))
         .await
-        .map_err(|e| ResumeError::Db(DbError::Io(std::io::Error::other(e.to_string()))))?
+        .map_err(|_| ResumeError::Unreadable)?
         .map_err(|error| match error {
             PdfError::NotPdf => ResumeError::NotPdf,
             PdfError::Unreadable(detail) => {
@@ -112,10 +111,8 @@ async fn upload(
             }
         })?;
     let file_name = sanitize_file_name(file_name);
-    let db = db.clone();
-    tokio::task::spawn_blocking(move || db.save_resume(&file_name, &bytes, &info))
+    db.save_resume(&file_name, &bytes, &info)
         .await
-        .map_err(|e| ResumeError::Db(DbError::Io(std::io::Error::other(e.to_string()))))?
         .map_err(ResumeError::Db)
 }
 

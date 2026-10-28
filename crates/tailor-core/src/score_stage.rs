@@ -52,7 +52,7 @@ impl ScoreStage {
 }
 
 async fn run(db: Arc<Db>, default_ollama_url: String, mut rx: UnboundedReceiver<ScoreMessage>) {
-    if let Err(e) = db.requeue_interrupted_scores() {
+    if let Err(e) = db.requeue_interrupted_scores().await {
         tracing::error!("couldn't requeue interrupted job scores: {e}");
     }
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -61,10 +61,10 @@ async fn run(db: Arc<Db>, default_ollama_url: String, mut rx: UnboundedReceiver<
     loop {
         if wanted && !running {
             wanted = false;
-            match next_job(&db) {
+            match next_job(&db).await {
                 Ok(Some((profile_id, profile, job))) => {
                     running = true;
-                    let url = configured_ollama_url(&db, &default_ollama_url);
+                    let url = configured_ollama_url(&db, &default_ollama_url).await;
                     spawn_scoring(db.clone(), url, profile_id, profile, job, done_tx.clone());
                 }
                 Ok(None) => {}
@@ -76,14 +76,14 @@ async fn run(db: Arc<Db>, default_ollama_url: String, mut rx: UnboundedReceiver<
                 None => break,
                 Some(ScoreMessage::Kick) => wanted = true,
                 Some(ScoreMessage::Rescore { job_id, reply }) => {
-                    let result = rescore(&db, job_id);
+                    let result = rescore(&db, job_id).await;
                     if result.is_ok() {
                         wanted = true;
                     }
                     let _ = reply.send(result);
                 }
                 Some(ScoreMessage::Skip { job_id, reply }) => {
-                    let _ = reply.send(skip(&db, job_id));
+                    let _ = reply.send(skip(&db, job_id).await);
                 }
             },
             _ = done_rx.recv(), if running => {
@@ -94,42 +94,49 @@ async fn run(db: Arc<Db>, default_ollama_url: String, mut rx: UnboundedReceiver<
     }
 }
 
-fn next_job(db: &Db) -> Result<Option<(i64, ResumeProfile, JobToScore)>, ScoreError> {
+async fn next_job(db: &Db) -> Result<Option<(i64, ResumeProfile, JobToScore)>, ScoreError> {
     let Some(ProfileRecord {
         id,
         profile: Some(profile),
         ..
-    }) = db.current_confirmed_profile()?
+    }) = db.current_confirmed_profile().await?
     else {
         return Ok(None);
     };
-    Ok(db.next_job_to_score(id)?.map(|job| (id, profile, job)))
+    Ok(db
+        .next_job_to_score(id)
+        .await?
+        .map(|job| (id, profile, job)))
 }
 
-fn rescore(db: &Db, job_id: i64) -> Result<(), ScoreError> {
-    match db.job_status(job_id)? {
+async fn rescore(db: &Db, job_id: i64) -> Result<(), ScoreError> {
+    match db.job_status(job_id).await? {
         None => return Err(ScoreError::NotFound),
         Some(JobStatus::Saved) => {}
         Some(_) => return Err(ScoreError::NotSaved),
     }
-    if db.current_confirmed_profile()?.is_none() {
+    if db.current_confirmed_profile().await?.is_none() {
         return Err(ScoreError::NoProfile);
     }
-    if db.score_status(job_id)?.as_deref() == Some("scoring") {
+    if db.score_status(job_id).await?.as_deref() == Some("scoring") {
         return Err(ScoreError::AlreadyScoring);
     }
-    db.clear_score(job_id)?;
+    db.clear_score(job_id).await?;
     Ok(())
 }
 
-fn skip(db: &Db, job_id: i64) -> Result<(), ScoreError> {
-    match db.job_status(job_id)? {
+async fn skip(db: &Db, job_id: i64) -> Result<(), ScoreError> {
+    match db.job_status(job_id).await? {
         None => return Err(ScoreError::NotFound),
         Some(JobStatus::Saved) => {}
         Some(_) => return Err(ScoreError::NotSaved),
     }
-    let profile_id = db.current_confirmed_profile()?.map(|p| p.id).unwrap_or(0);
-    db.skip_score(job_id, profile_id)?;
+    let profile_id = db
+        .current_confirmed_profile()
+        .await?
+        .map(|p| p.id)
+        .unwrap_or(0);
+    db.skip_score(job_id, profile_id).await?;
     Ok(())
 }
 
@@ -142,7 +149,7 @@ fn spawn_scoring(
     done: UnboundedSender<()>,
 ) {
     tokio::spawn(async move {
-        let config = match ai_step_config(&db, AiStep::ScoreJobs) {
+        let config = match ai_step_config(&db, AiStep::ScoreJobs).await {
             Ok(config) => config,
             Err(e) => {
                 tracing::error!(job_id = job.job_id, "couldn't load scoring settings: {e}");
@@ -151,19 +158,22 @@ fn spawn_scoring(
             }
         };
         let model = Ollama::new(&ollama_url, &config.model);
-        let outcome = match db.start_score(job.job_id, profile_id, &model.label()) {
+        let outcome = match db.start_score(job.job_id, profile_id, &model.label()).await {
             Ok(()) => {
                 tracing::info!(job_id = job.job_id, model = %model.label(), "scoring job");
                 match score_job(&model, &config.prompt, &profile, &job).await {
-                    Ok(scored) => db.finish_score(
-                        job.job_id,
-                        scored.score,
-                        &scored.summary,
-                        &scored.requirements,
-                    ),
+                    Ok(scored) => {
+                        db.finish_score(
+                            job.job_id,
+                            scored.score,
+                            &scored.summary,
+                            &scored.requirements,
+                        )
+                        .await
+                    }
                     Err(e) => {
                         tracing::warn!(job_id = job.job_id, "scoring failed: {e}");
-                        db.fail_score(job.job_id, &e.to_string())
+                        db.fail_score(job.job_id, &e.to_string()).await
                     }
                 }
             }
