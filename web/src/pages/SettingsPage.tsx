@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
-import { errorMessage, jobsApi, profileApi, type AiStatus, type Settings } from "../api";
+import { LogOut } from "lucide-react";
+import { api, errorMessage, jobsApi, profileApi, type AiStatus, type Settings } from "../api";
 import { ServerStatus } from "../components/Layout";
 import { Alert, Button, Card, PageHeader } from "../components/ui";
 import { useDevMode } from "../devMode";
@@ -44,8 +45,10 @@ export function SettingsPage() {
   const [error, setError] = useState<string | null>(null);
   const [ai, setAi] = useState<AiStatus | null>(null);
   const [ollamaUrl, setOllamaUrl] = useState("");
+  const [username, setUsername] = useState("");
 
   useEffect(() => {
+    api.currentUser().then((user) => setUsername(user.username), () => setUsername(""));
     jobsApi.getSettings().then(
       (s) => setIntervals(s),
       (e) => setError(errorMessage(e)),
@@ -58,6 +61,11 @@ export function SettingsPage() {
       (e) => setError(errorMessage(e)),
     );
   }, []);
+
+  async function signOut() {
+    await api.logout().catch(() => undefined);
+    window.location.assign("/login");
+  }
 
   const [savingUrl, setSavingUrl] = useState(false);
 
@@ -148,6 +156,13 @@ export function SettingsPage() {
         <Row label="Developer mode" hint="Show raw JSON views for inspecting what the app stores.">
           <Switch checked={devMode} onChange={setDevMode} label="Developer mode" />
         </Row>
+        <div className="flex flex-col gap-2 px-5 py-4 sm:flex-row sm:items-center sm:justify-between sm:gap-6">
+          <div>
+            <span className="text-sm font-medium">Account</span>
+            <p className="mt-0.5 text-xs text-zinc-500">Signed in as {username || "…"}</p>
+          </div>
+          <Button variant="danger" icon={LogOut} onClick={signOut}>Sign out</Button>
+        </div>
       </Card>
     </>
   );

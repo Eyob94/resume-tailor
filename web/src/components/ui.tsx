@@ -30,11 +30,12 @@ export function Button({
   );
 }
 
-export function Menu({ trigger, label, items, align = "right" }: {
+export function Menu({ trigger, label, items, align = "right", heading }: {
   trigger: ReactNode;
   label: string;
-  items: { label: string; icon?: LucideIcon; onSelect: () => void; danger?: boolean; disabled?: boolean }[];
+  items: { label: string; icon?: LucideIcon | null; onSelect: () => void; danger?: boolean; disabled?: boolean }[];
   align?: "left" | "right";
+  heading?: string;
 }) {
   const [open, setOpen] = useState(false);
   const root = useRef<HTMLDivElement>(null);
@@ -68,6 +69,7 @@ export function Menu({ trigger, label, items, align = "right" }: {
         {trigger}
       </button>
       {open && <div role="menu" className={`absolute z-20 mt-1 min-w-44 rounded-lg border border-zinc-200 bg-white p-1 shadow-lg ${align === "right" ? "right-0" : "left-0"}`}>
+        {heading && <div className="px-2.5 pb-1 pt-1.5 text-xs font-medium text-zinc-400">{heading}</div>}
         {items.map(({ label: itemLabel, icon: Icon, onSelect, danger, disabled }) => (
           <button
             key={itemLabel}
@@ -77,7 +79,7 @@ export function Menu({ trigger, label, items, align = "right" }: {
             className={`flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-sm ${danger ? "text-red-600 hover:bg-red-50" : "text-zinc-700 hover:bg-zinc-100"} ${disabled ? "pointer-events-none opacity-50" : ""}`}
             onClick={(event) => { event.stopPropagation(); if (disabled) return; onSelect(); setOpen(false); }}
           >
-            {Icon && <Icon className="size-4" />}
+            {Icon ? <Icon className="size-4" /> : Icon === null ? <span className="size-4" /> : null}
             {itemLabel}
           </button>
         ))}
@@ -107,7 +109,7 @@ export function ButtonLink({
 
 export function PageHeader({ title, description, actions }: { title: string; description?: string; actions?: ReactNode }) {
   return (
-    <div className="mb-8 flex flex-wrap items-end justify-between gap-4">
+    <div className="mb-4 flex flex-wrap items-center justify-between gap-4 sm:mb-8 sm:items-end">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">{title}</h1>
         {description && <p className="mt-1 text-sm text-zinc-500">{description}</p>}
