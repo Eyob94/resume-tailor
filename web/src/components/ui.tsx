@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import { useEffect, useRef, useState, type ButtonHTMLAttributes, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { AlertCircle, Loader2, type LucideIcon } from "lucide-react";
 
@@ -27,6 +27,62 @@ export function Button({
       {loading ? <Loader2 className="size-4 shrink-0 animate-spin" /> : Icon && <Icon className="size-4 shrink-0" />}
       {children}
     </button>
+  );
+}
+
+export function Menu({ trigger, label, items, align = "right" }: {
+  trigger: ReactNode;
+  label: string;
+  items: { label: string; icon?: LucideIcon; onSelect: () => void; danger?: boolean; disabled?: boolean }[];
+  align?: "left" | "right";
+}) {
+  const [open, setOpen] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onMouseDown = (event: MouseEvent) => {
+      if (!root.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onMouseDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onMouseDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  return (
+    <div ref={root} className="relative inline-block">
+      <button
+        type="button"
+        aria-label={label}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={(event) => { event.stopPropagation(); setOpen((value) => !value); }}
+        className="inline-flex items-center justify-center border-0 bg-transparent p-0 text-inherit focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900"
+      >
+        {trigger}
+      </button>
+      {open && <div role="menu" className={`absolute z-20 mt-1 min-w-44 rounded-lg border border-zinc-200 bg-white p-1 shadow-lg ${align === "right" ? "right-0" : "left-0"}`}>
+        {items.map(({ label: itemLabel, icon: Icon, onSelect, danger, disabled }) => (
+          <button
+            key={itemLabel}
+            type="button"
+            role="menuitem"
+            disabled={disabled}
+            className={`flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-sm ${danger ? "text-red-600 hover:bg-red-50" : "text-zinc-700 hover:bg-zinc-100"} ${disabled ? "pointer-events-none opacity-50" : ""}`}
+            onClick={(event) => { event.stopPropagation(); if (disabled) return; onSelect(); setOpen(false); }}
+          >
+            {Icon && <Icon className="size-4" />}
+            {itemLabel}
+          </button>
+        ))}
+      </div>}
+    </div>
   );
 }
 
