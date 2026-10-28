@@ -12,8 +12,8 @@ use crate::{
     errors::DbError,
     types::{
         JobCard, JobDetail, JobListing, JobScore, JobSearch, JobStatus, JobToScore, MasterResume,
-        PdfInfo, PostedWithin, ProfileRecord, Requirement, ResumeProfile, ScanRun, SearchCriteria, Site,
-        Warning, WorkMode,
+        PdfInfo, PostedWithin, ProfileRecord, Requirement, ResumeProfile, ScanRun, SearchCriteria,
+        Site, Warning, WorkMode,
     },
 };
 #[derive(Clone)]
@@ -577,7 +577,13 @@ impl Db {
             "UPDATE job_scores SET status = 'ready', score = ?2, summary = ?3, requirements = ?4,
                 error = NULL, updated_at = ?5
              WHERE job_id = ?1 AND status = 'scoring'",
-            params![job_id, score, summary, serde_json::to_string(requirements)?, now()],
+            params![
+                job_id,
+                score,
+                summary,
+                serde_json::to_string(requirements)?,
+                now()
+            ],
         )?;
         Ok(())
     }
@@ -612,7 +618,11 @@ impl Db {
     pub fn score_status(&self, job_id: i64) -> Result<Option<String>, DbError> {
         let conn = self.conn.lock().unwrap();
         let status = conn
-            .query_row("SELECT status FROM job_scores WHERE job_id = ?1", params![job_id], |row| row.get(0))
+            .query_row(
+                "SELECT status FROM job_scores WHERE job_id = ?1",
+                params![job_id],
+                |row| row.get(0),
+            )
             .optional()?;
         Ok(status)
     }
@@ -626,9 +636,11 @@ impl Db {
     pub fn job_status(&self, job_id: i64) -> Result<Option<JobStatus>, DbError> {
         let conn = self.conn.lock().unwrap();
         let status = conn
-            .query_row("SELECT status FROM jobs WHERE id = ?1", params![job_id], |row| {
-                row.get::<_, String>(0)
-            })
+            .query_row(
+                "SELECT status FROM jobs WHERE id = ?1",
+                params![job_id],
+                |row| row.get::<_, String>(0),
+            )
             .optional()?;
         Ok(status.as_deref().map(JobStatus::parse))
     }
@@ -701,7 +713,17 @@ impl Db {
         for row in rows {
             let (mut listing, keywords, score) = row?;
             let keywords: Vec<String> = serde_json::from_str(&keywords)?;
-            if let Some((status, score, summary, requirements, model, error, profile_id, updated_at)) = score {
+            if let Some((
+                status,
+                score,
+                summary,
+                requirements,
+                model,
+                error,
+                profile_id,
+                updated_at,
+            )) = score
+            {
                 listing.score = Some(JobScore {
                     status,
                     score: score.map(|s| s.clamp(0, 100) as u8),
@@ -781,6 +803,12 @@ impl Db {
         "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![key, value],
     )?;
+        Ok(())
+    }
+
+    pub fn delete_setting(&self, key: &str) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
         Ok(())
     }
 
@@ -1047,14 +1075,24 @@ mod tests {
         assert!(store.current_confirmed_profile().unwrap().is_none());
 
         let resume = store
-            .save_resume("cv.pdf", b"%PDF-1", &PdfInfo { page_count: 1, text: "cv".into() })
+            .save_resume(
+                "cv.pdf",
+                b"%PDF-1",
+                &PdfInfo {
+                    page_count: 1,
+                    text: "cv".into(),
+                },
+            )
             .unwrap();
         let profile_id = store.start_profile(&resume.uploaded_at, "fake").unwrap();
         let profile = ResumeProfile::default();
         store.finish_profile(profile_id, &profile, &[]).unwrap();
         assert!(store.current_confirmed_profile().unwrap().is_none());
         store.confirm_profile(profile_id).unwrap();
-        assert_eq!(store.current_confirmed_profile().unwrap().unwrap().id, profile_id);
+        assert_eq!(
+            store.current_confirmed_profile().unwrap().unwrap().id,
+            profile_id
+        );
 
         let detail = JobDetail {
             description: "Rust".into(),
@@ -1064,8 +1102,13 @@ mod tests {
         };
         let job = store.upsert_job(&card("1"), Some(&detail), None).unwrap();
         let undescribed = store.upsert_job(&card("2"), None, None).unwrap();
-        store.set_jobs_status(&[job, undescribed], JobStatus::Saved).unwrap();
-        assert_eq!(store.next_job_to_score(profile_id).unwrap().unwrap().job_id, job);
+        store
+            .set_jobs_status(&[job, undescribed], JobStatus::Saved)
+            .unwrap();
+        assert_eq!(
+            store.next_job_to_score(profile_id).unwrap().unwrap().job_id,
+            job
+        );
 
         store.start_score(job, profile_id, "fake").unwrap();
         assert!(store.next_job_to_score(profile_id).unwrap().is_none());
@@ -1079,16 +1122,29 @@ mod tests {
         }];
         store.finish_score(job, 80, "Good fit.", &reqs).unwrap();
         assert!(store.next_job_to_score(profile_id).unwrap().is_none());
-        assert_eq!(store.next_job_to_score(profile_id + 1).unwrap().unwrap().job_id, job);
+        assert_eq!(
+            store
+                .next_job_to_score(profile_id + 1)
+                .unwrap()
+                .unwrap()
+                .job_id,
+            job
+        );
 
         let search = store.create_search(&criteria("Backend Engineer")).unwrap();
         store.add_match(search.id, job, &[]).unwrap();
         let listed = store.list_jobs(None).unwrap();
         let score = listed[0].score.as_ref().unwrap();
-        assert_eq!((score.status.as_str(), score.score, score.requirements.len()), ("ready", Some(80), 1));
+        assert_eq!(
+            (score.status.as_str(), score.score, score.requirements.len()),
+            ("ready", Some(80), 1)
+        );
 
         store.clear_score(job).unwrap();
-        assert_eq!(store.next_job_to_score(profile_id).unwrap().unwrap().job_id, job);
+        assert_eq!(
+            store.next_job_to_score(profile_id).unwrap().unwrap().job_id,
+            job
+        );
         store.set_job_status(job, JobStatus::New).unwrap();
         assert!(store.next_job_to_score(profile_id).unwrap().is_none());
 
@@ -1104,7 +1160,10 @@ mod tests {
         store.start_score(job, profile_id, "fake").unwrap();
         store.requeue_interrupted_scores().unwrap();
         assert_eq!(store.score_status(job).unwrap(), None);
-        assert_eq!(store.next_job_to_score(profile_id).unwrap().unwrap().job_id, job);
+        assert_eq!(
+            store.next_job_to_score(profile_id).unwrap().unwrap().job_id,
+            job
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1119,8 +1178,12 @@ mod tests {
         };
         let paused_job = store.upsert_job(&card("1"), Some(&detail), None).unwrap();
         let enabled_job = store.upsert_job(&card("2"), Some(&detail), None).unwrap();
-        store.set_jobs_status(&[enabled_job], JobStatus::Saved).unwrap();
-        store.set_jobs_status(&[paused_job], JobStatus::Saved).unwrap();
+        store
+            .set_jobs_status(&[enabled_job], JobStatus::Saved)
+            .unwrap();
+        store
+            .set_jobs_status(&[paused_job], JobStatus::Saved)
+            .unwrap();
 
         let paused = store.create_search(&criteria("Backend Engineer")).unwrap();
         let enabled = store.create_search(&criteria("Platform Engineer")).unwrap();
@@ -1128,9 +1191,15 @@ mod tests {
         store.add_match(paused.id, paused_job, &[]).unwrap();
         store.add_match(enabled.id, enabled_job, &[]).unwrap();
 
-        assert_eq!(store.next_job_to_score(1).unwrap().unwrap().job_id, enabled_job);
+        assert_eq!(
+            store.next_job_to_score(1).unwrap().unwrap().job_id,
+            enabled_job
+        );
         store.set_search_enabled(enabled.id, false).unwrap();
-        assert_eq!(store.next_job_to_score(1).unwrap().unwrap().job_id, paused_job);
+        assert_eq!(
+            store.next_job_to_score(1).unwrap().unwrap().job_id,
+            paused_job
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1195,7 +1264,10 @@ mod tests {
         store
             .update_search(a.id, &criteria("Backend Engineer"))
             .unwrap();
-        assert_eq!(store.list_jobs(None).unwrap()[0].search_ids, vec![a.id, b.id]);
+        assert_eq!(
+            store.list_jobs(None).unwrap()[0].search_ids,
+            vec![a.id, b.id]
+        );
 
         store.set_job_status(id, JobStatus::New).unwrap();
         store
@@ -1226,8 +1298,23 @@ mod tests {
         assert_eq!((last.status.as_str(), last.new_matches), ("ok", 3));
         assert!(store.last_scan_run(Site::Indeed).unwrap().is_none());
         let indeed = store.start_scan_run(Site::Indeed).unwrap();
-        assert_eq!(store.last_scan_run(Site::Indeed).unwrap().unwrap().id, indeed);
-        assert_eq!(store.last_scan_run(Site::LinkedIn).unwrap().unwrap().id, run);
+        assert_eq!(
+            store.last_scan_run(Site::Indeed).unwrap().unwrap().id,
+            indeed
+        );
+        assert_eq!(
+            store.last_scan_run(Site::LinkedIn).unwrap().unwrap().id,
+            run
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn delete_setting_removes_saved_value() {
+        let (store, dir) = temp_job_store();
+        store.set_setting("k", "value").unwrap();
+        store.delete_setting("k").unwrap();
+        assert_eq!(store.get_setting("k").unwrap(), None);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1296,11 +1383,19 @@ mod tests {
         let search = store.create_search(&criteria("Backend Engineer")).unwrap();
         store.add_match(search.id, job, &[]).unwrap();
 
-        assert_eq!(store.companies_missing_site(8).unwrap(), vec![company.to_string()]);
-        store.save_company_site(company, Some("https://acme.com/")).unwrap();
+        assert_eq!(
+            store.companies_missing_site(8).unwrap(),
+            vec![company.to_string()]
+        );
+        store
+            .save_company_site(company, Some("https://acme.com/"))
+            .unwrap();
         assert!(store.companies_missing_site(8).unwrap().is_empty());
         let listed = store.list_jobs(None).unwrap();
-        assert_eq!(listed[0].company_website.as_deref(), Some("https://acme.com/"));
+        assert_eq!(
+            listed[0].company_website.as_deref(),
+            Some("https://acme.com/")
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

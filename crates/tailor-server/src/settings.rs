@@ -1,11 +1,15 @@
-use axum::{extract::Extension, routing::get, Json, Router};
+use axum::{
+    extract::{Extension, Path},
+    routing::get,
+    Json, Router,
+};
 use serde::{Deserialize, Serialize};
 use tailor_core::{
-    parse_stage::{ollama_status, DEFAULT_MODEL, MODEL_KEY, OLLAMA_URL_KEY},
+    parse_stage::{ai_step_config, ollama_status, DEFAULT_MODEL, MODEL_KEY, OLLAMA_URL_KEY},
     scrape_stage::{
         interval_key, interval_minutes, ScrapeMessage, MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES,
     },
-    types::{OllamaStatus, Site},
+    types::{AiStep, AiStepConfig, OllamaStatus, Site},
 };
 
 use super::{errors::AppError, AppState, UserServices};
@@ -14,6 +18,79 @@ pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/ai", get(ai_status).put(update_ai_settings))
         .route("/settings", get(get_settings).put(update_settings))
+        .route("/workflow/ai-steps", get(get_ai_steps))
+        .route(
+            "/workflow/ai-steps/{step}",
+            axum::routing::put(update_ai_step),
+        )
+        .route(
+            "/workflow/ai-steps/{step}/prompt",
+            axum::routing::delete(reset_ai_prompt),
+        )
+}
+
+async fn get_ai_steps(
+    Extension(state): Extension<std::sync::Arc<UserServices>>,
+) -> Result<Json<Vec<AiStepConfig>>, AppError> {
+    AiStep::ALL
+        .into_iter()
+        .map(|step| ai_step_config(&state.store, step).map_err(AppError::from))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+}
+
+#[derive(Deserialize)]
+struct AiStepUpdate {
+    model: Option<String>,
+    prompt: Option<String>,
+}
+
+async fn update_ai_step(
+    Extension(state): Extension<std::sync::Arc<UserServices>>,
+    Path(step): Path<String>,
+    Json(update): Json<AiStepUpdate>,
+) -> Result<Json<AiStepConfig>, AppError> {
+    let step = AiStep::parse(&step).ok_or_else(|| AppError::not_found_msg("Unknown step."))?;
+    let model = update.model.as_deref().map(str::trim);
+    let prompt = update.prompt.as_deref().map(str::trim);
+    if let Some(model) = model {
+        if model.is_empty() || model.chars().count() > 200 {
+            return Err(AppError::bad_request("Model must be 1 to 200 characters."));
+        }
+    }
+    if let Some(prompt) = prompt {
+        if prompt.is_empty() || prompt.chars().count() > 20_000 {
+            return Err(AppError::bad_request(
+                "Prompt must be 1 to 20,000 characters.",
+            ));
+        }
+    }
+    let current = if prompt.is_some() {
+        Some(ai_step_config(&state.store, step)?)
+    } else {
+        None
+    };
+    if let Some(model) = model {
+        state.store.set_setting(step.model_key(), model)?;
+    }
+    if let Some(prompt) = prompt {
+        let current = current.unwrap();
+        if prompt == current.default_prompt {
+            state.store.delete_setting(step.prompt_key())?;
+        } else {
+            state.store.set_setting(step.prompt_key(), prompt)?;
+        }
+    }
+    Ok(Json(ai_step_config(&state.store, step)?))
+}
+
+async fn reset_ai_prompt(
+    Extension(state): Extension<std::sync::Arc<UserServices>>,
+    Path(step): Path<String>,
+) -> Result<Json<AiStepConfig>, AppError> {
+    let step = AiStep::parse(&step).ok_or_else(|| AppError::not_found_msg("Unknown step."))?;
+    state.store.delete_setting(step.prompt_key())?;
+    Ok(Json(ai_step_config(&state.store, step)?))
 }
 
 #[derive(Debug, Serialize)]

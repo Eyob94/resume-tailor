@@ -146,6 +146,17 @@ export interface Settings {
   indeed_scan_interval_minutes: number;
 }
 
+export type AiStep = "read_resume" | "score_jobs";
+
+export interface AiStepConfig {
+  step: AiStep;
+  model: string;
+  prompt: string;
+  default_prompt: string;
+  prompt_is_default: boolean;
+  input_template: string;
+}
+
 const json = (body: unknown): RequestInit => ({
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify(body),
@@ -163,10 +174,22 @@ export const jobsApi = {
     request<{ updated: number }>("/jobs/status", { method: "POST", ...json({ ids, status }) }),
   rescore: (id: number) => request<void>(`/jobs/${id}/score`, { method: "POST" }),
   skipScore: (id: number) => request<void>(`/jobs/${id}/score`, { method: "DELETE" }),
-  scanStatus: () => request<ScanStatus[]>("/scan"),
+  scanStatus: async () => {
+    const status: unknown = await request<unknown>("/scan");
+    if (!Array.isArray(status)) throw new ApiError("The server returned an invalid scan status response.", 500);
+    return status as ScanStatus[];
+  },
   runScan: (site: Site) => request<void>(`/scan/${site}/run`, { method: "POST" }),
   getSettings: () => request<Settings>("/settings"),
   updateSettings: (settings: Settings) => request<Settings>("/settings", { method: "PUT", ...json(settings) }),
+};
+
+export const workflowApi = {
+  aiSteps: () => request<AiStepConfig[]>("/workflow/ai-steps"),
+  updateAiStep: (step: AiStep, update: { model?: string; prompt?: string }) =>
+    request<AiStepConfig>(`/workflow/ai-steps/${step}`, { method: "PUT", ...json(update) }),
+  resetPrompt: (step: AiStep) =>
+    request<AiStepConfig>(`/workflow/ai-steps/${step}/prompt`, { method: "DELETE" }),
 };
 
 export interface Bullet {
