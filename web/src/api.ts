@@ -174,7 +174,11 @@ export const jobsApi = {
     request<{ updated: number }>("/jobs/status", { method: "POST", ...json({ ids, status }) }),
   rescore: (id: number) => request<void>(`/jobs/${id}/score`, { method: "POST" }),
   skipScore: (id: number) => request<void>(`/jobs/${id}/score`, { method: "DELETE" }),
-  scanStatus: () => request<ScanStatus[]>("/scan"),
+  scanStatus: async () => {
+    const status: unknown = await request<unknown>("/scan");
+    if (!Array.isArray(status)) throw new ApiError("The server returned an invalid scan status response.", 500);
+    return status as ScanStatus[];
+  },
   runScan: (site: Site) => request<void>(`/scan/${site}/run`, { method: "POST" }),
   getSettings: () => request<Settings>("/settings"),
   updateSettings: (settings: Settings) => request<Settings>("/settings", { method: "PUT", ...json(settings) }),

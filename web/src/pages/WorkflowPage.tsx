@@ -1,28 +1,88 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Check, ChevronDown, ChevronRight } from "lucide-react";
+import {
+  Background,
+  BackgroundVariant,
+  Controls,
+  Handle,
+  MarkerType,
+  Panel,
+  Position,
+  ReactFlow,
+  type Edge,
+  type Node,
+  type NodeProps,
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
+import {
+  Brain,
+  Check,
+  FileDown,
+  Filter,
+  Gauge,
+  PenLine,
+  ScanText,
+  Search,
+  Upload,
+  Workflow,
+  X,
+} from "lucide-react";
 import { errorMessage, jobsApi, profileApi, workflowApi, type AiStep, type AiStepConfig, type Settings } from "../api";
 import { Dialog } from "../components/Dialog";
-import { Alert, Button, ButtonLink, Card, PageHeader } from "../components/ui";
+import { Alert, Button, ButtonLink } from "../components/ui";
 
 type StepId = "find_jobs" | "match_jobs" | "score_jobs" | "tailor_resume" | "make_pdf" | "upload_resume" | "read_resume" | "brain";
-type Step = { id: StepId; title: string; subtitle: string; lane: "Jobs" | "Resume"; kind: "plain" | "ai" | "planned" };
+type StepKind = "plain" | "ai" | "planned";
+type StepNodeData = { id?: StepId; title?: string; subtitle?: string; kind?: StepKind; model?: string; selected?: boolean; onHover?: (hovered: boolean) => void; label?: string };
 
-const steps: Step[] = [
-  { id: "find_jobs", title: "Find jobs", subtitle: "LinkedIn and Indeed", lane: "Jobs", kind: "plain" },
-  { id: "match_jobs", title: "Match jobs", subtitle: "Titles and keywords", lane: "Jobs", kind: "plain" },
-  { id: "score_jobs", title: "Score jobs", subtitle: "AI", lane: "Jobs", kind: "ai" },
-  { id: "tailor_resume", title: "Tailor resume", subtitle: "Not built yet", lane: "Jobs", kind: "planned" },
-  { id: "make_pdf", title: "Make PDF", subtitle: "Not built yet", lane: "Jobs", kind: "planned" },
-  { id: "upload_resume", title: "Upload resume", subtitle: "PDF to text", lane: "Resume", kind: "plain" },
-  { id: "read_resume", title: "Read resume", subtitle: "AI", lane: "Resume", kind: "ai" },
-  { id: "brain", title: "Brain", subtitle: "Not built yet", lane: "Resume", kind: "planned" },
+const steps: { id: StepId; title: string; subtitle: string; kind: StepKind; x: number; y: number; icon: typeof Search }[] = [
+  { id: "find_jobs", title: "Find jobs", subtitle: "LinkedIn and Indeed", kind: "plain", x: 0, y: 0, icon: Search },
+  { id: "match_jobs", title: "Match jobs", subtitle: "Titles and keywords", kind: "plain", x: 280, y: 0, icon: Filter },
+  { id: "score_jobs", title: "Score jobs", subtitle: "AI", kind: "ai", x: 560, y: 0, icon: Gauge },
+  { id: "tailor_resume", title: "Tailor resume", subtitle: "Not built yet", kind: "planned", x: 840, y: 0, icon: PenLine },
+  { id: "make_pdf", title: "Make PDF", subtitle: "Not built yet", kind: "planned", x: 1120, y: 0, icon: FileDown },
+  { id: "upload_resume", title: "Upload resume", subtitle: "PDF to text", kind: "plain", x: 280, y: 220, icon: Upload },
+  { id: "read_resume", title: "Read resume", subtitle: "AI", kind: "ai", x: 560, y: 220, icon: ScanText },
+  { id: "brain", title: "Brain", subtitle: "Not built yet", kind: "planned", x: 840, y: 220, icon: Brain },
 ];
 
 const aiFor: Partial<Record<StepId, AiStep>> = { read_resume: "read_resume", score_jobs: "score_jobs" };
+const stepById = Object.fromEntries(steps.map((step) => [step.id, step])) as Record<StepId, (typeof steps)[number]>;
+
+function StepNode({ data }: NodeProps<Node<StepNodeData>>) {
+  if (!data.id) return <span className="text-xs font-semibold text-zinc-500">{data.label}</span>;
+  const Icon = stepById[data.id].icon;
+  const planned = data.kind === "planned";
+  const ai = data.kind === "ai";
+  return (
+    <div
+      aria-disabled={planned ? "true" : undefined}
+      onMouseEnter={() => data.onHover?.(true)}
+      onMouseLeave={() => data.onHover?.(false)}
+      className={`relative flex h-[76px] w-[220px] items-center gap-3 rounded-xl border px-3 shadow-sm ${planned ? "cursor-not-allowed border-dashed border-zinc-300 bg-white opacity-50" : ai ? "cursor-pointer border-violet-200 border-l-4 border-l-violet-500 bg-violet-50" : "cursor-pointer border-zinc-200 bg-white"} ${data.selected ? "ring-2 ring-zinc-900" : ""}`}
+    >
+      <Handle type="target" position={Position.Left} className="!size-2 !border-0 !bg-zinc-400 !opacity-0" />
+      <Handle type="source" position={Position.Right} className="!size-2 !border-0 !bg-zinc-400 !opacity-0" />
+      <Handle type="target" position={Position.Top} id="top-target" className="!size-2 !border-0 !bg-zinc-400 !opacity-0" />
+      <Handle type="source" position={Position.Bottom} id="bottom-source" className="!size-2 !border-0 !bg-zinc-400 !opacity-0" />
+      <span className={`flex size-10 shrink-0 items-center justify-center rounded-lg ${ai ? "bg-violet-100 text-violet-700" : planned ? "bg-zinc-100 text-zinc-400" : "bg-zinc-100 text-zinc-700"}`}>
+        <Icon className="size-5" />
+      </span>
+      <span className="min-w-0">
+        <span className="block truncate text-sm font-semibold text-zinc-900">{data.title}</span>
+        <span className={`mt-0.5 block truncate text-xs ${ai ? "text-violet-700" : "text-zinc-500"}`}>{ai ? data.model || "Loading model…" : data.subtitle}</span>
+      </span>
+      {ai && <span className="absolute right-2 top-2 rounded-full bg-violet-100 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-violet-700">AI</span>}
+    </div>
+  );
+}
+
+const nodeTypes = { step: StepNode, lane: StepNode };
 
 export function WorkflowPage() {
   const [params, setParams] = useSearchParams();
+  const [phoneWidth, setPhoneWidth] = useState(() => window.matchMedia("(max-width: 639px)").matches);
+  const [pointerOverNode, setPointerOverNode] = useState(false);
   const selected = params.get("step") as StepId | null;
   const [configs, setConfigs] = useState<AiStepConfig[]>([]);
   const [aiReachable, setAiReachable] = useState(false);
@@ -40,7 +100,14 @@ export function WorkflowPage() {
     jobsApi.getSettings().then(setIntervals, (e) => setError(errorMessage(e)));
   }, []);
 
-  const current = steps.find((step) => step.id === selected);
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 639px)");
+    const update = () => setPhoneWidth(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
+  const current = selected ? stepById[selected] : undefined;
   const aiStep = current ? aiFor[current.id] : undefined;
   const config = aiStep ? configs.find((item) => item.step === aiStep) : undefined;
   const dirty = Boolean(config && promptDraft !== config.prompt);
@@ -49,20 +116,31 @@ export function WorkflowPage() {
     if (config) setPromptDraft(config.prompt);
   }, [config?.step, config?.prompt]);
 
-  const changeStep = (id: StepId | null) => {
+  const changeStep = useCallback((id: StepId | null) => {
     const next = new URLSearchParams(params);
     if (id) next.set("step", id);
     else next.delete("step");
     setParams(next);
-  };
+  }, [params, setParams]);
 
-  const requestSelect = (id: StepId) => {
+  const requestSelect = useCallback((id: StepId) => {
     if (dirty) {
       setPendingStep(id);
       return;
     }
     changeStep(id);
-  };
+  }, [changeStep, dirty]);
+
+  const onPaneClick = useCallback(() => {
+    if (!selected) return;
+    if (dirty) setPendingStep(null);
+    else changeStep(null);
+  }, [changeStep, dirty, selected]);
+
+  const onNodeClick = useCallback((_event: React.MouseEvent, node: Node<StepNodeData>) => {
+    const id = node.data.id;
+    if (id && stepById[id].kind !== "planned") requestSelect(id);
+  }, [requestSelect]);
 
   async function saveModel(step: AiStep, model: string) {
     try {
@@ -112,64 +190,95 @@ export function WorkflowPage() {
     }
   }
 
-  function lane(name: "Jobs" | "Resume") {
-    const laneSteps = steps.filter((step) => step.lane === name);
-    return (
-      <section aria-label={`${name} workflow`} className="mb-5">
-        <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500">{name}</h2>
-        <div className="overflow-x-auto pb-1">
-          <div className="flex min-w-0 flex-col gap-2 md:min-w-max md:flex-row md:items-stretch md:gap-0">
-          {laneSteps.map((step, index) => {
-            const stepConfig = aiFor[step.id] ? configs.find((item) => item.step === aiFor[step.id]) : undefined;
-            const selectedStyle = selected === step.id ? "ring-2 ring-zinc-900" : "";
-            const style = step.kind === "ai" ? "border-violet-200 bg-violet-50" : step.kind === "planned" ? "border-dashed border-zinc-300 opacity-50" : "border-zinc-200 bg-white";
-            return (
-              <div key={step.id} className="flex flex-col gap-2 md:flex-row md:items-center md:gap-1">
-                {index > 0 && <ChevronDown className="mx-auto size-4 text-zinc-400 md:hidden" />}
-                {index > 0 && <ChevronRight className="hidden size-4 shrink-0 text-zinc-400 md:block" />}
-                <button
-                  type="button"
-                  aria-disabled={step.kind === "planned" ? "true" : undefined}
-                  disabled={step.kind === "planned"}
-                  onClick={() => requestSelect(step.id)}
-                  className={`min-w-0 flex-1 rounded-xl border p-3 text-left ${style} ${selectedStyle} ${step.kind === "planned" ? "cursor-not-allowed" : "transition-shadow hover:shadow-sm"} md:w-[104px] md:flex-none`}
-                >
-                  <span className="flex items-center justify-between gap-2">
-                    <span className="truncate text-xs font-medium text-zinc-900 md:text-[11px]">{step.title}</span>
-                  </span>
-                  <span className="mt-1 block truncate text-xs text-zinc-500">{step.kind === "ai" ? <span className="rounded-full bg-violet-100 px-2 py-0.5 text-[10px] font-semibold text-violet-800">{step.subtitle}</span> : step.kind === "planned" ? <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-[10px] text-zinc-500">{step.subtitle}</span> : step.subtitle}</span>
-                  {stepConfig && <span className="mt-2 block truncate text-xs font-medium text-violet-800">{stepConfig.model}</span>}
-                  {step.id === "score_jobs" && <span className="mt-2 inline-block rounded bg-white/80 px-2 py-1 text-[10px] text-zinc-600">Uses: Read resume</span>}
-                  {step.id === "tailor_resume" && <span className="mt-2 inline-block rounded bg-white/80 px-2 py-1 text-[10px] text-zinc-600">Uses: Brain</span>}
-                </button>
-              </div>
-            );
-          })}
-          </div>
-        </div>
-      </section>
-    );
-  }
+  const nodes = useMemo<Node<StepNodeData>[]>(() => [
+    { id: "lane-jobs", type: "lane", position: { x: -90, y: 24 }, data: { label: "Jobs" }, draggable: false, selectable: false, style: { border: 0, background: "transparent", padding: 0, boxShadow: "none" } },
+    { id: "lane-resume", type: "lane", position: { x: 180, y: 244 }, data: { label: "Resume" }, draggable: false, selectable: false, style: { border: 0, background: "transparent", padding: 0, boxShadow: "none" } },
+    ...steps.map((step) => {
+      const stepConfig = aiFor[step.id] ? configs.find((item) => item.step === aiFor[step.id]) : undefined;
+      return {
+        id: step.id,
+        type: "step",
+        position: { x: step.x, y: step.y },
+        data: { id: step.id, title: step.title, subtitle: step.subtitle, kind: step.kind, model: stepConfig?.model, selected: selected === step.id, onHover: setPointerOverNode },
+        draggable: false,
+        selectable: false,
+      };
+    }),
+  ], [configs, selected]);
+
+  const edges = useMemo<Edge[]>(() => {
+    const links: [StepId, StepId, boolean?][] = [
+      ["find_jobs", "match_jobs"],
+      ["match_jobs", "score_jobs"],
+      ["score_jobs", "tailor_resume"],
+      ["tailor_resume", "make_pdf"],
+      ["upload_resume", "read_resume"],
+      ["read_resume", "brain"],
+      ["read_resume", "score_jobs", true],
+      ["brain", "tailor_resume", true],
+    ];
+    return links.map(([source, target, crossLane]) => {
+      const planned = stepById[source].kind === "planned" || stepById[target].kind === "planned";
+      const vertical = crossLane || (stepById[source].x === stepById[target].x && stepById[source].y !== stepById[target].y);
+      return {
+        id: `${source}-${target}`,
+        source,
+        target,
+        sourceHandle: vertical ? "bottom-source" : undefined,
+        targetHandle: vertical ? "top-target" : undefined,
+        type: "smoothstep",
+        animated: Boolean(crossLane),
+        markerEnd: { type: MarkerType.ArrowClosed, color: planned ? "#d4d4d8" : "#a1a1aa", width: 16, height: 16 },
+        style: { stroke: planned ? "#d4d4d8" : "#a1a1aa", strokeWidth: 1.5, ...(planned ? { strokeDasharray: "6 4" } : {}) },
+      };
+    });
+  }, []);
 
   return (
-    <>
-      <PageHeader title="Workflow" description="How the app finds jobs and uses your resume. Click a step to change it." />
-      {error && <Alert onDismiss={() => setError(null)}>{error}</Alert>}
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_400px]">
-        <div>
-          {lane("Jobs")}
-          {lane("Resume")}
-          <div className="flex flex-wrap gap-x-5 gap-y-2 pt-1 text-xs text-zinc-500">
-            <span className="inline-flex items-center gap-1.5"><span className="size-3 rounded border border-violet-200 bg-violet-50" />AI step</span>
-            <span className="inline-flex items-center gap-1.5"><span className="size-3 rounded border border-zinc-300 bg-white" />Runs without AI</span>
-            <span className="inline-flex items-center gap-1.5"><span className="size-3 rounded border border-dashed border-zinc-300 opacity-60" />Not built yet</span>
-          </div>
+    <div className="-mx-4 -mt-6 flex h-[calc(100dvh-4rem)] min-h-[520px] flex-col overflow-hidden sm:-mx-6 lg:-mx-8">
+      <header className="z-10 flex shrink-0 items-center justify-between gap-4 border-b border-zinc-200 bg-white px-4 py-3 sm:px-6">
+        <div className="flex min-w-0 items-center gap-3">
+          <Workflow className="size-5 shrink-0 text-zinc-700" />
+          <div className="min-w-0"><h1 className="text-base font-semibold text-zinc-900">Workflow</h1><p className="truncate text-xs text-zinc-500 sm:text-sm">How the app finds jobs and uses your resume. Click a step to change it.</p></div>
         </div>
-        <Card className="min-h-64 p-5">
-          {!current ? <p className="text-sm text-zinc-500">Pick a step to see its settings.</p> : <>
-            <div className="mb-4 flex items-start justify-between gap-3">
-              <div><h2 className="font-semibold">{current.title}</h2><p className="mt-1 text-sm text-zinc-500">{current.subtitle}</p></div>
-              <button type="button" onClick={() => dirty ? setPendingStep(null) : changeStep(null)} className="text-xs text-zinc-400 hover:text-zinc-700" aria-label="Clear selection">Clear</button>
+      </header>
+      {error && <div className="shrink-0 px-4 pt-2 sm:px-6"><Alert onDismiss={() => setError(null)}>{error}</Alert></div>}
+      <div className="relative min-h-0 flex-1">
+        <ReactFlow
+          nodes={nodes}
+          edges={edges}
+          nodeTypes={nodeTypes}
+          fitView
+          fitViewOptions={{ padding: phoneWidth ? 0.04 : 0.24, minZoom: phoneWidth ? 0.12 : 0.35, maxZoom: 1 }}
+          minZoom={0.25}
+          maxZoom={1.5}
+          nodesDraggable={false}
+          nodesConnectable={false}
+          elementsSelectable={false}
+          zoomOnScroll
+          zoomOnPinch
+          proOptions={{ hideAttribution: true }}
+          onPaneClick={onPaneClick}
+          onNodeClick={onNodeClick}
+          panOnDrag={!pointerOverNode}
+          className="bg-zinc-50"
+        >
+          <Background variant={BackgroundVariant.Dots} gap={20} size={1.5} color="#e4e4e7" />
+          <Controls showInteractive={false} position="bottom-left" />
+          <Panel position="top-left" className="m-3 rounded-xl border border-zinc-200 bg-white/95 p-3 shadow-sm">
+            <div className="space-y-2 text-xs text-zinc-600">
+              <div className="flex items-center gap-2"><span className="size-3 rounded border border-violet-200 bg-violet-50" />AI step</div>
+              <div className="flex items-center gap-2"><span className="size-3 rounded border border-zinc-300 bg-white" />Runs without AI</div>
+              <div className="flex items-center gap-2"><span className="size-3 rounded border border-dashed border-zinc-300 opacity-60" />Not built yet</div>
+            </div>
+          </Panel>
+        </ReactFlow>
+        {current && <>
+          <div className="fixed inset-0 z-20 hidden bg-black/10 lg:block" onClick={onPaneClick} />
+          <aside className="absolute inset-x-0 bottom-0 z-30 h-[70%] overflow-y-auto rounded-t-2xl border-t border-zinc-200 bg-white p-5 shadow-2xl lg:fixed lg:inset-y-0 lg:right-0 lg:left-auto lg:h-full lg:w-[420px] lg:rounded-none lg:border-l lg:border-t-0 lg:p-6">
+            <div className="mb-5 flex items-start justify-between gap-4">
+              <div><h2 className="text-lg font-semibold text-zinc-900">{current.title}</h2><p className="mt-1 text-sm text-zinc-500">{current.subtitle}</p></div>
+              <button type="button" onClick={() => dirty ? setPendingStep(null) : changeStep(null)} className="rounded-lg p-2 text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900" aria-label="Close settings"><X className="size-5" /></button>
             </div>
             {current.id === "find_jobs" && <div className="space-y-4 text-sm">
               <p>Finds jobs from enabled preferences on LinkedIn and Indeed.</p>
@@ -187,11 +296,11 @@ export function WorkflowPage() {
               <div><h3 className="mb-1 text-xs font-semibold text-zinc-700">What this step receives</h3><pre className="overflow-x-auto whitespace-pre-wrap rounded-lg bg-zinc-50 p-3 font-mono text-xs text-zinc-600">{config.input_template}</pre></div>
               <p className="text-xs text-zinc-500">The output format is fixed so the app can read the answer.</p>
             </div>}
-          </>}
-        </Card>
+          </aside>
+        </>}
       </div>
       {pendingStep !== null && <Dialog title="Discard your prompt changes?" onClose={() => setPendingStep(null)} actions={<><Button onClick={() => setPendingStep(null)}>Keep editing</Button><Button variant="primary" onClick={() => { changeStep(pendingStep); setPendingStep(null); }}>Discard</Button></>}><p>Your unsaved prompt changes will be lost.</p></Dialog>}
       {confirmReset && <Dialog title="Reset to default?" onClose={() => setConfirmReset(false)} actions={<><Button onClick={() => setConfirmReset(false)}>Cancel</Button><Button variant="primary" onClick={resetPrompt}>Reset to default</Button></>}><p>This replaces the saved prompt with the original prompt.</p></Dialog>}
-    </>
+    </div>
   );
 }
