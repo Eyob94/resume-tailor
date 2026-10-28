@@ -1216,7 +1216,8 @@ fn clean_text(el: ElementRef) -> String {
 }
 
 fn without_query(url: &str) -> String {
-    url.split(['?', '#']).next().unwrap_or(url).to_string()
+    let base = url.split(['?', '#']).next().unwrap_or(url);
+    base.replacen("://ae.linkedin.com", "://www.linkedin.com", 1)
 }
 
 pub fn parse_search_results(html: &str) -> Vec<JobCard> {
@@ -1905,10 +1906,10 @@ mod linkedin_tests {
                 source_id: "4362132219".into(),
                 title: "Senior Software Engineer- Backend".into(),
                 company: "talabat".into(),
-                company_url: Some("https://ae.linkedin.com/company/talabat-com".into()),
+                company_url: Some("https://www.linkedin.com/company/talabat-com".into()),
                 location: "Dubai, Dubai, United Arab Emirates".into(),
                 posted_on: Some("2026-10-13".into()),
-                url: "https://ae.linkedin.com/jobs/view/senior-software-engineer-backend-at-talabat-4362132219".into(),
+                url: "https://www.linkedin.com/jobs/view/senior-software-engineer-backend-at-talabat-4362132219".into(),
             }
         );
         assert_eq!(cards[1].title, "Backend Architect - Pay&Card Tech");
