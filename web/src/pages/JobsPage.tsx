@@ -44,6 +44,7 @@ import {
 } from "../api";
 import { Dialog } from "../components/Dialog";
 import { JsonView } from "../components/JsonView";
+import { KeyBanner } from "../components/KeyBanner";
 import { SearchForm, WORK_MODE_LABELS } from "../components/SearchForm";
 import { Alert, Button, Card, EmptyState, Menu, PageHeader, Skeleton } from "../components/ui";
 import { useDevMode } from "../devMode";
@@ -286,6 +287,7 @@ export function JobsPage() {
           ) : null
         }
       />
+      <KeyBanner />
       {error && <Alert onDismiss={() => setError(null)}>{error}</Alert>}
 
       {searches === null ? (

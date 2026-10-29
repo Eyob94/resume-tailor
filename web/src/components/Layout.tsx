@@ -21,27 +21,13 @@ function Brand() {
 }
 
 export function Layout() {
-  const [username, setUsername] = useState("");
-
-  useEffect(() => {
-    api.currentUser().then((user) => setUsername(user.username), () => setUsername(""));
-  }, []);
-
-  async function signOut() {
-    await api.logout().catch(() => undefined);
-    window.location.assign("/login");
-  }
-
   return (
     <div className="flex min-h-screen flex-col md:flex-row">
       <FanNav items={nav} />
 
       <aside className="sticky top-0 hidden h-screen w-60 shrink-0 flex-col border-r border-zinc-200 bg-white md:flex">
-        <div className="flex items-center justify-between px-5 py-5">
+        <div className="px-5 py-5">
           <Brand />
-          <button onClick={signOut} title={username ? `Signed in as ${username}` : "Sign out"} className="text-xs text-zinc-500 hover:text-zinc-900">
-            {username || "Sign out"}
-          </button>
         </div>
         <nav className="flex flex-col gap-1 px-3">
           {nav.map(({ to, label, icon: Icon, end }) => (

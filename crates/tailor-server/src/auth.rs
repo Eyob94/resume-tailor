@@ -3,10 +3,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
-    Argon2,
-};
 use axum::{
     extract::{Extension, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
@@ -15,7 +11,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use rand::RngCore;
+use rand::{rngs::OsRng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Executor, PgPool, Postgres};
@@ -24,16 +20,14 @@ use crate::{errors::AppError, AppState, UserServices};
 
 const SESSION_COOKIE: &str = "resume_tailor_session";
 const SESSION_SECONDS: u64 = 60 * 60 * 24 * 30;
+const KEY_ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 #[derive(Clone)]
 pub struct AuthStore(PgPool);
 
 #[derive(Debug)]
 pub enum AuthError {
-    InvalidCredentials,
-    UserExists,
     Database(sqlx::Error),
-    PasswordHash,
 }
 
 impl AuthStore {
@@ -41,50 +35,43 @@ impl AuthStore {
         Self(pool)
     }
 
-    pub async fn register(
-        &self,
-        username: &str,
-        password: &str,
-    ) -> Result<(i64, String), AuthError> {
-        let salt = SaltString::generate(&mut OsRng);
-        let password_hash = Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
-            .map_err(|_| AuthError::PasswordHash)?
-            .to_string();
+    pub async fn create_key_account(&self) -> Result<(i64, String, String), AuthError> {
+        let key = new_key();
         let mut tx = self.0.begin().await.map_err(AuthError::Database)?;
-        let user_id = sqlx::query_scalar::<_, i64>("INSERT INTO users (username, password_hash, created_at) VALUES ($1, $2, $3) RETURNING id")
-            .bind(username).bind(password_hash).bind(chrono::Utc::now().to_rfc3339()).fetch_one(&mut *tx).await.map_err(|error| {
-                if error.as_database_error().and_then(|e| e.code()).as_deref() == Some("23505") { AuthError::UserExists } else { AuthError::Database(error) }
-            })?;
+        let user_id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO users (created_at, key_hash) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(hash_token(&key))
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(AuthError::Database)?;
         let token = create_session(&mut *tx, user_id).await?;
         tx.commit().await.map_err(AuthError::Database)?;
-        Ok((user_id, token))
+        Ok((user_id, key, token))
     }
 
-    pub async fn login(&self, username: &str, password: &str) -> Result<(i64, String), AuthError> {
-        let user = sqlx::query_as::<_, (i64, Option<String>)>(
-            "SELECT id, password_hash FROM users WHERE LOWER(username) = LOWER($1)",
-        )
-        .bind(username)
-        .fetch_optional(&self.0)
-        .await
-        .map_err(AuthError::Database)?
-        .ok_or(AuthError::InvalidCredentials)?;
-        let password_hash = user.1.ok_or(AuthError::InvalidCredentials)?;
-        let parsed = PasswordHash::new(&password_hash).map_err(|_| AuthError::PasswordHash)?;
-        Argon2::default()
-            .verify_password(password.as_bytes(), &parsed)
-            .map_err(|_| AuthError::InvalidCredentials)?;
-        let token = create_session(&self.0, user.0).await?;
-        Ok((user.0, token))
-    }
-
-    pub async fn username(&self, user_id: i64) -> Result<Option<String>, AuthError> {
-        sqlx::query_scalar("SELECT username FROM users WHERE id = $1")
-            .bind(user_id)
+    pub async fn key_login(&self, key: &str) -> Result<Option<(i64, String)>, AuthError> {
+        let user_id = sqlx::query_scalar::<_, i64>("SELECT id FROM users WHERE key_hash = $1")
+            .bind(hash_token(&normalize_key(key)))
             .fetch_optional(&self.0)
             .await
-            .map_err(AuthError::Database)
+            .map_err(AuthError::Database)?;
+        match user_id {
+            Some(user_id) => Ok(Some((user_id, create_session(&self.0, user_id).await?))),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn rotate_key(&self, user_id: i64) -> Result<String, AuthError> {
+        let key = new_key();
+        sqlx::query("UPDATE users SET key_hash = $1 WHERE id = $2")
+            .bind(hash_token(&key))
+            .bind(user_id)
+            .execute(&self.0)
+            .await
+            .map_err(AuthError::Database)?;
+        Ok(key)
     }
 
     pub async fn session_user(&self, token: &str) -> Result<Option<i64>, AuthError> {
@@ -112,7 +99,7 @@ async fn create_session<'e>(
     user_id: i64,
 ) -> Result<String, AuthError> {
     let mut bytes = [0_u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    OsRng.fill_bytes(&mut bytes);
     let token = bytes
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -127,6 +114,21 @@ async fn create_session<'e>(
     Ok(token)
 }
 
+fn new_key() -> String {
+    let groups = (0..6)
+        .map(|_| {
+            (0..4)
+                .map(|_| KEY_ALPHABET[OsRng.gen_range(0..KEY_ALPHABET.len())] as char)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    format!("RT-{}", groups.join("-"))
+}
+
+fn normalize_key(key: &str) -> String {
+    key.split_whitespace().collect::<String>().to_uppercase()
+}
+
 fn hash_token(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
@@ -139,77 +141,73 @@ fn unix_time() -> i64 {
 }
 
 #[derive(Deserialize)]
-struct Credentials {
-    username: String,
-    password: String,
+struct KeyLogin {
+    key: String,
 }
 
 #[derive(Serialize)]
-struct UserResponse {
-    username: Option<String>,
+struct KeyResponse {
+    key: String,
+}
+
+#[derive(Serialize)]
+struct MeResponse {
+    user_id: i64,
 }
 
 pub fn public_routes() -> Router<AppState> {
     Router::new()
-        .route("/auth/register", post(register))
-        .route("/auth/login", post(login))
+        .route("/auth/key", post(create_key))
+        .route("/auth/key/login", post(key_login))
         .route("/auth/logout", post(logout))
 }
 
 pub fn protected_routes() -> Router<AppState> {
-    Router::new().route("/auth/me", get(me))
+    Router::new()
+        .route("/auth/me", get(me))
+        .route("/auth/key/rotate", post(rotate_key))
 }
 
-fn validate_credentials(credentials: &Credentials) -> Result<(), AppError> {
-    let username = credentials.username.trim();
-    if !(3..=32).contains(&username.len())
-        || !username
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-    {
-        return Err(AppError::bad_request(
-            "Username must be 3–32 characters using letters, numbers, dots, dashes, or underscores.",
-        ));
-    }
-    if !(12..=1024).contains(&credentials.password.len()) {
-        return Err(AppError::bad_request(
-            "Password must be between 12 and 1024 characters.",
-        ));
-    }
-    Ok(())
+async fn create_key(State(state): State<AppState>) -> Result<Response, AppError> {
+    let (_user_id, key, token) = state
+        .auth
+        .create_key_account()
+        .await
+        .map_err(auth_error)?;
+    with_session_cookie((StatusCode::CREATED, Json(KeyResponse { key })), &token)
 }
 
-async fn register(
+async fn key_login(
     State(state): State<AppState>,
-    Json(credentials): Json<Credentials>,
-) -> Result<impl IntoResponse, AppError> {
-    validate_credentials(&credentials)?;
-    let username = credentials.username.trim();
+    Json(body): Json<KeyLogin>,
+) -> Result<Response, AppError> {
     let (_user_id, token) = state
         .auth
-        .register(username, &credentials.password)
+        .key_login(&body.key)
         .await
-        .map_err(auth_error)?;
-    let response = Json(UserResponse {
-        username: Some(username.to_owned()),
-    });
-    Ok((StatusCode::CREATED, with_session_cookie(response, &token)?))
+        .map_err(auth_error)?
+        .ok_or_else(|| AppError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "That key doesn't match an account.".into(),
+        })?;
+    with_session_cookie(
+        Json(KeyResponse {
+            key: normalize_key(&body.key),
+        }),
+        &token,
+    )
 }
 
-async fn login(
+async fn rotate_key(
     State(state): State<AppState>,
-    Json(credentials): Json<Credentials>,
-) -> Result<impl IntoResponse, AppError> {
-    let (user_id, token) = state
+    Extension(user): Extension<Arc<UserServices>>,
+) -> Result<Json<KeyResponse>, AppError> {
+    let key = state
         .auth
-        .login(credentials.username.trim(), &credentials.password)
+        .rotate_key(user.user_id)
         .await
         .map_err(auth_error)?;
-    let username = state.auth.username(user_id).await.map_err(auth_error)?;
-    Ok(with_session_cookie(
-        Json(UserResponse { username }),
-        &token,
-    )?)
+    Ok(Json(KeyResponse { key }))
 }
 
 async fn logout(
@@ -229,9 +227,9 @@ async fn logout(
     Ok(response)
 }
 
-async fn me(Extension(user): Extension<Arc<UserServices>>) -> Json<UserResponse> {
-    Json(UserResponse {
-        username: user.username.clone(),
+async fn me(Extension(user): Extension<Arc<UserServices>>) -> Json<MeResponse> {
+    Json(MeResponse {
+        user_id: user.user_id,
     })
 }
 
@@ -288,13 +286,7 @@ fn unauthorized() -> AppError {
 
 fn auth_error(error: AuthError) -> AppError {
     match error {
-        AuthError::InvalidCredentials => AppError {
-            status: StatusCode::UNAUTHORIZED,
-            message: "Incorrect username or password.".into(),
-        },
-        AuthError::UserExists => AppError::bad_request("That username is already registered."),
         AuthError::Database(error) => AppError::internal(error),
-        AuthError::PasswordHash => AppError::internal("password hashing failed"),
     }
 }
 
@@ -302,32 +294,60 @@ fn auth_error(error: AuthError) -> AppError {
 mod tests {
     use super::*;
 
+    fn is_key_format(key: &str) -> bool {
+        let parts = key.split('-').collect::<Vec<_>>();
+        parts.len() == 7
+            && parts[0] == "RT"
+            && parts[1..].iter().all(|part| {
+                part.len() == 4 && part.bytes().all(|byte| KEY_ALPHABET.contains(&byte))
+            })
+    }
+
     #[sqlx::test(migrations = "../tailor-core/migrations")]
-    async fn password_authentication_uses_postgres_sessions(pool: PgPool) {
+    async fn key_accounts_sign_back_in_with_their_key(pool: PgPool) {
         let auth = AuthStore::new(pool);
-        let (user_id, token) = auth
-            .register("example-user", "correct-horse-battery")
-            .await
-            .unwrap();
-        assert_eq!(
-            auth.username(user_id).await.unwrap().as_deref(),
-            Some("example-user")
-        );
+        let (user_id, key, token) = auth.create_key_account().await.unwrap();
+        assert!(is_key_format(&key));
         assert_eq!(auth.session_user(&token).await.unwrap(), Some(user_id));
-        let (login_id, login_token) = auth
-            .login("EXAMPLE-USER", "correct-horse-battery")
-            .await
-            .unwrap();
+        let (login_id, login_token) = auth.key_login(&key).await.unwrap().unwrap();
         assert_eq!(login_id, user_id);
         assert_eq!(
             auth.session_user(&login_token).await.unwrap(),
             Some(user_id)
         );
-        assert!(matches!(
-            auth.login("example-user", "wrong-password").await,
-            Err(AuthError::InvalidCredentials)
-        ));
         auth.logout(&login_token).await.unwrap();
         assert_eq!(auth.session_user(&login_token).await.unwrap(), None);
+    }
+
+    #[sqlx::test(migrations = "../tailor-core/migrations")]
+    async fn keys_ignore_case_and_spaces(pool: PgPool) {
+        let auth = AuthStore::new(pool);
+        let (user_id, key, _) = auth.create_key_account().await.unwrap();
+        let typed = format!("  {}  ", key.to_lowercase().replace('-', " - "));
+        let (login_id, _) = auth.key_login(&typed).await.unwrap().unwrap();
+        assert_eq!(login_id, user_id);
+    }
+
+    #[sqlx::test(migrations = "../tailor-core/migrations")]
+    async fn wrong_key_is_rejected(pool: PgPool) {
+        let auth = AuthStore::new(pool);
+        auth.create_key_account().await.unwrap();
+        assert!(auth
+            .key_login("RT-0000-0000-0000-0000-0000-0000")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[sqlx::test(migrations = "../tailor-core/migrations")]
+    async fn rotating_a_key_replaces_it(pool: PgPool) {
+        let auth = AuthStore::new(pool);
+        let (user_id, old_key, _) = auth.create_key_account().await.unwrap();
+        let new_key = auth.rotate_key(user_id).await.unwrap();
+        assert!(is_key_format(&new_key));
+        assert_ne!(new_key, old_key);
+        assert!(auth.key_login(&old_key).await.unwrap().is_none());
+        let (login_id, _) = auth.key_login(&new_key).await.unwrap().unwrap();
+        assert_eq!(login_id, user_id);
     }
 }

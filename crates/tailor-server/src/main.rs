@@ -48,23 +48,15 @@ struct AppState {
 }
 
 struct UserServices {
+    user_id: i64,
     store: Arc<Db>,
     senders: PipelineSenders,
-    username: Option<String>,
     ollama_url: String,
     _pipeline: Pipeline,
 }
 
 impl AppState {
     async fn user_services(&self, user_id: i64) -> Result<Arc<UserServices>, String> {
-        if let Some(user) = self.users.lock().await.get(&user_id) {
-            return Ok(user.clone());
-        }
-        let username = self
-            .auth
-            .username(user_id)
-            .await
-            .map_err(|error| format!("couldn't load user: {error:?}"))?;
         let mut users = self.users.lock().await;
         if let Some(user) = users.get(&user_id) {
             return Ok(user.clone());
@@ -79,9 +71,9 @@ impl AppState {
         )
         .map_err(|error| error.to_string())?;
         let user = Arc::new(UserServices {
+            user_id,
             store,
             senders,
-            username,
             ollama_url: self.ollama_url.clone(),
             _pipeline: pipeline,
         });
