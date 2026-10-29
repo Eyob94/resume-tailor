@@ -41,10 +41,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   health: () => request<{ ok: boolean }>("/health"),
-  currentUser: () => request<{ username: string }>("/auth/me"),
-  register: (username: string, password: string) => request<{ username: string }>("/auth/register", { method: "POST", ...json({ username, password }) }),
-  login: (username: string, password: string) => request<{ username: string }>("/auth/login", { method: "POST", ...json({ username, password }) }),
-  logout: () => request<void>("/auth/logout", { method: "POST" }),
+  currentUser: () => request<{ user_id: number }>("/auth/me"),
+  createKey: () => request<{ key: string }>("/auth/key", { method: "POST" }),
+  keyLogin: (key: string) => request<{ key: string }>("/auth/key/login", { method: "POST", ...json({ key }) }),
+  rotateKey: () => request<{ key: string }>("/auth/key/rotate", { method: "POST" }),
   getResume: () => request<MasterResume | null>("/resume"),
   uploadResume: (file: File) => {
     const form = new FormData();

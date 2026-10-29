@@ -1,0 +1,1 @@
+ALTER TABLE users ADD COLUMN key_hash TEXT UNIQUE;
